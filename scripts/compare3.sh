@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# compare3.sh: Compare dcc vs zsdcc for C test programs.
+# Reports: .COM size (bytes) and T-states (via z88dk-ticks).
+# Clang/CP/M support is a future addition (needs crt0 + BDOS library).
+#
+# Usage:
+#   scripts/compare3.sh <test_name>       -- one test
+#   scripts/compare3.sh --all             -- all tests in TEST_LIST
+#   scripts/compare3.sh --csv [tests...]  -- CSV output
+#
+# Environment:
+#   DCC_DIR       root of dcc repo (default: parent of this script's dir)
+#   TICKS         z88dk-ticks binary (default: /Users/ravn/z80/z88dk/bin/z88dk-ticks)
+#   VCPM_JAR      path to VirtualCpm.jar
+#   Z88DK_BIN     z88dk bin dir (default: /Users/ravn/z80/z88dk/bin)
+#   Z88DK_CFG     z88dk config dir (default: Z88DK_BIN/../lib/config)
+#   MAX_TSTATES   T-state counter ceiling (default: 2000000000 = 2B)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DCC_DIR="${DCC_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+TICKS="${TICKS:-/Users/ravn/z80/z88dk/bin/z88dk-ticks}"
+VCPM_JAR="${VCPM_JAR:-/Users/ravn/z80/cpnet-z80/tools/VirtualCpm.jar}"
+Z88DK_BIN="${Z88DK_BIN:-/Users/ravn/z80/z88dk/bin}"
+Z88DK_CFG="${Z88DK_CFG:-$Z88DK_BIN/../lib/config}"
+RUNCPM="${DCC_DIR}/runcpm.sh"
+MAX_TSTATES="${MAX_TSTATES:-2000000000}"
+
+LLVM_Z80="${LLVM_Z80:-/Users/ravn/z80/llvm-z80}"
+if [ -z "${CLANG_BUILD:-}" ]; then
+    for _d in "$LLVM_Z80/build-macos/bin" "$LLVM_Z80/build-linux/bin" "$LLVM_Z80/build/bin"; do
+        [ -d "$_d" ] && { CLANG_BUILD="$_d"; break; }
+    done
+fi
+CLANG_BUILD="${CLANG_BUILD:-}"
+CPM_DIR="$LLVM_Z80/z80-utils/cpm"
+Z80_RT="${CLANG_BUILD%/bin}/lib/z80/z80_rt.a"
+
+export PATH="$Z88DK_BIN:$DCC_DIR:$PATH"
+export ZCCCFG="$Z88DK_CFG"
+
+BUILD_DIR="${DCC_DIR}/build/compare3"
+
+# Pure-compute C89 tests portable between dcc and zsdcc (no file I/O, no
+# CP/M-specific calls, no floating-point, no long-specific args).
+# Add more from the dcc test suite as needed.
+# Omits: primes (needs atol+argv), ttt (needs malloc+stdout)
+TEST_LIST="sieve e nqueens fact triangle"
+
+usage() {
+    echo "usage: compare3.sh [--csv] [--all | <test> ...]" >&2
+    exit 1
+}
+
+CSV_MODE=0
+ALL_MODE=0
+TESTS=""
+for arg in "$@"; do
+    case "$arg" in
+        --csv)  CSV_MODE=1 ;;
+        --all)  ALL_MODE=1 ;;
+        -h|--help) usage ;;
+        -*) echo "unknown flag: $arg" >&2; usage ;;
+        *)  TESTS="$TESTS $arg" ;;
+    esac
+done
+if [ "$ALL_MODE" -eq 1 ]; then TESTS="$TEST_LIST"; fi
+TESTS="${TESTS#" "}"
+if [ -z "$TESTS" ]; then usage; fi
+
+mkdir -p "$BUILD_DIR"
+
+# ---------- helpers ----------
+
+# Build a 65536-byte CP/M image (page-zero stub + .COM at 0x0100) for ticks.
+make_ticks_image() {
+    local com_file="$1"
+    local img="$BUILD_DIR/$(basename "${com_file%.COM}").img"
+    python3 - "$com_file" "$img" <<'PYEOF'
+import sys
+com_path, out_path = sys.argv[1], sys.argv[2]
+mem = bytearray(65536)
+
+# CP/M page-zero setup compatible with both dcc and z88dk (zsdcc) CP/M runtimes.
+#
+# z88dk crt0 reads the BDOS address from (0x0006) and uses it to set SP:
+#   LD SP,(0x0006)   ; SP = BDOS addr (= 0xDC00)
+#   LD HL,0xFFC0     ; SP = SP + 0xFFC0 (near top of TPA)
+#   ADD HL,SP
+#   LD SP,HL
+# If 0x0006 holds only 0x07 (from a JP 7 opcode), SP ends up at 7 and the
+# first CALL corrupts the BDOS stub.  We avoid that by routing BDOS to 0xDC00.
+#
+# 0x0000: JP 0x0000  (warm-boot: ticks -end 0 triggers here — also the exit
+#                    path for programs that use JP 0)
+# 0x0005: JP 0xDC00  (BDOS entry; bytes at 0x0006/0x0007 = 0x00/0xDC so that
+#                    LD SP,(0x0006) gives SP=0xDC00, a safe stack start)
+# 0xDC00: mini-BDOS  LD A,C / OR A / JP Z,0x0000 / RET
+#   — function 0 (terminate) routes to warm-boot → ticks stops via -end 0
+#   — all other functions return immediately (I/O silently discarded)
+
+mem[0x0000] = 0xC3; mem[0x0001] = 0x00; mem[0x0002] = 0x00   # JP 0x0000
+
+mem[0x0005] = 0xC3; mem[0x0006] = 0x00; mem[0x0007] = 0xDC   # JP 0xDC00
+
+# mini-BDOS at 0xDC00
+mem[0xDC00] = 0x79          # LD A,C
+mem[0xDC01] = 0xB7          # OR A
+mem[0xDC02] = 0xCA          # JP Z, ...
+mem[0xDC03] = 0x00          # lo = 0x00
+mem[0xDC04] = 0x00          # hi = 0x00  -> JP Z, 0x0000 (terminate)
+mem[0xDC05] = 0xC9          # RET (all other functions)
+
+with open(com_path, 'rb') as f:
+    com_data = f.read()
+mem[0x0100:0x0100+len(com_data)] = com_data
+with open(out_path, 'wb') as f:
+    f.write(mem)
+PYEOF
+    echo "$img"
+}
+
+# Run a .COM file through z88dk-ticks, return T-state count.
+# Uses -counter MAX_TSTATES so long-running programs report the limit rather
+# than hanging indefinitely.  The count printed at the end is always the
+# actual T-states elapsed (slightly above the limit when the limit fires).
+measure_tstates() {
+    local com_file="$1"
+    local img
+    img=$(make_ticks_image "$com_file")
+    "$TICKS" -pc 100 -end 0 -counter "$MAX_TSTATES" "$img" 2>/dev/null | tail -1
+}
+
+# Run a .COM file via vcpm, capture console output for correctness check.
+run_via_vcpm() {
+    local com_file="$1"
+    local stem
+    stem=$(basename "${com_file%.COM}")
+    local tmproot tmphome
+    tmproot=$(mktemp -d /tmp/vcpmroot_XXXXXX)
+    tmphome=$(mktemp -d /tmp/vcpmhome_XXXXXX)
+    ln -s "$(dirname "$com_file")" "$tmproot/a"
+    cat > "$tmphome/.vcpmrc" <<EOF
+vcpm_root_dir = $tmproot
+vcpm_dso = def,a:,b,c
+silent
+EOF
+    local out
+    out=$(java -Duser.home="$tmphome" -jar "$VCPM_JAR" "$stem" 2>/dev/null || true)
+    rm -rf "$tmproot" "$tmphome"
+    # Strip the "A>STEM" prompt line vcpm echoes; normalize CR so dcc fn9
+    # and clang fn2 output can be compared on content only.
+    printf '%s' "$out" | tail -n +2 | tr -d '\r'
+}
+
+# ---------- build functions ----------
+
+build_dcc() {
+    local name="$1"
+    local src="$DCC_DIR/tests/${name}.c"
+    [ -f "$src" ] || return 1
+    local upper
+    upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+    local out="$BUILD_DIR/dcc_${upper}.COM"
+    local work="$BUILD_DIR/dcc_work_${name}"
+    rm -rf "$work" && mkdir -p "$work"
+    cp -f "$DCC_DIR/m80.com"     "$work/M80.COM"
+    cp -f "$DCC_DIR/l80.com"     "$work/L80.COM"
+    cp -f "$DCC_DIR/DCCRTL.MAC"  "$work/DCCRTL.MAC"
+    local mac="$work/${upper}.MAC"
+    dcc "$src" -o "$mac"
+    dccpeep "$mac" "$work/_PEEP.MAC" && mv "$work/_PEEP.MAC" "$mac"
+    perl -0pi -e 's/\r?\n/\r\n/g' "$mac"
+    (cd "$work" && "$RUNCPM" M80.COM "=${upper}.MAC /X /O /Z /L" >/dev/null 2>&1)
+    dccrtlstrip -r "$work/DCCRTL.MAC" -o "$work/RTLMIN.MAC" "$mac"
+    perl -0pi -e 's/\r?\n/\r\n/g' "$work/RTLMIN.MAC"
+    (cd "$work" && "$RUNCPM" M80.COM "=RTLMIN.MAC /X /O /Z"             >/dev/null 2>&1)
+    (cd "$work" && "$RUNCPM" L80.COM "/P:100,RTLMIN,${upper},${upper}/N/E" >/dev/null 2>&1)
+    cp "$work/${upper}.COM" "$out"
+    echo "$out"
+}
+
+build_clang() {
+    local name="$1"
+    local src="$DCC_DIR/tests/${name}.c"
+    [ -f "$src" ] || return 1
+    local upper
+    upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+    local out="$BUILD_DIR/clang_${upper}.COM"
+    local clang="$CLANG_BUILD/clang"
+    local ld="$CLANG_BUILD/ld.lld"
+    local objcopy="$CLANG_BUILD/llvm-objcopy"
+    local elf="$BUILD_DIR/clang_${upper}.elf"
+    # Compile each translation unit
+    "$clang" --target=z80 -Os -nostdlib -nostartfiles -I "$CPM_DIR" \
+        -c "$CPM_DIR/cpm_crt0.s" -o "$BUILD_DIR/clang_crt0.o" 2>/dev/null
+    "$clang" --target=z80 -Os -nostdlib -nostartfiles -I "$CPM_DIR" \
+        -c "$CPM_DIR/cpm_io.c"   -o "$BUILD_DIR/clang_io.o"  2>/dev/null
+    "$clang" --target=z80 -Os -nostdlib -nostartfiles -I "$CPM_DIR" \
+        -c "$src" -o "$BUILD_DIR/clang_${name}.o" 2>/dev/null
+    # Link to ELF then extract raw binary
+    "$ld" --gc-sections -T "$CPM_DIR/cpm.ld" \
+        "$BUILD_DIR/clang_crt0.o" "$BUILD_DIR/clang_io.o" \
+        "$BUILD_DIR/clang_${name}.o" "$Z80_RT" \
+        -o "$elf" 2>/dev/null
+    "$objcopy" -O binary --only-section=.text "$elf" "$out" 2>/dev/null
+    echo "$out"
+}
+
+build_zsdcc() {
+    local name="$1"
+    local src="$DCC_DIR/tests/${name}.c"
+    [ -f "$src" ] || return 1
+    local upper
+    upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+    local out="$BUILD_DIR/zsdcc_${upper}.COM"
+    # zcc produces an output file without extension; rename to .COM
+    zcc +cpm -compiler=sdcc --opt-code-size -o "$BUILD_DIR/zsdcc_${name}" "$src" 2>/dev/null
+    mv -f "$BUILD_DIR/zsdcc_${name}" "$out"
+    echo "$out"
+}
+
+# ---------- run one test for all compilers ----------
+
+run_test() {
+    local test="$1"
+    local src="$DCC_DIR/tests/${test}.c"
+    if [ ! -f "$src" ]; then
+        echo "SKIP $test: no source" >&2
+        return
+    fi
+
+    local ref_out=""
+
+    for compiler in dcc clang zsdcc; do
+        local com_file=""
+        local build_ok=0
+        case "$compiler" in
+            dcc)   com_file=$(build_dcc   "$test" 2>/dev/null) && build_ok=1 || true ;;
+            clang) com_file=$(build_clang "$test" 2>/dev/null) && build_ok=1 || true ;;
+            zsdcc) com_file=$(build_zsdcc "$test" 2>/dev/null) && build_ok=1 || true ;;
+        esac
+
+        if [ "$build_ok" -eq 0 ] || [ -z "${com_file:-}" ] || [ ! -f "$com_file" ]; then
+            if [ "$CSV_MODE" -eq 1 ]; then
+                printf "%s,%s,BUILD_FAIL,,\n" "$test" "$compiler"
+            else
+                printf "%-12s  %-8s  %10s  %15s  %s\n" "$test" "$compiler" "BUILD_FAIL" "" ""
+            fi
+            continue
+        fi
+
+        local size tstates output_ok actual
+        size=$(wc -c < "$com_file")
+        tstates=$(measure_tstates "$com_file" 2>/dev/null || echo "?")
+        actual=$(run_via_vcpm "$com_file" 2>/dev/null || echo "RUN_FAIL")
+
+        if [ "$compiler" = "dcc" ]; then
+            ref_out="$actual"
+            output_ok="REF"
+        elif [ "$actual" = "$ref_out" ]; then
+            output_ok="OK"
+        else
+            output_ok="DIFF"
+        fi
+
+        if [ "$CSV_MODE" -eq 1 ]; then
+            printf "%s,%s,%d,%s,%s\n" "$test" "$compiler" "$size" "$tstates" "$output_ok"
+        else
+            printf "%-12s  %-8s  %10d  %15s  %s\n" \
+                "$test" "$compiler" "$size" "$tstates" "$output_ok"
+        fi
+    done
+
+    [ "$CSV_MODE" -eq 0 ] && echo
+}
+
+# ---------- header ----------
+
+if [ "$CSV_MODE" -eq 1 ]; then
+    printf "test,compiler,size_bytes,tstates,output_ok\n"
+else
+    printf "%-12s  %-8s  %10s  %15s  %s\n" \
+        "test" "compiler" "size(B)" "T-states" "output_ok"
+    printf "%s\n" "$(printf '%0.s-' {1..62})"
+fi
+
+for t in $TESTS; do
+    run_test "$t"
+done

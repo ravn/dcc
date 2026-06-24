@@ -59,20 +59,22 @@ fi
 DCC=${DCC:-dcc}
 DCCPEEP=${DCCPEEP:-dccpeep}
 DCCRTLSTRIP=${DCCRTLSTRIP:-dccrtlstrip}
-NTVCM=${NTVCM:-ntvcm}
+# NTVCM is no longer used; runticks.sh wraps z88dk-ticks with CP/M BDOS emulation.
+# Override RUNTICKS to point to a different wrapper if needed.
+RUNTICKS=${RUNTICKS:-"$(cd "$(dirname "$0")" && pwd)/runticks.sh"}
 M80=${M80:-m80}
 L80=${L80:-l80}
 
 build_dir="build"
 mkdir -p "$build_dir"
 
-# ntvcm resolves COM command files from the working directory; when we run it
-# in build/, stage the tool COM files there to avoid manual setup.
+# Stage CP/M tool binaries in build/ so runticks.sh finds them via the
+# current directory when running the assembler and linker.
 if [ -f "m80.com" ]; then
-    cp -f "m80.com" "${build_dir}/m80.com"
+    cp -f "m80.com" "${build_dir}/M80.COM"
 fi
 if [ -f "l80.com" ]; then
-    cp -f "l80.com" "${build_dir}/l80.com"
+    cp -f "l80.com" "${build_dir}/L80.COM"
 fi
 
 # M80/L80 on CP/M want uppercase filenames. Keep all generated CP/M-facing
@@ -144,10 +146,10 @@ fi
 
 to_crlf "$app_mac"
 
-# Assemble app. Explicit uppercase .MAC is important on Linux/macOS.
+# Assemble app via z88dk-ticks CP/M emulation.
 (
     cd "$build_dir"
-    "$NTVCM" "$M80" "=${upper_base}.MAC" /X /O /Z /L
+    "$RUNTICKS" "M80.COM" "=${upper_base}.MAC /X /O /Z /L"
 )
 
 # Strip runtime using the final app .MAC, then assemble/link uppercase modules.
@@ -165,8 +167,8 @@ to_crlf "$rtl_min"
 
 (
     cd "$build_dir"
-    "$NTVCM" "$M80" "=RTLMIN.MAC" /X /O /Z
-    "$NTVCM" "$L80" "/P:100,RTLMIN,${upper_base},${upper_base}/N/E"
+    "$RUNTICKS" "M80.COM" "=RTLMIN.MAC /X /O /Z"
+    "$RUNTICKS" "L80.COM" "/P:100,RTLMIN,${upper_base},${upper_base}/N/E"
 )
 
 # Convenience lowercase copy for host-side scripts/emulators that prefer it.

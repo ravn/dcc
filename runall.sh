@@ -16,7 +16,7 @@ for arg in "$@"; do
         *) if [ -z "$EMULATOR" ]; then EMULATOR="$arg"; fi ;;
     esac
 done
-EMULATOR=${EMULATOR:-ntvcm}
+EMULATOR=${EMULATOR:-"$(cd "$(dirname "$0")" && pwd)/runticks.sh"}
 BUILD_DIR=${BUILD_DIR:-build}
 
 if [ "$FORCE_STACK_CHECK" = "1" ]; then
