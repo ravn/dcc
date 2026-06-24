@@ -18,12 +18,16 @@
 #   (cd build && runcpm.sh SIEVE)
 #
 # Environment:
-#   VCPM_JAR  path to VirtualCpm.jar
-#             default: /Users/ravn/z80/cpnet-z80/tools/VirtualCpm.jar
+#   VCPM_JAR          path to VirtualCpm.jar
+#                     default: /Users/ravn/z80/cpnet-z80/tools/VirtualCpm.jar
+#   RUNCPM_TIMEOUT    hard wall-clock limit in seconds (default 60).  A CP/M
+#                     program that reads console input, or a bad command line,
+#                     can otherwise hang vcpm forever.
 
 set -euo pipefail
 
 VCPM_JAR="${VCPM_JAR:-/Users/ravn/z80/cpnet-z80/tools/VirtualCpm.jar}"
+RUNCPM_TIMEOUT="${RUNCPM_TIMEOUT:-60}"
 
 if [ $# -lt 1 ]; then
     echo "usage: runcpm.sh COM_STEM [args...]" >&2
@@ -49,4 +53,10 @@ if [ $# -gt 0 ]; then
     CMD="$CMD $*"
 fi
 
-java -Duser.home="$VCPM_HOME" -jar "$VCPM_JAR" $CMD 2>/dev/null
+# Run vcpm under a perl-alarm timeout (macOS has no GNU `timeout`).  `exec`
+# makes java the alarmed process itself, so a timeout kills java directly with
+# no orphaned grandchild.  stdin from /dev/null so a console-reading program
+# gets EOF immediately instead of blocking.  A timeout exits non-zero (SIGALRM
+# = 142), which set -e propagates to the caller as a build/run failure.
+perl -e 'alarm shift; exec @ARGV' "$RUNCPM_TIMEOUT" \
+    java -Duser.home="$VCPM_HOME" -jar "$VCPM_JAR" $CMD < /dev/null 2>/dev/null
