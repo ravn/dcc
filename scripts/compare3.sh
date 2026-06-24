@@ -45,8 +45,7 @@ BUILD_DIR="${DCC_DIR}/build/compare3"
 # Pure-compute C89 tests portable between dcc and zsdcc (no file I/O, no
 # CP/M-specific calls, no floating-point, no long-specific args).
 # Add more from the dcc test suite as needed.
-# Omits: primes (needs atol+argv), ttt (needs malloc+stdout)
-TEST_LIST="sieve e nqueens fact triangle"
+TEST_LIST="sieve e nqueens fact triangle ttt tstring tqsort tbsearch tsetjmp tmalloch"
 
 usage() {
     echo "usage: compare3.sh [--csv] [--all | <test> ...]" >&2
@@ -147,7 +146,12 @@ vcpm_dso = def,a:,b,c
 silent
 EOF
     local out
-    out=$(java -Duser.home="$tmphome" -jar "$VCPM_JAR" "$stem" 2>/dev/null || true)
+    # Hard timeout (perl alarm — macOS has no GNU timeout) so a program that
+    # reads console input, or a missing .COM, can never hang the harness.
+    # Feed /dev/null to stdin so any console-read returns EOF immediately.
+    out=$(perl -e 'alarm shift; exec @ARGV' "${VCPM_TIMEOUT:-20}" \
+            java -Duser.home="$tmphome" -jar "$VCPM_JAR" "$stem" \
+            < /dev/null 2>/dev/null || true)
     rm -rf "$tmproot" "$tmphome"
     # Strip the "A>STEM" prompt line vcpm echoes; normalize CR so dcc fn9
     # and clang fn2 output can be compared on content only.
@@ -192,19 +196,21 @@ build_clang() {
     local ld="$CLANG_BUILD/ld.lld"
     local objcopy="$CLANG_BUILD/llvm-objcopy"
     local elf="$BUILD_DIR/clang_${upper}.elf"
-    # Compile each translation unit
-    "$clang" --target=z80 -Os -nostdlib -nostartfiles -I "$CPM_DIR" \
-        -c "$CPM_DIR/cpm_crt0.s" -o "$BUILD_DIR/clang_crt0.o" 2>/dev/null
-    "$clang" --target=z80 -Os -nostdlib -nostartfiles -I "$CPM_DIR" \
-        -c "$CPM_DIR/cpm_io.c"   -o "$BUILD_DIR/clang_io.o"  2>/dev/null
-    "$clang" --target=z80 -Os -nostdlib -nostartfiles -I "$CPM_DIR" \
-        -c "$src" -o "$BUILD_DIR/clang_${name}.o" 2>/dev/null
-    # Link to ELF then extract raw binary
+    # Remove stale outputs so a failed compile/link can't masquerade as success.
+    rm -f "$out" "$elf" "$BUILD_DIR/clang_${name}.o"
+    local cflags="--target=z80 -Os -fno-builtin -ffunction-sections -fdata-sections -nostdlib -nostartfiles -I $CPM_DIR"
+    # Runtime objects are shared; rebuild them each time (cheap, always fresh).
+    "$clang" $cflags -c "$CPM_DIR/cpm_crt0.s"   -o "$BUILD_DIR/clang_crt0.o"   2>/dev/null || return 1
+    "$clang" $cflags -c "$CPM_DIR/cpm_io.c"     -o "$BUILD_DIR/clang_io.o"     2>/dev/null || return 1
+    "$clang" $cflags -c "$CPM_DIR/cpm_stdlib.c" -o "$BUILD_DIR/clang_stdlib.o" 2>/dev/null || return 1
+    "$clang" $cflags -c "$src" -o "$BUILD_DIR/clang_${name}.o" 2>/dev/null || return 1
     "$ld" --gc-sections -T "$CPM_DIR/cpm.ld" \
         "$BUILD_DIR/clang_crt0.o" "$BUILD_DIR/clang_io.o" \
+        "$BUILD_DIR/clang_stdlib.o" \
         "$BUILD_DIR/clang_${name}.o" "$Z80_RT" \
-        -o "$elf" 2>/dev/null
-    "$objcopy" -O binary --only-section=.text "$elf" "$out" 2>/dev/null
+        -o "$elf" 2>/dev/null || return 1
+    "$objcopy" -O binary --only-section=.text "$elf" "$out" 2>/dev/null || return 1
+    [ -f "$out" ] || return 1
     echo "$out"
 }
 
@@ -223,6 +229,11 @@ build_zsdcc() {
 
 # ---------- run one test for all compilers ----------
 
+# Output-agreement verdict is by CONSENSUS, not against any single compiler:
+# dcc lacks %ld/%lu (prints literal "lu"), so it is NOT a trustworthy oracle.
+#   AGREE  — output matches at least one other compiler (cross-validated)
+#   SOLO   — the only compiler that built+ran this test (no peer to check)
+#   DIFF   — built+ran but disagrees with every peer (the outlier — suspect)
 run_test() {
     local test="$1"
     local src="$DCC_DIR/tests/${test}.c"
@@ -231,58 +242,70 @@ run_test() {
         return
     fi
 
-    local ref_out=""
-
-    for compiler in dcc clang zsdcc; do
-        local com_file=""
-        local build_ok=0
-        case "$compiler" in
+    local compilers="dcc clang zsdcc"
+    local c
+    # Pass 1: build, measure, capture output into per-compiler temp files
+    for c in $compilers; do
+        local com_file="" build_ok=0
+        case "$c" in
             dcc)   com_file=$(build_dcc   "$test" 2>/dev/null) && build_ok=1 || true ;;
             clang) com_file=$(build_clang "$test" 2>/dev/null) && build_ok=1 || true ;;
             zsdcc) com_file=$(build_zsdcc "$test" 2>/dev/null) && build_ok=1 || true ;;
         esac
-
-        if [ "$build_ok" -eq 0 ] || [ -z "${com_file:-}" ] || [ ! -f "$com_file" ]; then
-            if [ "$CSV_MODE" -eq 1 ]; then
-                printf "%s,%s,BUILD_FAIL,,\n" "$test" "$compiler"
-            else
-                printf "%-12s  %-8s  %10s  %15s  %s\n" "$test" "$compiler" "BUILD_FAIL" "" ""
-            fi
-            continue
-        fi
-
-        local size tstates output_ok actual
-        size=$(wc -c < "$com_file")
-        tstates=$(measure_tstates "$com_file" 2>/dev/null || echo "?")
-        actual=$(run_via_vcpm "$com_file" 2>/dev/null || echo "RUN_FAIL")
-
-        if [ "$compiler" = "dcc" ]; then
-            ref_out="$actual"
-            output_ok="REF"
-        elif [ "$actual" = "$ref_out" ]; then
-            output_ok="OK"
+        if [ "$build_ok" -eq 1 ] && [ -n "${com_file:-}" ] && [ -f "$com_file" ]; then
+            echo "$(wc -c < "$com_file")"               > "$BUILD_DIR/.r_${c}_size"
+            measure_tstates "$com_file" 2>/dev/null      > "$BUILD_DIR/.r_${c}_ts" || echo "?" > "$BUILD_DIR/.r_${c}_ts"
+            run_via_vcpm "$com_file" 2>/dev/null          > "$BUILD_DIR/.r_${c}_out" || true
+            echo "1" > "$BUILD_DIR/.r_${c}_built"
         else
-            output_ok="DIFF"
-        fi
-
-        if [ "$CSV_MODE" -eq 1 ]; then
-            printf "%s,%s,%d,%s,%s\n" "$test" "$compiler" "$size" "$tstates" "$output_ok"
-        else
-            printf "%-12s  %-8s  %10d  %15s  %s\n" \
-                "$test" "$compiler" "$size" "$tstates" "$output_ok"
+            echo "0" > "$BUILD_DIR/.r_${c}_built"
         fi
     done
 
+    # Pass 2: consensus verdict + print
+    for c in $compilers; do
+        if [ "$(cat "$BUILD_DIR/.r_${c}_built")" != "1" ]; then
+            if [ "$CSV_MODE" -eq 1 ]; then
+                printf "%s,%s,BUILD_FAIL,,\n" "$test" "$c"
+            else
+                printf "%-12s  %-8s  %10s  %15s  %s\n" "$test" "$c" "BUILD_FAIL" "" ""
+            fi
+            continue
+        fi
+        local size tstates verdict mine peers
+        size=$(cat "$BUILD_DIR/.r_${c}_size")
+        tstates=$(cat "$BUILD_DIR/.r_${c}_ts")
+        mine=$(cat "$BUILD_DIR/.r_${c}_out" 2>/dev/null)
+        # Compare against the other built compilers
+        verdict="SOLO"
+        local other agreed=0 had_peer=0
+        for other in $compilers; do
+            [ "$other" = "$c" ] && continue
+            [ "$(cat "$BUILD_DIR/.r_${other}_built")" = "1" ] || continue
+            had_peer=1
+            peers=$(cat "$BUILD_DIR/.r_${other}_out" 2>/dev/null)
+            [ "$mine" = "$peers" ] && agreed=1
+        done
+        if [ "$had_peer" = "1" ]; then
+            [ "$agreed" = "1" ] && verdict="AGREE" || verdict="DIFF"
+        fi
+        if [ "$CSV_MODE" -eq 1 ]; then
+            printf "%s,%s,%d,%s,%s\n" "$test" "$c" "$size" "$tstates" "$verdict"
+        else
+            printf "%-12s  %-8s  %10d  %15s  %s\n" "$test" "$c" "$size" "$tstates" "$verdict"
+        fi
+    done
+    rm -f "$BUILD_DIR"/.r_*
     [ "$CSV_MODE" -eq 0 ] && echo
 }
 
 # ---------- header ----------
 
 if [ "$CSV_MODE" -eq 1 ]; then
-    printf "test,compiler,size_bytes,tstates,output_ok\n"
+    printf "test,compiler,size_bytes,tstates,verdict\n"
 else
     printf "%-12s  %-8s  %10s  %15s  %s\n" \
-        "test" "compiler" "size(B)" "T-states" "output_ok"
+        "test" "compiler" "size(B)" "T-states" "verdict"
     printf "%s\n" "$(printf '%0.s-' {1..62})"
 fi
 
