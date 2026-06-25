@@ -63,7 +63,11 @@ char *read_file(const char *name, long *lenp)
     char *p;
 
     f = fopen(name, "rb");
-    if (!f) fatal("cannot open input");
+    if (!f) {
+        char _msg[512];
+        snprintf(_msg, sizeof(_msg), "cannot open input: %s", name);
+        fatal(_msg);
+    }
 
     n = file_size(f);
     p = (char *)xmalloc((size_t)n + 1);
