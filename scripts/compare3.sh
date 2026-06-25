@@ -45,7 +45,7 @@ BUILD_DIR="${DCC_DIR}/build/compare3"
 # Pure-compute C89 tests portable between dcc and zsdcc (no file I/O, no
 # CP/M-specific calls, no floating-point, no long-specific args).
 # Add more from the dcc test suite as needed.
-TEST_LIST="sieve e nqueens fact triangle ttt tstring tqsort tbsearch tsetjmp tmalloch"
+TEST_LIST="sieve e nqueens fact triangle ttt tstring tqsort tbsearch tsetjmp tmalloch fwdelay fwfdc fwsector fwbitops fwcoord fwxlt fwcrc"
 
 usage() {
     echo "usage: compare3.sh [--csv] [--all | <test> ...]" >&2
@@ -296,7 +296,7 @@ run_test() {
         fi
     done
     rm -f "$BUILD_DIR"/.r_*
-    [ "$CSV_MODE" -eq 0 ] && echo
+    [ "$CSV_MODE" -eq 0 ] && echo || true
 }
 
 # ---------- header ----------
