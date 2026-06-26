@@ -31,8 +31,12 @@ static void fdc_read_result(fdc_result_t *res, unsigned char status_base)
     unsigned char ctr = status_base;
     for (i = 0; i < 7; i++) {
         p[i] = next_byte(&ctr);
+        /* Early exit when FDC signals no more result bytes (bit 4 clear).
+         * Only write the next byte if it is still within the 7-byte struct
+         * (i < 6); writing p[7] on the final iteration is undefined behaviour
+         * and produces different results across compilers. */
         if (!(ctr & 0x10)) {
-            p[i + 1] = ctr;
+            if (i < 6) p[i + 1] = ctr;
             return;
         }
     }
