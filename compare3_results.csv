@@ -41,9 +41,9 @@ fwfdc,zsdcc,8064,9342268,AGREE
 fwsector,dcc,2560,180628724,AGREE
 fwsector,clang,3649,45648768,AGREE
 fwsector,zsdcc,BUILD_FAIL,,
-fwbitops,dcc,2944,18997764,AGREE
-fwbitops,clang,3875,9749854,AGREE
-fwbitops,zsdcc,8413,9917955,DIFF
+fwbitops,dcc,2944,19569537,AGREE
+fwbitops,clang,3878,10283235,AGREE
+fwbitops,zsdcc,8421,10036365,AGREE
 fwcoord,dcc,2176,6497249,AGREE
 fwcoord,clang,3567,3230221,AGREE
 fwcoord,zsdcc,8086,3750384,AGREE

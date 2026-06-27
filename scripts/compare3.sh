@@ -72,6 +72,32 @@ mkdir -p "$BUILD_DIR"
 
 # ---------- helpers ----------
 
+# Run a command under a hard wall-clock timeout in its OWN process group, so a
+# hung child AND all of its descendants (clang / zcc / java / ticks) are killed
+# together -- no orphans, no stalled sweep.  macOS has no GNU timeout(1); perl
+# gives us fork + setpgrp + alarm.  Returns the command's exit status, or 124 if
+# the timeout fired (the child was SIGKILLed).
+#
+# Worked example: with_timeout 240 env _C3_ONE=1 bash compare3.sh sieve
+#   - perl forks; the grandchild calls setpgrp(0,0) -> becomes group leader,
+#     then exec's `env ... bash ...`; clang/ld/ticks it spawns inherit the group.
+#   - if 240 s elapse first, SIGALRM -> kill('KILL', -$pid) reaps the whole group.
+with_timeout() {
+    local secs="$1"; shift
+    perl -e '
+        my $secs = shift @ARGV;
+        my $pid  = fork();
+        die "fork: $!" unless defined $pid;
+        if ($pid == 0) { setpgrp(0, 0); exec @ARGV or exit 127; }
+        local $SIG{ALRM} = sub { kill("KILL", -$pid); };
+        alarm $secs;
+        waitpid($pid, 0);
+        my $st = $?;
+        alarm 0;
+        exit(($st & 127) ? 124 : ($st >> 8));
+    ' "$secs" "$@"
+}
+
 # Build a 65536-byte CP/M image (page-zero stub + .COM at 0x0100) for ticks.
 make_ticks_image() {
     local com_file="$1"
@@ -242,6 +268,12 @@ run_test() {
         return
     fi
 
+    # Defensive: a previously SIGKILLed test (watchdog) may have left stale
+    # per-compiler scratch files (.r_dcc_built=1 with no matching size/out).
+    # Clear them so this test's consensus verdict can't read another test's
+    # leftovers.
+    rm -f "$BUILD_DIR"/.r_* 2>/dev/null || true
+
     local compilers="dcc clang zsdcc"
     local c
     # Pass 1: build, measure, capture output into per-compiler temp files
@@ -299,16 +331,64 @@ run_test() {
     [ "$CSV_MODE" -eq 0 ] && echo || true
 }
 
-# ---------- header ----------
+# ---------- header (parent only) ----------
 
-if [ "$CSV_MODE" -eq 1 ]; then
-    printf "test,compiler,size_bytes,tstates,verdict\n"
-else
-    printf "%-12s  %-8s  %10s  %15s  %s\n" \
-        "test" "compiler" "size(B)" "T-states" "verdict"
-    printf "%s\n" "$(printf '%0.s-' {1..62})"
+# In child mode (_C3_ONE set) we run exactly one test and print no header --
+# the parent already printed it once.
+if [ -z "${_C3_ONE:-}" ]; then
+    if [ "$CSV_MODE" -eq 1 ]; then
+        printf "test,compiler,size_bytes,tstates,verdict\n"
+    else
+        printf "%-12s  %-8s  %10s  %15s  %s\n" \
+            "test" "compiler" "size(B)" "T-states" "verdict"
+        printf "%s\n" "$(printf '%0.s-' {1..62})"
+    fi
 fi
 
-for t in $TESTS; do
-    run_test "$t"
-done
+# ---------- driver ----------
+
+# Per-test wall-clock budget.  A test that builds 3 compilers + emulates each
+# can legitimately take a while (fwsector dcc ~180 M tstates), so default high.
+TEST_TIMEOUT="${TEST_TIMEOUT:-300}"
+
+# Emit a single diagnostic row when a whole test could not be completed (the
+# child aborted or was killed by the watchdog), so the failure is VISIBLE in
+# the output and the sweep keeps going instead of silently dropping the test.
+emit_harness_row() {
+    local t="$1" label="$2"
+    if [ "$CSV_MODE" -eq 1 ]; then
+        printf "%s,harness,%s,,\n" "$t" "$label"
+    else
+        printf "%-12s  %-8s  %10s  %15s  %s\n" "$t" "harness" "$label" "" ""
+        echo
+    fi
+}
+
+if [ -n "${_C3_ONE:-}" ]; then
+    # Child mode: run the single requested test in-process.
+    for t in $TESTS; do
+        run_test "$t"
+    done
+else
+    # Parent mode: run EACH test as an isolated child under a hard timeout in
+    # its own process group.  This is the resilience boundary -- a hang, crash,
+    # or `set -e` abort inside one test kills only that child; the parent
+    # records a TIMEOUT/ERROR row and proceeds to the next test.  Results are
+    # flushed per test (each child prints its rows before the next starts), so
+    # redirecting stdout to a file always yields a complete partial record.
+    childflags=""
+    [ "$CSV_MODE" -eq 1 ] && childflags="--csv"
+    for t in $TESTS; do
+        rm -f "$BUILD_DIR"/.r_* 2>/dev/null || true
+        rc=0
+        with_timeout "$TEST_TIMEOUT" env _C3_ONE=1 bash "$0" $childflags "$t" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            if [ "$rc" -eq 124 ]; then
+                emit_harness_row "$t" "TIMEOUT"
+            else
+                emit_harness_row "$t" "ERROR"
+            fi
+        fi
+    done
+    rm -f "$BUILD_DIR"/.r_* 2>/dev/null || true
+fi
