@@ -9,6 +9,7 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 
 #define BUF_BITS  512
 #define BUF_BYTES (BUF_BITS / 8)
@@ -36,16 +37,10 @@ static void bitclear(unsigned int bitpos, unsigned int count)
                 ? count - (8 - bitno) : 0;
     }
 
-    /* Clear whole bytes.
-     * Use an explicit loop instead of memset: CP/M runtime memset
-     * implementations vary in correctness; an explicit loop is
-     * both portable and matches the actual firmware idiom this
-     * benchmark was derived from. */
+    /* Clear whole bytes */
     whole = (unsigned char)(count >> 3);
     if (whole) {
-        unsigned char j;
-        for (j = 0; j < whole; j++)
-            bgbuf[byteoff + j] = 0;
+        memset(bgbuf + byteoff, 0, whole);
         byteoff += whole;
         total_cleared += whole;
     }
@@ -73,10 +68,7 @@ int main(void)
     int i;
     unsigned int checksum = 0;
 
-    {
-        unsigned char j;
-        for (j = 0; j < BUF_BYTES; j++) bgbuf[j] = 0xFF;
-    }
+    memset(bgbuf, 0xFF, sizeof(bgbuf));
 
     for (i = 0; i < 2000; i++) {
         unsigned int pos   = (unsigned int)((i * 13) % BUF_BITS);
@@ -85,12 +77,7 @@ int main(void)
         if ((i & 15) == 0) {
             bitset_range(pos, count);
         }
-        /* XOR accumulator: stays within unsigned int range on both 16-bit
-         * (dcc/Z80) and 32-bit (clang/x86) so all compilers agree.
-         * Addition would overflow 16-bit unsigned int across 2000 iterations
-         * (max sum ~200k >> 65535) causing dcc/clang to diverge.
-         */
-        checksum ^= bgbuf[pos >> 3];
+        checksum += bgbuf[pos >> 3];
     }
     printf("fw_bitops: cleared=%u chk=%u\n", total_cleared, checksum);
     return 0;
