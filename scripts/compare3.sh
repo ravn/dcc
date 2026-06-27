@@ -7,6 +7,9 @@
 #   scripts/compare3.sh <test_name>       -- one test
 #   scripts/compare3.sh --all             -- all tests in TEST_LIST
 #   scripts/compare3.sh --csv [tests...]  -- CSV output
+#   scripts/compare3.sh --html [tests...] -- HTML table (writes $HTML_OUT,
+#                                            default /tmp/compare3.html, and
+#                                            auto-opens it when `open` exists)
 #
 # Environment:
 #   DCC_DIR       root of dcc repo (default: parent of this script's dir)
@@ -15,6 +18,7 @@
 #   Z88DK_BIN     z88dk bin dir (default: /Users/ravn/z80/z88dk/bin)
 #   Z88DK_CFG     z88dk config dir (default: Z88DK_BIN/../lib/config)
 #   MAX_TSTATES   T-state counter ceiling (default: 2000000000 = 2B)
+#   HTML_OUT      output path for --html (default: /tmp/compare3.html)
 
 set -euo pipefail
 
@@ -48,16 +52,18 @@ BUILD_DIR="${DCC_DIR}/build/compare3"
 TEST_LIST="sieve e nqueens fact triangle ttt tstring tqsort tbsearch tsetjmp tmalloch fwdelay fwfdc fwsector fwbitops fwcoord fwxlt fwcrc"
 
 usage() {
-    echo "usage: compare3.sh [--csv] [--all | <test> ...]" >&2
+    echo "usage: compare3.sh [--csv | --html] [--all | <test> ...]" >&2
     exit 1
 }
 
 CSV_MODE=0
+HTML_MODE=0
 ALL_MODE=0
 TESTS=""
 for arg in "$@"; do
     case "$arg" in
         --csv)  CSV_MODE=1 ;;
+        --html) HTML_MODE=1; CSV_MODE=1 ;;  # HTML is rendered from CSV rows
         --all)  ALL_MODE=1 ;;
         -h|--help) usage ;;
         -*) echo "unknown flag: $arg" >&2; usage ;;
@@ -331,20 +337,6 @@ run_test() {
     [ "$CSV_MODE" -eq 0 ] && echo || true
 }
 
-# ---------- header (parent only) ----------
-
-# In child mode (_C3_ONE set) we run exactly one test and print no header --
-# the parent already printed it once.
-if [ -z "${_C3_ONE:-}" ]; then
-    if [ "$CSV_MODE" -eq 1 ]; then
-        printf "test,compiler,size_bytes,tstates,verdict\n"
-    else
-        printf "%-12s  %-8s  %10s  %15s  %s\n" \
-            "test" "compiler" "size(B)" "T-states" "verdict"
-        printf "%s\n" "$(printf '%0.s-' {1..62})"
-    fi
-fi
-
 # ---------- driver ----------
 
 # Per-test wall-clock budget.  A test that builds 3 compilers + emulates each
@@ -364,31 +356,68 @@ emit_harness_row() {
     fi
 }
 
-if [ -n "${_C3_ONE:-}" ]; then
-    # Child mode: run the single requested test in-process.
-    for t in $TESTS; do
-        run_test "$t"
-    done
-else
-    # Parent mode: run EACH test as an isolated child under a hard timeout in
-    # its own process group.  This is the resilience boundary -- a hang, crash,
-    # or `set -e` abort inside one test kills only that child; the parent
-    # records a TIMEOUT/ERROR row and proceeds to the next test.  Results are
-    # flushed per test (each child prints its rows before the next starts), so
-    # redirecting stdout to a file always yields a complete partial record.
-    childflags=""
-    [ "$CSV_MODE" -eq 1 ] && childflags="--csv"
-    for t in $TESTS; do
-        rm -f "$BUILD_DIR"/.r_* 2>/dev/null || true
-        rc=0
-        with_timeout "$TEST_TIMEOUT" env _C3_ONE=1 bash "$0" $childflags "$t" || rc=$?
-        if [ "$rc" -ne 0 ]; then
-            if [ "$rc" -eq 124 ]; then
-                emit_harness_row "$t" "TIMEOUT"
-            else
-                emit_harness_row "$t" "ERROR"
-            fi
+# Print the header (parent only) + run every test.  Wrapped in a function so
+# --html can capture the CSV stream and render it, while plain/--csv runs stream
+# straight to stdout.
+run_sweep() {
+    # In child mode (_C3_ONE set) we run exactly one test and print no header --
+    # the parent already printed it once.
+    if [ -z "${_C3_ONE:-}" ]; then
+        if [ "$CSV_MODE" -eq 1 ]; then
+            printf "test,compiler,size_bytes,tstates,verdict\n"
+        else
+            printf "%-12s  %-8s  %10s  %15s  %s\n" \
+                "test" "compiler" "size(B)" "T-states" "verdict"
+            printf "%s\n" "$(printf '%0.s-' {1..62})"
         fi
-    done
-    rm -f "$BUILD_DIR"/.r_* 2>/dev/null || true
+    fi
+
+    if [ -n "${_C3_ONE:-}" ]; then
+        # Child mode: run the single requested test in-process.
+        for t in $TESTS; do
+            run_test "$t"
+        done
+    else
+        # Parent mode: run EACH test as an isolated child under a hard timeout in
+        # its own process group.  This is the resilience boundary -- a hang,
+        # crash, or `set -e` abort inside one test kills only that child; the
+        # parent records a TIMEOUT/ERROR row and proceeds to the next test.
+        # Results are flushed per test (each child prints its rows before the
+        # next starts), so redirecting stdout to a file always yields a complete
+        # partial record.
+        local childflags=""
+        [ "$CSV_MODE" -eq 1 ] && childflags="--csv"
+        local t rc
+        for t in $TESTS; do
+            rm -f "$BUILD_DIR"/.r_* 2>/dev/null || true
+            rc=0
+            with_timeout "$TEST_TIMEOUT" env _C3_ONE=1 bash "$0" $childflags "$t" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                if [ "$rc" -eq 124 ]; then
+                    emit_harness_row "$t" "TIMEOUT"
+                else
+                    emit_harness_row "$t" "ERROR"
+                fi
+            fi
+        done
+        rm -f "$BUILD_DIR"/.r_* 2>/dev/null || true
+    fi
+}
+
+if [ "$HTML_MODE" -eq 1 ]; then
+    # Buffer the CSV stream to a temp file, then render it to HTML.  A child
+    # invocation (_C3_ONE) never reaches here -- children always run CSV rows.
+    HTML_OUT="${HTML_OUT:-/tmp/compare3.html}"
+    _tmpcsv="$(mktemp "${TMPDIR:-/tmp}/compare3_XXXXXX.csv")"
+    run_sweep > "$_tmpcsv"
+    python3 "$SCRIPT_DIR/compare3_html.py" "$_tmpcsv" "$HTML_OUT"
+    rm -f "$_tmpcsv"
+    # Auto-open on a desktop (macOS `open` / Linux `xdg-open`) when available.
+    if command -v open >/dev/null 2>&1; then
+        open "$HTML_OUT"
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$HTML_OUT" >/dev/null 2>&1 || true
+    fi
+else
+    run_sweep
 fi
