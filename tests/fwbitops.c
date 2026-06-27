@@ -3,13 +3,17 @@
  *
  * Source: rcbios-in-c/bios.c bg_clear_from().  Converts a bit-position into
  * a byte offset + bit-within-byte, clears the trailing bits of a partial byte,
- * then clears whole bytes with memset, then clears leading bits of the last byte.
+ * then clears whole bytes with an explicit fill loop, then clears leading bits
+ * of the last byte.
+ *
+ * The explicit fill loop is intentional: clang's LoopIdiomRecognize recognises
+ * it as a memset-equivalent and lowers it to the Z80 LDIR instruction, matching
+ * the firmware idiom exactly (see llvm-z80 lit test loop-idiom-fill-ldir.ll).
  *
  * Workload: 2000 calls cycling through different bit positions and counts.
  */
 
 #include <stdio.h>
-#include <string.h>
 
 #define BUF_BITS  512
 #define BUF_BYTES (BUF_BITS / 8)
@@ -40,7 +44,9 @@ static void bitclear(unsigned int bitpos, unsigned int count)
     /* Clear whole bytes */
     whole = (unsigned char)(count >> 3);
     if (whole) {
-        memset(bgbuf + byteoff, 0, whole);
+        unsigned char j;
+        for (j = 0; j < whole; j++)
+            bgbuf[byteoff + j] = 0;
         byteoff += whole;
         total_cleared += whole;
     }
@@ -68,7 +74,11 @@ int main(void)
     int i;
     unsigned int checksum = 0;
 
-    memset(bgbuf, 0xFF, sizeof(bgbuf));
+    {
+        unsigned char j;
+        for (j = 0; j < BUF_BYTES; j++)
+            bgbuf[j] = 0xFF;
+    }
 
     for (i = 0; i < 2000; i++) {
         unsigned int pos   = (unsigned int)((i * 13) % BUF_BITS);
