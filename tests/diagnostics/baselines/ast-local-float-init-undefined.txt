@@ -1,0 +1,2 @@
+<source>:3: error DCC-E0201: use of undeclared identifier 'missing_symbol'
+dcc: 1 error(s)

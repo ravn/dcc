@@ -81,17 +81,18 @@ try {
     }
 
     function Get-WindowsBuildToolsHelp {
+        $toolchain = Get-MsvcToolchain
         @"
 Could not find MSVC build tools.
 
 Install one of these, then rerun this script:
-    winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --wait"
-    winget install --id Microsoft.VisualStudio.2022.Community -e
+    $($toolchain.InstallCommand)
+    winget install --id Microsoft.VisualStudio.Community -e
 
 If Visual Studio is already installed, open Visual Studio Installer and add:
     Desktop development with C++
 
-This script looks for vcvars64.bat and requires the MSVC x64 C++ toolchain.
+This script looks for $($toolchain.VcVars) and requires the $($toolchain.Description).
 "@
     }
 
@@ -132,12 +133,32 @@ You can also pass a compiler explicitly:
 "@
     }
 
+    function Get-MsvcToolchain {
+        $isWindowsArm64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64
+        if ($isWindowsArm64) {
+            return [pscustomobject]@{
+                Component = "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+                VcVars = "vcvarsarm64.bat"
+                Description = "MSVC ARM64 C++ toolchain"
+                InstallCommand = 'winget install --id Microsoft.VisualStudio.BuildTools -e --override "--add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --includeRecommended --quiet --wait"'
+            }
+        }
+
+        return [pscustomobject]@{
+            Component = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+            VcVars = "vcvars64.bat"
+            Description = "MSVC x64 C++ toolchain"
+            InstallCommand = 'winget install --id Microsoft.VisualStudio.BuildTools -e --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --wait"'
+        }
+    }
+
     function Get-MsvcVarsPath {
+        $toolchain = Get-MsvcToolchain
         $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
         if (Test-Path $vswhere) {
-            $installPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            $installPath = & $vswhere -latest -products * -requires $toolchain.Component -property installationPath
             if ($installPath) {
-                $candidate = Join-Path $installPath "VC\Auxiliary\Build\vcvars64.bat"
+                $candidate = Join-Path $installPath "VC\Auxiliary\Build\$($toolchain.VcVars)"
                 if (Test-Path $candidate) { return $candidate }
             }
         }
@@ -148,7 +169,7 @@ You can also pass a compiler explicitly:
         foreach ($root in $roots) {
             foreach ($version in $versions) {
                 foreach ($edition in $editions) {
-                    $candidate = Join-Path $root "Microsoft Visual Studio\$version\$edition\VC\Auxiliary\Build\vcvars64.bat"
+                    $candidate = Join-Path $root "Microsoft Visual Studio\$version\$edition\VC\Auxiliary\Build\$($toolchain.VcVars)"
                     if (Test-Path $candidate) { return $candidate }
                 }
             }
@@ -157,10 +178,11 @@ You can also pass a compiler explicitly:
     }
 
     function Initialize-Msvc {
+        $toolchain = Get-MsvcToolchain
         $vcvars = Get-MsvcVarsPath
         if (-not $vcvars) { throw (Get-WindowsBuildToolsHelp) }
 
-        Write-Host "Found MSVC: $vcvars"
+        Write-Host "Found $($toolchain.Description): $vcvars"
         $envBlock = & cmd /c "`"$vcvars`" >nul 2>&1 && set"
         foreach ($line in $envBlock) {
             if ($line -match "^([^=]+)=(.*)$") {
@@ -265,6 +287,11 @@ You can also pass a compiler explicitly:
             @{ Pattern = '(?<![A-Za-z0-9_])outp\s*\('; Reason = 'Z80 port output' },
             @{ Pattern = '(?<![A-Za-z0-9_])getch\s*\('; Reason = 'CP/M non-echo console input' },
             @{ Pattern = '(?<![A-Za-z0-9_])kbhit\s*\('; Reason = 'CP/M console polling' },
+            @{ Pattern = '(?<![A-Za-z0-9_])tmpnam\s*\('; Reason = 'CP/M 8.3 limit' },
+            @{ Pattern = '(?<![A-Za-z0-9_])execv\s*\('; Reason = 'CP/M execv' },
+            @{ Pattern = '(?<![A-Za-z0-9_])strftime\s*\('; Reason = 'CP/M strftime' },
+            @{ Pattern = '(?<![A-Za-z0-9_])assert\s*\('; Reason = 'CP/M assert' },
+            @{ Pattern = '(?<![A-Za-z0-9_])abort\s*\('; Reason = 'CP/M abort' },
             @{ Pattern = '\*\s*\([^\)]*\*\)\s*6\b'; Reason = 'CP/M BDOS vector memory access' }
         )
 
@@ -314,7 +341,7 @@ You can also pass a compiler explicitly:
 
         if ($Compiler.Kind -eq "msvc") {
             $objPath = Join-Path $WorkDir ([System.IO.Path]::GetFileNameWithoutExtension($ExePath) + ".obj")
-            $arguments = @("/nologo", "/w", "/O2", "/std:c11", "/Fe:$ExePath", "/Fo:$objPath", $SourceFile)
+            $arguments = @("/nologo", "/w", "/O2", "/Zc:__STDC__", "/std:c11", "/Fe:$ExePath", "/Fo:$objPath", $SourceFile)
             $output = & $Compiler.Command @arguments 2>&1
             return [pscustomobject]@{ Success = ($LASTEXITCODE -eq 0 -and (Test-Path $ExePath -PathType Leaf)); Output = ($output -join "`n") }
         }
@@ -499,6 +526,7 @@ You can also pass a compiler explicitly:
         '{{DATE}}' = '[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}'
         '{{TIME}}' = '\d{2}:\d{2}:\d{2}'
         '{{SEP}}'  = '[/\\]'
+        '{{UINT}}' = '\d+'
     }
 
     $testFiles = if ($App) {

@@ -1,0 +1,4 @@
+<source>:2: error DCC-E0401: constant integer expression expected near 'x'
+        A = x
+            ^
+dcc: 1 error(s)

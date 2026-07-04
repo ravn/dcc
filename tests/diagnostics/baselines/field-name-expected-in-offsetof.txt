@@ -1,0 +1,4 @@
+<source>:6: error DCC-E0503: field name expected in offsetof near '1'
+        A = __offsetof(struct S, 1)
+                                 ^
+dcc: 1 error(s)

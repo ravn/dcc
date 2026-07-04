@@ -11,6 +11,335 @@
  */
 
 #include "dcc.h"
+#include "dcc_ast.h"
+
+static int inline_param_index(struct Sym *s, const char *name)
+{
+    int i;
+    if (s == NULL || name == NULL)
+        return -1;
+    for (i = 0; i < s->proto_nargs && i < MAX_PROTO_PARAMS; ++i)
+        if (!strcmp(s->inline_param_names[i], name))
+            return i;
+    return -1;
+}
+
+static int inline_expr_is_simple(struct Sym *fn, const struct AstNode *n)
+{
+    int i;
+
+    if (n == NULL)
+        return 0;
+    switch (n->kind) {
+    case AST_INT_LIT:
+    case AST_FLOAT_LIT:
+    case AST_STR_LIT:
+    case AST_SIZEOF_EXPR:
+    case AST_SIZEOF_TYPE:
+        return 1;
+    case AST_IDENT:
+        i = inline_param_index(fn, n->sval);
+        if (i >= 0) {
+            if (i < MAX_PROTO_PARAMS)
+                fn->inline_param_use_count[i]++;
+            return 1;
+        }
+        return find_global(n->sval) != NULL;
+    case AST_UNARY:
+        if (n->op == TOK_INC || n->op == TOK_DEC)
+            return 0;
+        return inline_expr_is_simple(fn, n->a);
+    case AST_BINARY:
+    case AST_LOGAND:
+    case AST_LOGOR:
+    case AST_INDEX:
+        return inline_expr_is_simple(fn, n->a) && inline_expr_is_simple(fn, n->b);
+    case AST_ASSIGN:
+        return inline_expr_is_simple(fn, n->a) && inline_expr_is_simple(fn, n->b);
+    case AST_MEMBER:
+        return inline_expr_is_simple(fn, n->a);
+    case AST_COND:
+        return inline_expr_is_simple(fn, n->a) && inline_expr_is_simple(fn, n->b) &&
+               inline_expr_is_simple(fn, n->c);
+    case AST_CAST:
+        return inline_expr_is_simple(fn, n->a);
+    case AST_CALL:
+        if (n->a == NULL || n->a->kind != AST_IDENT)
+            return 0;
+        for (i = 0; i < n->list_len; ++i)
+            if (!inline_expr_is_simple(fn, n->list[i]))
+                return 0;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static struct AstNode *inline_stmt_return_expr(struct AstNode *n)
+{
+    if (n == NULL)
+        return NULL;
+    if (n->kind == AST_RETURN)
+        return n->a;
+    if (n->kind == AST_COMPOUND && n->list_len == 1 && n->list[0] != NULL &&
+        n->list[0]->kind == AST_RETURN)
+        return n->list[0]->a;
+    return NULL;
+}
+
+static struct AstNode *inline_return_expr_from_seq(struct AstNode *body, int index)
+{
+    struct AstNode *stmt;
+    struct AstNode *then_expr;
+    struct AstNode *else_expr;
+    struct AstNode *rest_expr;
+    struct AstNode *cond;
+
+    if (body == NULL || body->kind != AST_COMPOUND || index >= body->list_len)
+        return NULL;
+
+    stmt = body->list[index];
+    if (stmt == NULL)
+        return NULL;
+
+    if (stmt->kind == AST_RETURN)
+        return (index == body->list_len - 1) ? stmt->a : NULL;
+
+    if (stmt->kind != AST_IF)
+        return NULL;
+
+    then_expr = inline_stmt_return_expr(stmt->b);
+    if (then_expr == NULL)
+        return NULL;
+
+    if (stmt->c != NULL) {
+        if (index != body->list_len - 1)
+            return NULL;
+        else_expr = inline_stmt_return_expr(stmt->c);
+        if (else_expr == NULL)
+            return NULL;
+    } else {
+        rest_expr = inline_return_expr_from_seq(body, index + 1);
+        if (rest_expr == NULL)
+            return NULL;
+        else_expr = rest_expr;
+    }
+
+    cond = ast_new(&g_ast_inline_arena, AST_COND);
+    cond->a = stmt->a;
+    cond->b = then_expr;
+    cond->c = else_expr;
+    cond->type = 0;
+    return cond;
+}
+
+static int inline_void_stmt_body_is_simple(struct Sym *fn, const struct AstNode *n)
+{
+    int i;
+
+    if (n == NULL)
+        return 0;
+    if (n->kind != AST_COMPOUND)
+        return 0;
+    if (n->list_len <= 0)
+        return 0;
+    for (i = 0; i < n->list_len; ++i) {
+        const struct AstNode *stmt;
+        stmt = n->list[i];
+        if (stmt == NULL || stmt->kind != AST_EXPR_STMT || stmt->a == NULL)
+            return 0;
+        if (!inline_expr_is_simple(fn, stmt->a))
+            return 0;
+    }
+    return 1;
+}
+
+static void record_inline_function_if_simple(struct Sym *s)
+{
+    long sv_pos;
+    long sv_tok_start;
+    int sv_line;
+    int sv_tok_line;
+    struct Token sv_tok;
+    struct AstNode *body;
+    struct AstNode *ret_expr;
+    int i;
+    int nparams;
+    size_t namelen;
+
+    if (s == NULL || !s->is_static || !s->is_inline || tok.kind != '{')
+        return;
+    if ((s->type & 15) != TYPE_VOID &&
+        (!(type_size(s->type) == 2 || type_size(s->type) == 4) ||
+         type_is_bool(s->type) || type_is_struct_object(s->type)))
+        return;
+
+    nparams = 0;
+    for (i = 0; i < nlocals && nparams < MAX_PROTO_PARAMS; ++i) {
+        if (locals[i].storage == SC_PARAM) {
+            if (!(type_size(locals[i].type) == 2 || type_size(locals[i].type) == 4) ||
+                type_is_struct_object(locals[i].type))
+                return;
+            namelen = strlen(locals[i].name);
+            if (namelen > sizeof(s->inline_param_names[nparams]) - 1)
+                namelen = sizeof(s->inline_param_names[nparams]) - 1;
+            memcpy(s->inline_param_names[nparams], locals[i].name, namelen);
+            s->inline_param_names[nparams][namelen] = 0;
+            nparams++;
+        }
+    }
+    if (nparams != s->proto_nargs || s->proto_variadic)
+        return;
+
+    sv_pos = posi;
+    sv_tok_start = tok_start_pos;
+    sv_line = line_no;
+    sv_tok_line = tok_line;
+    sv_tok = tok;
+
+    body = ast_build_stmt(&g_ast_inline_arena);
+
+    posi = sv_pos;
+    tok_start_pos = sv_tok_start;
+    line_no = sv_line;
+    tok_line = sv_tok_line;
+    tok = sv_tok;
+
+    for (i = 0; i < MAX_PROTO_PARAMS; ++i)
+        s->inline_param_use_count[i] = 0;
+
+    if ((s->type & 15) == TYPE_VOID) {
+        if (!inline_void_stmt_body_is_simple(s, body))
+            return;
+        if (body->list_len == 1)
+            s->inline_stmt_expr = body->list[0]->a;
+        else
+            s->inline_stmt_body = body;
+        return;
+    }
+
+    ret_expr = inline_return_expr_from_seq(body, 0);
+    if (ret_expr == NULL)
+        return;
+    if (!inline_expr_is_simple(s, ret_expr))
+        return;
+
+    s->inline_return_expr = ret_expr;
+}
+
+static int static_inline_body_can_be_buffered(struct Sym *s)
+{
+    return s != NULL && s->is_static && s->is_inline &&
+           (s->inline_return_expr != NULL || s->inline_stmt_expr != NULL ||
+            s->inline_stmt_body != NULL);
+}
+
+static void inline_temp_name(char *dst, int dstsz, int index)
+{
+    sprintf(dst, "#itmp%d", index);
+    (void)dstsz;
+}
+
+static int inline_function_has_multiuse_param(struct Sym *s)
+{
+    int i;
+
+    if (s == NULL || !s->is_static || !s->is_inline ||
+        (s->inline_return_expr == NULL && s->inline_stmt_expr == NULL &&
+         s->inline_stmt_body == NULL))
+        return 0;
+    for (i = 0; i < s->proto_nargs && i < MAX_PROTO_PARAMS; ++i)
+        if (s->inline_param_use_count[i] > 1)
+            return 1;
+    return 0;
+}
+
+static int function_body_mentions_multiuse_inline_call(void)
+{
+    long sv_pos;
+    long sv_tok_start;
+    int sv_line;
+    int sv_tok_line;
+    struct Token sv_tok;
+    int depth;
+    int result;
+
+    if (tok.kind != '{')
+        return 0;
+
+    sv_pos = posi;
+    sv_tok_start = tok_start_pos;
+    sv_line = line_no;
+    sv_tok_line = tok_line;
+    sv_tok = tok;
+
+    depth = 1;
+    result = 0;
+    next_token();
+    while (tok.kind != TOK_EOF && depth > 0) {
+        if (tok.kind == TOK_ID) {
+            char name[64];
+            struct Sym *s;
+
+            strncpy(name, tok.text, sizeof(name) - 1);
+            name[sizeof(name) - 1] = 0;
+            next_token();
+            if (tok.kind == '(') {
+                s = find_global(name);
+                if (inline_function_has_multiuse_param(s)) {
+                    result = 1;
+                    break;
+                }
+            }
+            continue;
+        }
+        if (tok.kind == '{')
+            depth++;
+        else if (tok.kind == '}')
+            depth--;
+        next_token();
+    }
+
+    posi = sv_pos;
+    tok_start_pos = sv_tok_start;
+    line_no = sv_line;
+    tok_line = sv_tok_line;
+    tok = sv_tok;
+    return result;
+}
+
+static void reserve_inline_temp_locals(void)
+{
+    int i;
+
+    for (i = 0; i < MAX_PROTO_PARAMS; ++i) {
+        char name[64];
+        inline_temp_name(name, sizeof(name), i);
+        add_local_alloc(name, TYPE_INT, 2);
+    }
+}
+
+void emit_needed_inline_bodies(void)
+{
+    int i;
+
+    for (i = 0; i < nglobals; ++i) {
+        struct Sym *s;
+        int c;
+
+        s = &globals[i];
+        if (s->inline_body_file == NULL)
+            continue;
+        if (s->inline_body_needed) {
+            rewind(s->inline_body_file);
+            while ((c = fgetc(s->inline_body_file)) != EOF)
+                fputc(c, outf);
+        }
+        fclose(s->inline_body_file);
+        s->inline_body_file = NULL;
+    }
+}
+
 int current_void_is_empty_param_list(void)
 {
     long save_pos;
@@ -97,6 +426,11 @@ void skip_prototype_array_suffixes(int *ptype)
 void skip_prototype_function_suffix(void)
 {
     int depth;
+    long save_pos;
+    long save_tok_start;
+    int save_line;
+    int save_tok_line;
+    struct Token save_tok;
 
     if (!accept('('))
         return;
@@ -108,6 +442,25 @@ void skip_prototype_function_suffix(void)
         else if (tok.kind == ')')
             depth--;
         next_token();
+    }
+
+    while (tok.kind == '(')
+        skip_prototype_function_suffix();
+
+    if (tok.kind == ')') {
+        save_pos = posi;
+        save_tok_start = tok_start_pos;
+        save_line = line_no;
+        save_tok_line = tok_line;
+        save_tok = tok;
+        next_token();
+        if (tok.kind != ',') {
+            posi = save_pos;
+            tok_start_pos = save_tok_start;
+            line_no = save_line;
+            tok_line = save_tok_line;
+            tok = save_tok;
+        }
     }
 }
 
@@ -316,6 +669,10 @@ void parse_param_list(void)
         }
 
         type = parse_type();
+        if (g_typedef_array_len > 0) {
+            type = type_add_ptr(type);
+            g_typedef_array_len = 0;
+        }
         unnamed_id = 0;
 
         while (accept('*')) {
@@ -460,12 +817,13 @@ void emit_function_prologue(const char *name, int local_bytes, int omit_ix_frame
         emit_runtime_call("__stchk");
 }
 
-void emit_function_epilogue(void)
+void emit_function_epilogue(int implicit_zero_return)
 {
+    if (implicit_zero_return)
+        emit("\tld hl,0\n");
     emit_label(current_return_label);
-    /* Always emit ld sp,ix so that gen_switch_chain's push/pop of the switch
-     * value does not corrupt the stack when a return fires inside a case body.
-     * pass_elim_ix_frame and pass_shared_frame_stubs clean up the extra
+    /* Always emit ld sp,ix so returns from nested control flow restore the
+     * caller stack reliably. pass_elim_ix_frame and pass_shared_frame_stubs clean up the extra
      * instruction for functions that never actually need the stack restore. */
     if (!current_omit_ix_frame) {
         emit("\tld sp,ix\n");
@@ -484,6 +842,109 @@ void skip_initializer_or_decl_tail(void)
 
     while (tok.kind != TOK_EOF) {
         if (depth == 0 && (tok.kind == ',' || tok.kind == ';')) return;
+
+        if (tok.kind == '(' || tok.kind == '[' || tok.kind == '{') depth++;
+        else if (tok.kind == ')' || tok.kind == ']' || tok.kind == '}') {
+            if (depth > 0) depth--;
+        }
+
+        next_token();
+    }
+}
+
+static int scan_compound_literal_if_present(void)
+{
+    long save_pos;
+    long save_tok_start;
+    int save_line;
+    int save_tok_line;
+    int save_long_suffix;
+    int save_unsigned_suffix;
+    struct Token save_tok;
+    int type;
+    int size;
+    int depth;
+
+    if (tok.kind != '(' || !paren_starts_cast())
+        return 0;
+
+    save_pos = posi;
+    save_tok_start = tok_start_pos;
+    save_line = line_no;
+    save_tok_line = tok_line;
+    save_long_suffix = g_tok_long_suffix;
+    save_unsigned_suffix = g_tok_unsigned_suffix;
+    save_tok = tok;
+
+    depth = 1;
+    next_token();
+    while (tok.kind != TOK_EOF && depth > 0) {
+        if (tok.kind == '(')
+            depth++;
+        else if (tok.kind == ')')
+            depth--;
+        next_token();
+    }
+
+    if (tok.kind != '{') {
+        posi = save_pos;
+        tok_start_pos = save_tok_start;
+        line_no = save_line;
+        tok_line = save_tok_line;
+        g_tok_long_suffix = save_long_suffix;
+        g_tok_unsigned_suffix = save_unsigned_suffix;
+        tok = save_tok;
+        return 0;
+    }
+
+    posi = save_pos;
+    tok_start_pos = save_tok_start;
+    line_no = save_line;
+    tok_line = save_tok_line;
+    g_tok_long_suffix = save_long_suffix;
+    g_tok_unsigned_suffix = save_unsigned_suffix;
+    tok = save_tok;
+
+    next_token();
+    parse_type_name_decl(&type, &size);
+    expect(')');
+
+    if (tok.kind != '{') {
+        posi = save_pos;
+        tok_start_pos = save_tok_start;
+        line_no = save_line;
+        tok_line = save_tok_line;
+        tok = save_tok;
+        return 0;
+    }
+
+    add_compound_literal_local(type);
+
+    depth = 0;
+    do {
+        if (tok.kind == TOK_EOF)
+            break;
+        if (tok.kind == '{')
+            depth++;
+        else if (tok.kind == '}')
+            depth--;
+        next_token();
+    } while (depth > 0);
+
+    return 1;
+}
+
+static void scan_initializer_or_decl_tail(void)
+{
+    int depth;
+
+    depth = 0;
+
+    while (tok.kind != TOK_EOF) {
+        if (depth == 0 && (tok.kind == ',' || tok.kind == ';')) return;
+
+        if (tok.kind == '(' && scan_compound_literal_if_present())
+            continue;
 
         if (tok.kind == '(' || tok.kind == '[' || tok.kind == '{') depth++;
         else if (tok.kind == ')' || tok.kind == ']' || tok.kind == '}') {
@@ -606,6 +1067,13 @@ void scan_local_decl_after_type(int base)
         strncpy(source_name, name, sizeof(source_name) - 1);
         source_name[sizeof(source_name) - 1] = 0;
 
+        if (tok.kind == '(') {
+            skip_prototype_function_suffix();
+            if (!accept(','))
+                break;
+            continue;
+        }
+
         if (g_for_decl_seq >= 0) {
             const char *rn;
             rn = enter_for_decl_rename(name);
@@ -681,7 +1149,7 @@ void scan_local_decl_after_type(int base)
          * swallowed this and silently kept the first declaration's type; report
          * it instead, then reuse the existing symbol for error recovery. */
         s = find_local_decl(name);
-        if (s) {
+        if (s && !scan_mode) {
             char redef_msg[96];
             sprintf(redef_msg, "redefinition of '%s'", source_name);
             error_here(redef_msg);
@@ -709,7 +1177,7 @@ void scan_local_decl_after_type(int base)
         g_ptr_array_dim_count = 0;
         g_ptr_array_elem_size = 0;
 
-        if (s && !s->is_const_value && accept('=')) skip_initializer_or_decl_tail();
+        if (s && !s->is_const_value && accept('=')) scan_initializer_or_decl_tail();
 
         if (!accept(',')) break;
     }
@@ -831,6 +1299,8 @@ void scan_function_body(void)
     g_for_decl_rename_index = 0;
     g_for_decl_recording = 0;
     g_scope_depth = 0;
+    g_compound_literal_seq = 0;
+    g_licm_seq = 0;
 
     expect('{');
     enter_scope();              /* function body block */
@@ -849,93 +1319,25 @@ void scan_function_body(void)
             leave_scope();
             can_decl = 1;
         } else if (tok.kind == TOK_FOR) {
-            int for_seq;
             /*
-             * The old scanner looked for starts_type() at every token in the
-             * function body.  That is unsafe now that casts are supported:
+             * Build and replay the whole for-statement (header + body)
+             * through the AST builder/emitter (ast_scan_for_stmt, output
+             * suppressed) instead of hand-walking tokens. This is the exact
+             * same builder+emitter the real codegen pass uses, so frame
+             * sizing - declarations inside the body, C99 for-init renaming,
+             * and any AST-level for-loop fast path that reserves extra frame
+             * space - stays in sync with the real pass by construction,
+             * rather than needing a hand-written parallel scanner kept in
+             * sync by hand. (That hand-written scanner used to live here;
+             * see git history for its final form and the cast-vs-declaration
+             * bug it once had to work around - both are now moot since this
+             * runs the real parser instead of guessing at token shapes.)
              *
-             *     f = s + ((float)p / (float)denom);
-             *
-             * During the pre-pass, the "float" in the cast was mistaken for a
-             * block declaration.  scan_local_decl_after_type() then bailed out
-             * at ')' without consuming a declaration, and the scan could miss
-             * later real declarations.  The generated prologue therefore
-             * reserved too little stack space; a call such as printf could
-             * overwrite locals, making a later call like nmfpart(f) receive
-             * garbage even though f printed correctly just before the call.
-             *
-             * Scan declarations only at statement/declaration boundaries, with
-             * a special case for C99-style for-init declarations.
+             * A 0 return (AST build declined) is left alone: it only happens
+             * for malformed/unsupported input that the real pass will report
+             * with a proper diagnostic anyway.
              */
-            for_seq = g_for_seq++;
-            if (for_seq >= MAX_FOR_SCOPES)
-                fatal("too many for statements");
-            next_token();
-            if (accept('(')) {
-                int depth;
-
-                if (starts_type()) {
-                    int t;
-                    int old_for_decl_seq;
-                    int old_for_decl_rename_index;
-                    int old_for_decl_recording;
-                    decl_is_extern = 0;
-                    decl_is_const = 0;
-                    t = parse_base_type();
-
-                    g_for_rename_count[for_seq] = 0;
-
-                    old_for_decl_seq = g_for_decl_seq;
-                    old_for_decl_rename_index = g_for_decl_rename_index;
-                    old_for_decl_recording = g_for_decl_recording;
-                    g_for_decl_seq = for_seq;
-                    g_for_decl_rename_index = 0;
-                    g_for_decl_recording = 1;
-
-                    if (tok.kind != ';')
-                        scan_local_decl_after_type(t); /* consumes ';' */
-                    else
-                        next_token();
-
-                    while (g_for_decl_rename_index > 0) {
-                        pop_for_rename();
-                        g_for_decl_rename_index--;
-                    }
-                    g_for_decl_seq = old_for_decl_seq;
-                    g_for_decl_rename_index = old_for_decl_rename_index;
-                    g_for_decl_recording = old_for_decl_recording;
-                } else {
-                    g_for_rename_count[for_seq] = 0;
-                    depth = 0;
-                    while (tok.kind != TOK_EOF) {
-                        if (depth == 0 && tok.kind == ';') {
-                            next_token();
-                            break;
-                        }
-                        if (tok.kind == '(' || tok.kind == '[') depth++;
-                        else if (tok.kind == ')' || tok.kind == ']') {
-                            if (depth > 0) depth--;
-                        }
-                        next_token();
-                    }
-                }
-
-                /* Skip the condition and increment clauses.  They may contain
-                 * casts, but cannot contain declarations except for the
-                 * for-init handled above. */
-                depth = 0;
-                while (tok.kind != TOK_EOF) {
-                    if (depth == 0 && tok.kind == ')') {
-                        next_token();
-                        break;
-                    }
-                    if (tok.kind == '(' || tok.kind == '[') depth++;
-                    else if (tok.kind == ')' || tok.kind == ']') {
-                        if (depth > 0) depth--;
-                    }
-                    next_token();
-                }
-            }
+            ast_scan_for_stmt();
             can_decl = 1;
         } else if (can_decl && tok.kind == TOK_TYPEDEF) {
             parse_typedef_decl();
@@ -944,6 +1346,9 @@ void scan_function_body(void)
             int t;
             int is_static_local;
             decl_is_extern = 0;
+            decl_is_static = 0;
+            decl_is_inline = 0;
+            decl_is_const = 0;
             is_static_local = (tok.kind == TOK_STATIC);
             t = parse_base_type();
             if (tok.kind == ';') {
@@ -956,6 +1361,10 @@ void scan_function_body(void)
             can_decl = 1;
         } else {
             int k;
+            if (tok.kind == '(' && scan_compound_literal_if_present()) {
+                can_decl = 0;
+                continue;
+            }
             k = tok.kind;
             if (k == TOK_ID) {
                 next_token();
@@ -1053,6 +1462,48 @@ void parse_typedef_decl(void)
         expect(';');
         done = 1;
     }
+}
+
+static void parse_global_init_type_at(struct Sym *s, int type, int size, int baseoff);
+static void parse_global_init_array_at(struct Sym *s, int elem_type, int count, int elem_size, int baseoff);
+static void parse_global_init_struct_at(struct Sym *s, int type, int baseoff);
+
+static int global_compound_literal_seq;
+
+static int parse_global_compound_literal_address(char *label, int labelsz)
+{
+    int type;
+    int size;
+    char name[64];
+    struct Sym *lit;
+
+    if (tok.kind != '(' || !paren_starts_cast())
+        return 0;
+
+    next_token();
+    parse_type_name_decl(&type, &size);
+    expect(')');
+
+    if (tok.kind != '{') {
+        error_here("compound literal initializer expected");
+        return 1;
+    }
+
+    sprintf(name, "__clit%d", global_compound_literal_seq++);
+    lit = add_global(name, type, SC_GLOBAL);
+    lit->is_defined = 1;
+    lit->is_static = 1;
+    lit->needs_extrn = 0;
+    lit->has_init = 1;
+    lit->init_count = 0;
+    lit->size = size;
+    parse_global_init_type_at(lit, type, size, 0);
+
+    if (label && labelsz > 0) {
+        strncpy(label, name, labelsz - 1);
+        label[labelsz - 1] = 0;
+    }
+    return 1;
 }
 
 int parse_global_init_atom(long *val, char *label, int labelsz)
@@ -1156,6 +1607,8 @@ int parse_global_init_atom(long *val, char *label, int labelsz)
 
     if (tok.kind == '&') {
         next_token();
+        if (parse_global_compound_literal_address(label, labelsz))
+            return 2;
         if (tok.kind == TOK_ID) {
             if (label && labelsz > 0) {
                 struct Sym *ls;
@@ -1169,10 +1622,14 @@ int parse_global_init_atom(long *val, char *label, int labelsz)
             return 2;   /* symbolic address */
         }
         error_here("identifier expected after & in initializer");
+        if (tok.kind != ',' && tok.kind != ';' && tok.kind != '}')
+            next_token();
         return 0;
     }
 
     error_here("constant initializer expected");
+    if (tok.kind != ',' && tok.kind != ';' && tok.kind != '}')
+        next_token();
     return 0;
 }
 
@@ -1214,6 +1671,171 @@ void append_global_zero_bytes(struct Sym *s, int bytes)
     }
 }
 
+static int global_init_used_bytes(struct Sym *s)
+{
+    int i;
+    int used;
+
+    used = 0;
+    for (i = 0; i < s->init_count; ++i)
+        used += s->init_sizes[i] ? s->init_sizes[i] : 2;
+    return used;
+}
+
+static int global_init_entry_at_offset(struct Sym *s, int off, int *startp)
+{
+    int i;
+    int cur;
+    int sz;
+
+    cur = 0;
+    for (i = 0; i < s->init_count; ++i) {
+        sz = s->init_sizes[i] ? s->init_sizes[i] : 2;
+        if (cur == off) {
+            if (startp) startp[0] = cur;
+            return i;
+        }
+        if (off > cur && off < cur + sz) {
+            if (startp) startp[0] = cur;
+            return -2;
+        }
+        cur += sz;
+    }
+
+    if (cur == off) {
+        if (startp) startp[0] = cur;
+        return s->init_count;
+    }
+
+    if (startp) startp[0] = cur;
+    return -1;
+}
+
+static void global_init_pad_to_offset(struct Sym *s, int off)
+{
+    while (global_init_used_bytes(s) < off)
+        append_global_init(s, NULL, 0, 1, 0);
+}
+
+static void global_init_write_byte_at(struct Sym *s, int off, unsigned int v)
+{
+    int idx;
+    int start;
+
+    if (off < 0) {
+        error_here("negative initializer offset");
+        return;
+    }
+
+    global_init_pad_to_offset(s, off);
+    idx = global_init_entry_at_offset(s, off, &start);
+    if (idx == s->init_count) {
+        append_global_init(s, NULL, (long)(v & 255U), 1, 0);
+        return;
+    }
+
+    if (idx < 0 || s->init_sizes[idx] != 1) {
+        error_here("initializer designator overlaps address constant");
+        return;
+    }
+
+    sprintf(s->init_labels[idx], "%u", v & 255U);
+    s->init_sizes[idx] = 1;
+}
+
+static void global_init_insert_entry_at(struct Sym *s, int idx, const char *label, long v, int bytes, int is_label)
+{
+    grow_init_cap(s, s->init_count + 1);
+    if (idx < s->init_count) {
+        memmove(&s->init_labels[idx + 1], &s->init_labels[idx],
+                (size_t)(s->init_count - idx) * sizeof(s->init_labels[0]));
+        memmove(&s->init_sizes[idx + 1], &s->init_sizes[idx],
+                (size_t)(s->init_count - idx) * sizeof(s->init_sizes[0]));
+    }
+    if (is_label) {
+        strncpy(s->init_labels[idx], label, sizeof(s->init_labels[0]) - 1);
+        s->init_labels[idx][sizeof(s->init_labels[0]) - 1] = 0;
+    } else {
+        sprintf(s->init_labels[idx], "%ld", v);
+    }
+    s->init_sizes[idx] = bytes;
+    s->init_count++;
+}
+
+static void global_init_remove_entries(struct Sym *s, int idx, int count)
+{
+    if (count <= 0) return;
+    if (idx + count < s->init_count) {
+        memmove(&s->init_labels[idx], &s->init_labels[idx + count],
+                (size_t)(s->init_count - idx - count) * sizeof(s->init_labels[0]));
+        memmove(&s->init_sizes[idx], &s->init_sizes[idx + count],
+                (size_t)(s->init_count - idx - count) * sizeof(s->init_sizes[0]));
+    }
+    s->init_count -= count;
+}
+
+static void global_init_write_label_at(struct Sym *s, int off, const char *label, int bytes)
+{
+    int idx;
+    int start;
+    int consumed;
+    int count;
+    int i;
+
+    if (bytes <= 0) bytes = 2;
+    if (off < 0) {
+        error_here("negative initializer offset");
+        return;
+    }
+
+    global_init_pad_to_offset(s, off);
+    idx = global_init_entry_at_offset(s, off, &start);
+    if (idx == s->init_count) {
+        append_global_init(s, label, 0, bytes, 1);
+        return;
+    }
+    if (idx < 0) {
+        error_here("initializer designator overlaps address constant");
+        return;
+    }
+
+    consumed = 0;
+    count = 0;
+    for (i = idx; i < s->init_count && consumed < bytes; ++i) {
+        if (s->init_sizes[i] != 1) {
+            error_here("initializer designator overlaps address constant");
+            return;
+        }
+        consumed++;
+        count++;
+    }
+    while (consumed < bytes) {
+        append_global_init(s, NULL, 0, 1, 0);
+        consumed++;
+        count++;
+    }
+    global_init_remove_entries(s, idx, count);
+    global_init_insert_entry_at(s, idx, label, 0, bytes, 1);
+}
+
+static void global_init_write_value_at(struct Sym *s, int off, const char *label, long v, int bytes, int is_label)
+{
+    int i;
+    unsigned long uv;
+
+    if (bytes <= 0) bytes = 2;
+    if (!is_label && bytes == 1 && type_is_bool(s->type))
+        v = v ? 1 : 0;
+    if (is_label) {
+        global_init_write_label_at(s, off, label, bytes);
+        return;
+    }
+
+    uv = (unsigned long)v;
+    for (i = 0; i < bytes; ++i)
+        global_init_write_byte_at(s, off + i, (unsigned int)((uv >> (8 * i)) & 255UL));
+}
+
 void append_global_char_array_string(struct Sym *s, int count, const char *str)
 {
     int i;
@@ -1239,12 +1861,42 @@ void append_global_char_array_string(struct Sym *s, int count, const char *str)
 
 void parse_global_init_type(struct Sym *s, int type, int size);
 
-void parse_global_init_array(struct Sym *s, int elem_type, int count, int elem_size)
+static void global_init_write_char_array_string_at(struct Sym *s, int baseoff, int count, const char *str)
+{
+    int i;
+    int n;
+
+    n = (int)strlen(str);
+    if (count <= 0)
+        return;
+
+    if (n > count) {
+        error_here("string initializer too long for char array field");
+        n = count;
+    }
+
+    for (i = 0; i < n; ++i)
+        global_init_write_value_at(s, baseoff + i, NULL, (unsigned char)str[i], 1, 0);
+    while (i < count) {
+        global_init_write_value_at(s, baseoff + i, NULL, 0, 1, 0);
+        i++;
+    }
+}
+
+static void parse_global_init_array_at(struct Sym *s, int elem_type, int count, int elem_size, int baseoff)
 {
     int n;
+    int maxn;
+    int had_brace;
+    int parse_elem_size;
 
     if (elem_size <= 0) elem_size = type_size(elem_type);
     if (elem_size <= 0) elem_size = 2;
+    parse_elem_size = elem_size;
+    if (count <= 0 && s->is_array && s->dim_count > 1 && s->dims[0] == 0) {
+        parse_elem_size = type_size(elem_type);
+        if (parse_elem_size <= 0) parse_elem_size = 2;
+    }
 
     if ((elem_type & 15) == TYPE_CHAR && type_ptr_depth(elem_type) == 0 &&
         tok.kind == TOK_STR) {
@@ -1254,32 +1906,43 @@ void parse_global_init_array(struct Sym *s, int elem_type, int count, int elem_s
         if (is_wide)
             error_here("wide string cannot initialize char array field");
         else
-            append_global_char_array_string(s, count, lit);
+            global_init_write_char_array_string_at(s, baseoff, count, lit);
         free(lit);
         return;
     }
 
-    if (tok.kind == '{')
+    had_brace = 0;
+    if (tok.kind == '{') {
         next_token();
+        had_brace = 1;
+    }
     n = 0;
-    while (tok.kind != TOK_EOF && tok.kind != '}') {
+    maxn = 0;
+    while (tok.kind != TOK_EOF && (had_brace || count <= 0 || n < count) &&
+           (had_brace || tok.kind != '}')) {
+        if (had_brace && tok.kind == '}')
+            break;
+        if (had_brace && tok.kind == '[') {
+            next_token();
+            n = parse_const_int_expr();
+            expect(']');
+            expect('=');
+        }
         if (count > 0 && n >= count) {
             error_here("too many initializer elements");
             skip_initializer_or_decl_tail();
             break;
         }
-        parse_global_init_type(s, elem_type, elem_size);
+        parse_global_init_type_at(s, elem_type, parse_elem_size, baseoff + n * parse_elem_size);
         n++;
+        if (n > maxn) maxn = n;
+        if (!had_brace && count > 0 && n >= count)
+            break;
         if (!accept(',')) break;
-        if (tok.kind == '}') break;
+        if (had_brace && tok.kind == '}') break;
     }
-    expect('}');
-
-    while (count > 0 && n < count) {
-        append_global_zero_bytes(s, elem_size);
-        n++;
-    }
-
+    if (had_brace)
+        expect('}');
     /*
      * Omitted first dimension on an array of structs, e.g.
      *     static const Instr prog[] = { {..}, {..}, {..} };
@@ -1298,7 +1961,7 @@ void parse_global_init_array(struct Sym *s, int elem_type, int count, int elem_s
         inner = sym_array_inner_count_from(s, 1);
         if (inner <= 0)
             inner = 1;
-        rows = (n + inner - 1) / inner;
+        rows = (maxn + inner - 1) / inner;
         stride = elem_size;
         if (stride <= 0) {
             int base = type_size(elem_type);
@@ -1314,18 +1977,26 @@ void parse_global_init_array(struct Sym *s, int elem_type, int count, int elem_s
     }
 }
 
-void parse_global_init_struct(struct Sym *s, int type)
+void parse_global_init_array(struct Sym *s, int elem_type, int count, int elem_size)
+{
+    parse_global_init_array_at(s, elem_type, count, elem_size, global_init_used_bytes(s));
+}
+
+static int field_def_index(struct FieldDef *fd)
+{
+    if (fd == NULL)
+        return -1;
+    return (int)(fd - field_defs);
+}
+
+static void parse_global_init_struct_at(struct Sym *s, int type, int baseoff)
 {
     int sid;
     int i;
-    int used;
-    int total;
     int is_union;
     int had_brace;
 
     sid = type_struct_id(type);
-    total = type_size(type);
-    used = 0;
     is_union = (sid > 0 && sid <= nstruct_defs && struct_defs[sid - 1].is_union);
 
     had_brace = 0;
@@ -1338,7 +2009,7 @@ void parse_global_init_struct(struct Sym *s, int type)
         struct FieldDef *first;
         first = NULL;
         for (i = 0; i < nfield_defs; ++i) {
-            if (field_defs[i].parent_struct_id == sid) {
+            if (field_defs[i].parent_struct_id == sid && !field_defs[i].is_promoted) {
                 first = &field_defs[i];
                 break;
             }
@@ -1346,10 +2017,9 @@ void parse_global_init_struct(struct Sym *s, int type)
 
         if (first && tok.kind != TOK_EOF && tok.kind != '}') {
             if (first->is_array)
-                parse_global_init_array(s, first->elem_type, first->array_len, first->elem_size);
+                parse_global_init_array_at(s, first->elem_type, first->array_len, first->elem_size, baseoff);
             else
-                parse_global_init_type(s, first->type, first->size);
-            used = first->size;
+                parse_global_init_type_at(s, first->type, first->size, baseoff);
 
             /* Braceless union element in an array (static U a[] = {1,2,3})
              * stops after its single initializer; the array loop owns the
@@ -1357,30 +2027,42 @@ void parse_global_init_struct(struct Sym *s, int type)
             if (had_brace && accept(',')) {
                 if (tok.kind != '}') {
                     error_here("too many union initializer elements");
-                    while (tok.kind != TOK_EOF && tok.kind != '}') {
-                        skip_initializer_or_decl_tail();
-                        if (tok.kind == ',') next_token();
-                        else break;
-                    }
+                    while (tok.kind != TOK_EOF && tok.kind != '}')
+                        next_token();
                 }
             }
         }
 
         if (had_brace)
             expect('}');
-        if (total > used)
-            append_global_zero_bytes(s, total - used);
         return;
     }
 
     for (i = 0; i < nfield_defs && tok.kind != TOK_EOF && tok.kind != '}'; ++i) {
         struct FieldDef *fd;
-        fd = &field_defs[i];
-        if (fd->parent_struct_id != sid)
-            continue;
-
-        if (fd->offset > used)
-            append_global_zero_bytes(s, fd->offset - used);
+        if (tok.kind == '.') {
+            next_token();
+            if (tok.kind != TOK_ID) {
+                error_here("expected a field designator, such as '.field = value'");
+                while (tok.kind != TOK_EOF && tok.kind != '}')
+                    next_token();
+                break;
+            }
+            fd = find_field_def(sid, tok.text);
+            if (fd == NULL) {
+                error_here("unknown field initializer designator");
+                while (tok.kind != TOK_EOF && tok.kind != '}')
+                    next_token();
+                break;
+            }
+            i = field_def_index(fd);
+            next_token();
+            expect('=');
+        } else {
+            fd = &field_defs[i];
+            if (fd->parent_struct_id != sid || fd->is_promoted)
+                continue;
+        }
 
         if (fd->bit_width > 0) {
             int unit_off;
@@ -1396,7 +2078,7 @@ void parse_global_init_struct(struct Sym *s, int type)
             while (k >= 0 && k < nfield_defs && tok.kind != TOK_EOF && tok.kind != '}') {
                 struct FieldDef *bfd;
                 bfd = &field_defs[k];
-                if (bfd->parent_struct_id == sid) {
+                if (bfd->parent_struct_id == sid && !bfd->is_promoted) {
                     if (bfd->bit_width <= 0 || bfd->offset != unit_off)
                         break;
                     unit |= bitfield_init_part(bfd, parse_struct_init_const_value());
@@ -1424,8 +2106,7 @@ void parse_global_init_struct(struct Sym *s, int type)
                 }
                 k = next;
             }
-            append_global_init(s, NULL, (long)(unit & 0xffffU), 2, 0);
-            used = unit_off + 2;
+            global_init_write_value_at(s, baseoff + unit_off, NULL, (long)(unit & 0xffffU), 2, 0);
             if (k > i)
                 i = k - 1;
             if (stop)
@@ -1434,35 +2115,41 @@ void parse_global_init_struct(struct Sym *s, int type)
         }
 
         if (fd->is_array)
-            parse_global_init_array(s, fd->elem_type, fd->array_len, fd->elem_size);
+            parse_global_init_array_at(s, fd->elem_type, fd->array_len, fd->elem_size,
+                                       baseoff + fd->offset);
         else
-            parse_global_init_type(s, fd->type, fd->size);
+            parse_global_init_type_at(s, fd->type, fd->size, baseoff + fd->offset);
 
-        used = fd->offset + fd->size;
+        if (!had_brace && next_parent_field_index(sid, i + 1) < 0)
+            break;
         if (!accept(',')) break;
         if (tok.kind == '}') break;
+        if (tok.kind == '.') i = -1;
     }
-    expect('}');
-
-    if (total > used)
-        append_global_zero_bytes(s, total - used);
+    if (had_brace)
+        expect('}');
 }
 
-void parse_global_init_type(struct Sym *s, int type, int size)
+void parse_global_init_struct(struct Sym *s, int type)
+{
+    parse_global_init_struct_at(s, type, global_init_used_bytes(s));
+}
+
+static void parse_global_init_type_at(struct Sym *s, int type, int size, int baseoff)
 {
     long v;
     char label[64];
     int k;
 
     if ((type & TYPE_STRUCT) && type_ptr_depth(type) == 0) {
-        parse_global_init_struct(s, type);
+        parse_global_init_struct_at(s, type, baseoff);
         return;
     }
 
     if ((type & 15) == TYPE_FLOAT && type_ptr_depth(type) == 0) {
         unsigned long bits;
         if (parse_float_init_literal(&bits))
-            append_global_init(s, NULL, (long)bits, 4, 0);
+            global_init_write_value_at(s, baseoff, NULL, (long)bits, 4, 0);
         else {
             error_here("float initializer must be constant");
             if (tok.kind != ',' && tok.kind != '}') next_token();
@@ -1472,11 +2159,20 @@ void parse_global_init_type(struct Sym *s, int type, int size)
 
     k = parse_global_init_atom(&v, label, sizeof(label));
     if (k == 1)
-        append_global_init(s, NULL, v, size, 0);
+    {
+        if (type_is_bool(type))
+            v = v ? 1 : 0;
+        global_init_write_value_at(s, baseoff, NULL, v, size, 0);
+    }
     else if (k == 2)
-        append_global_init(s, label, 0, size, 1);
+        global_init_write_value_at(s, baseoff, label, 0, size, 1);
     else
         next_token();
+}
+
+void parse_global_init_type(struct Sym *s, int type, int size)
+{
+    parse_global_init_type_at(s, type, size, global_init_used_bytes(s));
 }
 
 void parse_global_scalar_array_init_scalar(struct Sym *s, int *np)
@@ -1510,6 +2206,8 @@ void parse_global_scalar_array_init_scalar(struct Sym *s, int *np)
         k = parse_global_init_atom(&v, s->init_labels[n],
                                    sizeof(s->init_labels[n]));
         if (k == 1) {
+            if (type_is_bool(s->type))
+                v = v ? 1 : 0;
             sprintf(s->init_labels[n], "%ld", v);
             s->init_sizes[n] = elem_bytes;
             np[0] = n + 1;
@@ -1553,6 +2251,27 @@ void parse_global_scalar_array_init_level(struct Sym *s, int *np, int level)
     limit = start + sym_array_elems_from_level(s, level);
 
     while (tok.kind != TOK_EOF && tok.kind != '}') {
+        if (tok.kind == '[') {
+            int idx;
+            int span;
+
+            next_token();
+            idx = parse_const_int_expr();
+            expect(']');
+            expect('=');
+            span = sym_array_elems_from_level(s, level + 1);
+            if (span <= 0) span = 1;
+            if (idx < 0)
+                error_here("negative array initializer designator");
+            else {
+                int target;
+                target = start + idx * span;
+                if (target > np[0])
+                    parse_global_scalar_array_zero_to(s, np, target);
+                else
+                    np[0] = target;
+            }
+        }
         if (tok.kind == '{' && s->dim_count > 0 && level + 1 < s->dim_count)
             parse_global_scalar_array_init_level(s, np, level + 1);
         else
@@ -1573,6 +2292,7 @@ void parse_global_scalar_array_init_level(struct Sym *s, int *np, int level)
 void parse_global_init_list(struct Sym *s)
 {
     int n;
+    int maxn;
     long v;
     int k;
 
@@ -1675,6 +2395,8 @@ void parse_global_init_list(struct Sym *s)
                 k = parse_global_init_atom(&v, s->init_labels[0],
                                            sizeof(s->init_labels[0]));
                 if (k == 1) {
+                    if (type_is_bool(s->type))
+                        v = v ? 1 : 0;
                     s->init_value = v;
                     s->init_count = 0;
                 } else if (k == 2) {
@@ -1685,16 +2407,42 @@ void parse_global_init_list(struct Sym *s)
             }
         } else {
             error_here("array initializer list expected");
+            while (tok.kind != TOK_EOF && tok.kind != ';' && tok.kind != ',')
+                next_token();
         }
         return;
     }
 
     n = 0;
+    maxn = 0;
     while (tok.kind != TOK_EOF && tok.kind != '}') {
+        if (tok.kind == '[') {
+            int idx;
+            int span;
+            int target;
+
+            next_token();
+            idx = parse_const_int_expr();
+            expect(']');
+            expect('=');
+
+            span = sym_array_elems_from_level(s, 1);
+            if (span <= 0) span = 1;
+            if (idx < 0) {
+                error_here("negative array initializer designator");
+            } else {
+                target = idx * span;
+                if (target > n)
+                    parse_global_scalar_array_zero_to(s, &n, target);
+                else
+                    n = target;
+            }
+        }
         if (tok.kind == '{' && s->dim_count > 1)
             parse_global_scalar_array_init_level(s, &n, 1);
         else
             parse_global_scalar_array_init_scalar(s, &n);
+        if (n > maxn) maxn = n;
         if (!accept(','))
             break;
         if (tok.kind == '}')
@@ -1702,6 +2450,8 @@ void parse_global_init_list(struct Sym *s)
     }
 
     expect('}');
+    if (maxn > n)
+        n = maxn;
     if (s->is_array && s->array_len > 0) {
         int total;
         total = sym_array_total_elems(s);
@@ -1723,6 +2473,210 @@ void parse_global_init_list(struct Sym *s)
         if (s->elem_size <= 0)
             s->elem_size = elem_bytes;
     }
+}
+
+/* Cheap pre-filter for try_speculative_noix_function_body: is it even worth
+ * attempting? A function that makes any call almost certainly pushes
+ * arguments for it (current_function_has_call is set during the scan pass,
+ * so it is already known here) - cheap to check and saves a wasted extra
+ * generation pass on the common case. main() is excluded outright: it is
+ * never a hot leaf, and the __mrun-shim emission right after this codegen
+ * assumes the ordinary IX-framed epilogue shape.
+ *
+ * local_bytes must be exactly 0 (no declared locals AND no compiler-
+ * generated temporaries - #itmp/#clit locals count too, since local_bytes is
+ * just local_size after the scan). This is load-bearing, not a size
+ * heuristic: the disabled no-IX-frame support only ever extended to
+ * SC_PARAM addressing (frame_sp_offset_for_sym, and the current_omit_ix_
+ * frame checks in emit_load_sym_value_direct/emit_load_frame_addr_hl are
+ * both gated on `s->storage == SC_PARAM`). A local variable is still
+ * addressed (ix+N) unconditionally - with no `push ix`/`ld ix,0` this reads
+ * and writes through whatever garbage IX happens to hold at entry, silently
+ * corrupting memory rather than crashing. A speculative generation pass
+ * cannot catch this the way it catches an SP-shifting push (there is no
+ * "did the buffer do something wrong" signal to check for - the emitted
+ * instructions are individually valid, just relative to the wrong
+ * register), so functions with any local storage must be excluded here,
+ * before ever attempting it, rather than verified after the fact. */
+static int function_qualifies_for_speculative_noix(const char *name, int local_bytes)
+{
+    if (strcmp(name, "main") == 0)
+        return 0;
+    if (current_function_has_call)
+        return 0;
+    if (local_bytes != 0)
+        return 0;
+    return 1;
+}
+
+/* Does the buffered speculative body contain anything unsafe for a function
+ * that never set up an IX frame? Two independent signals, both fatal:
+ *
+ *   - "push": the only way SP-relative (sp+N) addressing already computed
+ *     earlier in the body can go wrong - a push shifts SP out from under it,
+ *     and dcc has no live SP-delta tracking to compensate.
+ *   - "(ix": IX was never loaded with anything meaningful in this function
+ *     (no `push ix`/`ld ix,0`/`add ix,sp`), so ANY `(ix+N)`/`(ix-N)` memory
+ *     reference anywhere in the body reads or writes through whatever
+ *     garbage IX happens to hold at entry - silently corrupting memory
+ *     rather than crashing. This is not hypothetical: the disabled no-IX
+ *     support only ever touched a handful of load/store helpers
+ *     (emit_load_sym_value_direct and friends in dcc_symbols.c) to check
+ *     current_omit_ix_frame; other, unrelated fast paths elsewhere in the
+ *     codegen (e.g. gen_return_ast's dedicated "return a 1-byte identifier"
+ *     shortcut) emit `(ix+N)` addressing directly and were never taught
+ *     about current_omit_ix_frame at all, so cannot be trusted to have
+ *     skipped it just because this function has no locals. Rather than
+ *     audit every such shortcut across the codebase (and every future one
+ *     anyone adds), checking for the address mode itself is exact: a
+ *     correctly-generated no-IX-frame body can never legitimately contain
+ *     it, so any occurrence at all is proof something used it by mistake.
+ *
+ * Every push/(ix in dcc's own codegen is emitted as literal text (there are
+ * no comments or other decoration at this stage - dccpeep is a separate
+ * later pass), so a plain substring search is exact, not a heuristic. */
+static int tmpfile_unsafe_for_noix(FILE *f)
+{
+    long size;
+    char *buf;
+    int found;
+
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    rewind(f);
+    if (size <= 0)
+        return 0;
+    buf = (char *)xmalloc((size_t)size + 1);
+    if (fread(buf, 1, (size_t)size, f) != (size_t)size)
+        fatal("cannot read speculative no-ix-frame temp file");
+    buf[size] = 0;
+    found = strstr(buf, "push") != NULL || strstr(buf, "(ix") != NULL;
+    free(buf);
+    return found;
+}
+
+/* Speculatively generate `name`'s already-scanned body without an IX frame
+ * (params/locals addressed sp-relative - see current_function_safe_to_omit_ix,
+ * which stays hard-disabled for the ordinary path below), and check whether
+ * it ever pushed anything. A push is the only way that addressing can go
+ * wrong: it shifts SP out from under every sp+N address already computed,
+ * and dcc has no live SP-delta tracking to compensate (auditing every push
+ * emission site to add that tracking would be a much larger, more invasive
+ * change - see the long comment on current_function_safe_to_omit_ix). Rather
+ * than prove push-freedom statically, generate into a scratch buffer and
+ * inspect the result: no push anywhere means SP provably never moved, so
+ * every address in the buffer is correct and it can be used as-is; a push
+ * means discard it and let the caller regenerate normally with the IX frame,
+ * via the exact same rewind this function performs on failure.
+ *
+ * Returns 1 if the no-IX version was kept and already written to outf; 0 if
+ * the caller must still run the normal (IX-framed) codegen path itself, with
+ * every relevant piece of parser/codegen state already rewound to the body
+ * start as if this function had never been called - the same state the
+ * scan-to-codegen reset just above this call already established. */
+static int try_speculative_noix_function_body(const char *name, int type,
+                                                     int local_bytes, struct Sym *s,
+                                                     long body_start_pos,
+                                                     long body_start_tok_start,
+                                                     int body_start_line,
+                                                     int body_start_tok_line,
+                                                     struct Token body_start_tok,
+                                                     int body_start_nlocals,
+                                                     int body_start_local_size)
+{
+    FILE *scratch;
+    FILE *saved_outf_ptr;
+    int implicit_zero_return;
+    int c;
+
+    implicit_zero_return = strcmp(name, "main") == 0 &&
+                            (type & 15) == TYPE_INT && type_ptr_depth(type) == 0;
+
+    scratch = tmpfile();
+    if (scratch == NULL)
+        fatal("cannot create speculative no-ix-frame temp file");
+
+    saved_outf_ptr = outf;
+    outf = scratch;
+    /* emit_runtime_extrn_if_needed (dcc_symbols.c) caches which runtime-
+     * helper EXTRNs have already been emitted in a *persistent*,
+     * compilation-wide table, so a helper's declaration is normally only
+     * ever written once no matter how many call sites reference it. That
+     * cache has no idea this generation is speculative and may be thrown
+     * away: without g_inline_body_buffering set, a call emitted here (e.g.
+     * -fstack-check's `call __stchk` in every prologue) marks the helper as
+     * "already declared" globally, and if this attempt is then discarded,
+     * the real fallback generation's identical call skips its own EXTRN
+     * line - producing a `call` with no matching declaration anywhere in
+     * the actual output. g_inline_body_buffering is the existing mechanism
+     * for exactly this hazard (see emit_runtime_extrn_if_needed and the
+     * static-inline-body-buffering branch above): it makes every EXTRN
+     * unconditionally self-contained in whatever `outf` currently points
+     * at, instead of relying on the global cache. */
+    g_inline_body_buffering++;
+    nulabels = 0;
+    current_return_label = new_label();
+    g_for_seq = 0;
+    g_forren_n = 0;
+    g_for_decl_seq = -1;
+    g_for_decl_rename_index = 0;
+    g_for_decl_recording = 0;
+    g_scope_depth = 0;
+    g_static_local_func_index = (int)(s - globals);
+    g_static_local_seq = 0;
+    g_compound_literal_seq = 0;
+    g_licm_seq = 0;
+    emit_function_prologue(name, local_bytes, 1);
+    gen_compound();
+    emit_function_epilogue(implicit_zero_return);
+    g_inline_body_buffering--;
+    outf = saved_outf_ptr;
+
+    /* check_undefined_user_labels() is deliberately not called above: if
+     * this attempt is about to be discarded, calling it here would both
+     * double-report a genuine undefined-label error (the caller's normal
+     * codegen path below already calls it once) and, more subtly, leave
+     * ulabel_defined[]/nulabels populated from this attempt's goto/label
+     * bookkeeping for the caller's fresh gen_compound() run to collide
+     * with - exactly the "duplicate goto label" false positive this
+     * function's first version produced by forgetting to reset nulabels
+     * (and the rest of the per-function codegen state below) before
+     * falling back. */
+    if (!tmpfile_unsafe_for_noix(scratch)) {
+        check_undefined_user_labels();
+        rewind(scratch);
+        while ((c = fgetc(scratch)) != EOF)
+            fputc(c, outf);
+        fclose(scratch);
+        return 1;
+    }
+
+    fclose(scratch);
+
+    /* Undo every bit of per-function codegen state this discarded attempt
+     * touched - the same set the scan-to-codegen transition above this
+     * function resets - so the caller's normal codegen path runs exactly as
+     * if this function had never been called. */
+    posi = body_start_pos;
+    tok_start_pos = body_start_tok_start;
+    line_no = body_start_line;
+    tok_line = body_start_tok_line;
+    tok = body_start_tok;
+    nlocals = body_start_nlocals;
+    local_size = body_start_local_size;
+    nulabels = 0;
+    current_return_label = new_label();
+    g_for_seq = 0;
+    g_forren_n = 0;
+    g_for_decl_seq = -1;
+    g_for_decl_rename_index = 0;
+    g_for_decl_recording = 0;
+    g_scope_depth = 0;
+    g_static_local_func_index = (int)(s - globals);
+    g_static_local_seq = 0;
+    g_compound_literal_seq = 0;
+    g_licm_seq = 0;
+    return 0;
 }
 
 void parse_function_or_global(int base_type)
@@ -1749,11 +2703,15 @@ void parse_function_or_global(int base_type)
         int saved_nlocals;
         int saved_local_size;
         int saved_param_offset;
+        int saved_nenum_consts;
+        int saved_nulabels;
 
         int base_is_func_typedef;
+        int is_funcret_funcptr_decl;
 
         type = base_type;
         base_is_func_typedef = g_typedef_is_func;
+        is_funcret_funcptr_decl = 0;
         name[0] = 0;
 
         /* Each declarator starts again from the shared declaration-specifier
@@ -1779,23 +2737,9 @@ void parse_function_or_global(int base_type)
             next_token();
         }
 
-        /* C89: return_type (*func_name(params))(fp_params) — a function that
-         * returns a pointer to function.  parse_funcptr_declarator sets
-         * g_funcptr_is_funcret_decl and consumes both param lists; the return
-         * type is already recorded as a pointer in `type`. */
         if (g_funcptr_is_funcret_decl) {
             g_funcptr_is_funcret_decl = 0;
-            s = add_global(name, type, SC_FUNC);
-            parse_function_return_type = type;
-            if (decl_is_static) {
-                s->is_static = 1;
-                s->needs_extrn = 0;
-            } else if (!s->is_defined)
-                s->needs_extrn = 1;
-            if (accept(','))
-                continue;
-            expect(';');
-            return;
+            is_funcret_funcptr_decl = 1;
         }
 
         /* A typedef-name that denotes a function type can declare a function
@@ -1806,6 +2750,7 @@ void parse_function_or_global(int base_type)
          * fn_t *fp have already cleared base_is_func_typedef above. */
         if (base_is_func_typedef && g_funcptr_decl_array_len == 0) {
             s = add_global(name, type, SC_FUNC);
+            s->is_inline |= decl_is_inline;
             parse_function_return_type = type;
             if (decl_is_static) {
                 s->is_static = 1;
@@ -1819,16 +2764,19 @@ void parse_function_or_global(int base_type)
         }
 
         /* Function declarator or definition. */
-        if (g_funcptr_decl_array_len == 0 && accept('(')) {
+        if (is_funcret_funcptr_decl || (g_funcptr_decl_array_len == 0 && accept('('))) {
             s = add_global(name, type, SC_FUNC);
+            s->is_inline |= decl_is_inline;
             parse_function_return_type = type;
             if (decl_is_static) {
                 s->is_static = 1;
                 s->needs_extrn = 0;
             }
-            parse_param_list();
+            if (!is_funcret_funcptr_decl)
+                parse_param_list();
             copy_parsed_prototype_to_sym(s);
-            expect(')');
+            if (!is_funcret_funcptr_decl)
+                expect(')');
 
             /* Snapshot nlocals after prototype params are registered but before
              * K&R declarations: used to detect main() with no parameters. */
@@ -1838,6 +2786,20 @@ void parse_function_or_global(int base_type)
                 parse_old_style_param_declarations();
 
             if (tok.kind == '{') {
+                /* Set once here, covering both frame-sizing scan passes below
+                 * and the real codegen pass later in this same block, so a
+                 * hoist decision keyed on "am I compiling function X" (see
+                 * ast_for_hoist_global_member_value_supported) is identical
+                 * across all passes over this function - required for the
+                 * scan pass to reserve the same frame space the real pass
+                 * allocates. */
+                strncpy(g_current_compiling_func, name, sizeof(g_current_compiling_func) - 1);
+                g_current_compiling_func[sizeof(g_current_compiling_func) - 1] = 0;
+
+                record_inline_function_if_simple(s);
+                if (function_body_mentions_multiuse_inline_call())
+                    reserve_inline_temp_locals();
+
                 saved_pos = posi;
                 saved_tok_start = tok_start_pos;
                 saved_line = line_no;
@@ -1846,6 +2808,8 @@ void parse_function_or_global(int base_type)
                 saved_nlocals = nlocals;
                 saved_local_size = local_size;
                 saved_param_offset = param_offset;
+                saved_nenum_consts = nenum_consts;
+                saved_nulabels = nulabels;
 
                 current_function_has_call = 0;
                 g_static_local_func_index = (int)(s - globals);
@@ -1870,6 +2834,15 @@ void parse_function_or_global(int base_type)
                 nlocals = saved_nlocals;
                 local_size = saved_local_size;
                 param_offset = saved_param_offset;
+                nenum_consts = saved_nenum_consts;
+                /* ast_scan_for_stmt (called by scan_function_body via the AST
+                 * builder/emitter for for-loops) can now reach a labeled
+                 * statement inside a loop body and call define_user_label,
+                 * which the old hand-walked scanner never did. Reset nulabels
+                 * before the second scan pass so it does not see the first
+                 * scan's labels as already-defined duplicates - matching how
+                 * nlocals/local_size are reset here for the same reason. */
+                nulabels = saved_nulabels;
 
                 g_static_local_func_index = (int)(s - globals);
                 g_static_local_seq = 0;
@@ -1882,6 +2855,7 @@ void parse_function_or_global(int base_type)
                 line_no = saved_line;
                 tok_line = saved_tok_line;
                 tok = saved_tok;
+                nenum_consts = saved_nenum_consts;
 
                 s->is_defined = 1;
                 s->needs_extrn = 0;
@@ -1905,10 +2879,39 @@ void parse_function_or_global(int base_type)
                 g_scope_depth = 0;
                 g_static_local_func_index = (int)(s - globals);
                 g_static_local_seq = 0;
-                emit_function_prologue(name, current_local_bytes, current_function_safe_to_omit_ix(type, current_local_bytes));
-                gen_compound();
-                check_undefined_user_labels();
-                emit_function_epilogue();
+                g_compound_literal_seq = 0;
+                g_licm_seq = 0;
+                if (static_inline_body_can_be_buffered(s)) {
+                    FILE *saved_outf;
+
+                    s->inline_body_file = tmpfile();
+                    if (s->inline_body_file == NULL)
+                        fatal("cannot create inline body temp file");
+                    saved_outf = outf;
+                    outf = s->inline_body_file;
+                    g_inline_body_buffering++;
+                    emit_function_prologue(name, current_local_bytes, current_function_safe_to_omit_ix(type, current_local_bytes));
+                    gen_compound();
+                    check_undefined_user_labels();
+                    emit_function_epilogue(0);
+                    g_inline_body_buffering--;
+                    outf = saved_outf;
+                } else if (function_qualifies_for_speculative_noix(name, current_local_bytes) &&
+                           try_speculative_noix_function_body(name, type, current_local_bytes, s,
+                                                               saved_pos, saved_tok_start, saved_line,
+                                                               saved_tok_line, saved_tok,
+                                                               saved_nlocals, saved_local_size)) {
+                    /* No-IX-frame body already generated and written to outf
+                     * inside try_speculative_noix_function_body. */
+                } else {
+                    emit_function_prologue(name, current_local_bytes, current_function_safe_to_omit_ix(type, current_local_bytes));
+                    gen_compound();
+                    check_undefined_user_labels();
+                    emit_function_epilogue(strcmp(name, "main") == 0 &&
+                                           (type & 15) == TYPE_INT &&
+                                           type_ptr_depth(type) == 0);
+                }
+                nenum_consts = saved_nenum_consts;
 
                 /* Emit the __mrun shim that start: dispatches to.  When main has
                  * no args the shim omits any reference to __build_argv/__argc/argv
@@ -2139,6 +3142,7 @@ void parse_translation_unit(void)
             int t;
             decl_is_extern = 0;
             decl_is_static = 0;
+            decl_is_inline = 0;
             decl_is_const = 0;
             t = parse_type();
             if (tok.kind == ';') {
@@ -2146,6 +3150,24 @@ void parse_translation_unit(void)
             } else {
                 parse_function_or_global(t);
             }
+        } else if (tok.kind == TOK_ID && is_unsupported_target_type_name(tok.text)) {
+            int t;
+            decl_is_extern = 0;
+            decl_is_static = 0;
+            decl_is_inline = 0;
+            decl_is_const = 0;
+            t = parse_type();
+            if (tok.kind == ';')
+                next_token();
+            else
+                parse_function_or_global(t);
+        } else if (tok.kind == TOK_ID) {
+            /* C89: implicit int return type for function definition/declaration. */
+            decl_is_extern = 0;
+            decl_is_static = 0;
+            decl_is_inline = 0;
+            decl_is_const = 0;
+            parse_function_or_global(TYPE_INT);
         } else {
             error_here("external declaration expected");
             next_token();

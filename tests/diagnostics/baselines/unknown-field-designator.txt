@@ -1,0 +1,4 @@
+<source>:6: error DCC-E0502: unknown field initializer designator near 'y'
+        .y = 1
+         ^
+dcc: 1 error(s)

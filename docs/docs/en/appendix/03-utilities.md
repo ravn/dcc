@@ -2,24 +2,30 @@
 
 Developer scripts for building and testing dcc programs.
 
-Run these scripts from the dcc checkout. Open your operating-system terminal or
-the VS Code terminal, change to the dcc directory, start PowerShell, and then
-run the script commands shown below:
+Run these scripts from the dcc checkout or from an installed package. Linux and
+macOS packages include a native shell build driver, so normal package users do
+not need PowerShell to build a single app.
 
-```pwsh
-cd /path/to/dcc
-pwsh
-```
+## Build Driver (`dcc-ma`, `ma.sh` / `ma.ps1`)
 
-## Build Driver (`ma.ps1`)
+The build driver compiles one app, optionally runs `dccpeep`, strips the
+runtime, assembles, and links a `.COM` executable.
 
-Cross-platform PowerShell 7+ build driver. It compiles one app, optionally runs
-`dccpeep`, strips the runtime, assembles, and links a `.COM` executable.
+- Installed packages: use `dcc-ma` on Windows, macOS, and Linux.
+- Source checkout: use `scripts/ma.sh` on Linux/macOS, or `scripts/ma.ps1` with Windows PowerShell 5.1 or PowerShell 7+.
 
 ### Build Driver Usage
 
 ```pwsh
 ./scripts/ma.ps1 <name> [mode] [options]
+```
+
+```sh
+dcc-ma <name> [mode] [options]
+```
+
+```sh
+./scripts/ma.sh <name> [mode] [options]
 ```
 
 - `<name>` — Test app name (e.g., `triangle`, `sieve`, `ttt`)
@@ -34,6 +40,18 @@ Cross-platform PowerShell 7+ build driver. It compiles one app, optionally runs
 ./scripts/ma.ps1 cobint -Mode fast -BuildDir mybuild
 ```
 
+```sh
+dcc-ma triangle
+dcc-ma sieve nopeep
+dcc-ma cobint --mode fast --build-dir mybuild
+```
+
+```sh
+./scripts/ma.sh triangle
+./scripts/ma.sh sieve nopeep
+./scripts/ma.sh cobint --mode fast --build-dir mybuild
+```
+
 ### Build Driver Parameters
 
 | Parameter | Default | Purpose |
@@ -45,23 +63,38 @@ Cross-platform PowerShell 7+ build driver. It compiles one app, optionally runs
 
 ### Environment Variables
 
-- `DCC_STACK_SIZE` — C stack reserve in bytes (default: 512)
+- `DCC_STACK_SIZE` — C stack reserve in bytes; when unset, `dcc` uses its default
 - `DCC_FORCE_STACK_CHECK` — Force `-fstack-check` on all builds
+- `DCC_FLOATIO` — Set to `1` to pass `-ffloatio` and keep float `printf` runtime support
+- `DCC_LONGIO` — Set to `1` to pass `-flongio` and keep long integer `printf` runtime support
+- `DCC_ARGS` — Extra whitespace-separated `dcc` options such as `-DNAME=1 -UOLD`
+- `NTVCM_ARGS` — Extra whitespace-separated `ntvcm` options such as `-p -s:4000000`
+- `DCC_HOME` — dcc package/install root; used to find `include/`, `lib/`, and CP/M tools
+- `DCC_INCLUDE` — extra include directories, separated by the host path separator
+- `DCC_LIB` — extra runtime/tool asset roots, separated by the host path separator
+- `DCC_RUNTIME` — explicit path to `DCCRTL.MAC`
 - `DCC`, `DCCPEEP`, `DCCRTLSTRIP`, `NTVCM`, `M80`, `L80` — Tool paths
+
+Run `dcc-ma -Help` on Windows or `dcc-ma --help` on Linux/macOS for the full option map, including which
+`dcc` options are owned by the helper pipeline.
 
 ## Test Suite Runner (`runall.ps1`)
 
 Builds and runs the test suite against per-app baselines in `tests/baselines/`.
-It uses `ma.ps1` for builds and `tests/_test_overrides.json` for test-specific
-arguments and stack sizes.
+It uses `dccmake` for builds and `tests/_test_overrides.json` for test-specific
+runtime arguments, stack sizes, and optional dcc build flags.
 
 Runs in parallel by default:
 
 - Each app builds in its own `build/<app>/` subdirectory so concurrent builds
   don't clobber shared artifacts.
+- The whole run is isolated under a per-invocation `build/run-<pid>/` folder that
+  is removed automatically on exit; pass `-KeepBuild` to retain it for debugging.
 - A live `[ n/total] PASS/FAIL` status prints as each app completes.
 - Use `-Serial` to fall back to sequential builds in the shared `build/`
   directory.
+- Pass `-Extended` to also run the imported c-testsuite single-exec corpus
+  (via `runall-extended.ps1`) after the main suite.
 - The lightweight stack-overflow guard (`-fstack-check`) is **on by default**;
   pass `-NoStackCheck` to build without it.
 - Pass `-Report` to append per-app run time and `.COM` size measurements to a
@@ -87,6 +120,8 @@ With no options, the suite runs in parallel, enables `-fstack-check`, and uses
 ./scripts/runall.ps1 -Emulator altair
 ./scripts/runall.ps1 -Mode fast            # optimized build only
 ./scripts/runall.ps1 -Mode nopeep          # unoptimized build only
+./scripts/runall.ps1 -Extended             # also run extended c-testsuite
+./scripts/runall.ps1 -KeepBuild            # keep build/run-<pid>/ for debugging
 ./scripts/runall.ps1 -Report               # also append perf_results.csv
 ```
 
@@ -113,8 +148,10 @@ The `-Mode` parameter selects which optimization pass(es) to build and verify.
 | `-BaselineDir` | `tests/baselines` | Directory of per-app `<app>.txt` baselines |
 | `-Mode` | `fast` | Build mode: `fast` (optimized), `nopeep` (unoptimized), or `full` |
 | `-Help` | (off) | Show help text and exit without building or running tests |
+| `-Extended` | (off) | Also run the extended c-testsuite corpus after the main suite |
 | `-Serial` | (off) | Run sequentially instead of the default parallel mode |
 | `-ThrottleLimit` | CPU core count | Max concurrent apps in parallel mode |
+| `-KeepBuild` | (off) | Keep the per-invocation `build/run-<pid>/` folder instead of removing it on exit (parallel mode) |
 | `-Report` | (off) | Append per-app execution time and `.COM` size metrics to a CSV report; implies `-NoStackCheck` |
 | `-ReportFile` | `perf_results.csv` | CSV path used by `-Report` |
 | `-ReportClockHz` | `1000000000` | ntvcm clock speed used for measured app runs in report mode; set to `0` for full-speed report runs |
@@ -141,6 +178,7 @@ normal C implementation before comparing them with dcc's CP/M/Z80 output.
 Host compiler selection follows `scripts/build-dcc.ps1`:
 
 - Windows uses MSVC `cl.exe` after locating the Visual Studio C++ build tools.
+  On Windows ARM64, it uses the native ARM64 MSVC tools.
 - macOS uses `clang` by default.
 - Linux uses `gcc` by default.
 - Unix-like hosts can override the compiler with `-CC` or the `CC` environment
@@ -226,7 +264,7 @@ one test, keyed by `name`:
 ```json
 {
   "apps": [
-    { "name": "<app>", "args": "<string>", "stdin": "<string>", "stack_size": <int>, "ignore": <bool> }
+    { "name": "<app>", "args": "<string>", "stdin": "<string>", "stack_size": <int>, "dcc_args": "<string>", "dcc_floatio": <bool>, "dcc_longio": <bool>, "ignore": <bool> }
   ]
 }
 ```
@@ -237,6 +275,9 @@ one test, keyed by `name`:
 | `args` | string | no | `""` | Command-line arguments passed to the program when run. Multi-token strings are split on whitespace (e.g. `"a bb ccc"`) |
 | `stdin` | string | no | `""` | Text piped to the program's standard input during execution (for keyboard/input-driven tests) |
 | `stack_size` | integer | no | `512` | C stack reserve in bytes, passed to `dcc` as `-stack`. Used by recursive apps that need more headroom |
+| `dcc_args` | string | no | `""` | Extra dcc-style build arguments passed through `dccmake` (for example `-DNAME=1 -UOLD`) |
+| `dcc_floatio` | boolean | no | environment/default | When set, controls `dccmake` `dcc-floatio` and dcc `-ffloatio` for this app |
+| `dcc_longio` | boolean | no | environment/default | When set, controls `dccmake` `dcc-flongio` and dcc `-flongio` for this app |
 | `ignore` | boolean | no | `false` | When `true`, the test is skipped entirely (not built or run) |
 
 Entries with none of the optional properties have no effect, so an app only

@@ -4595,15 +4595,61 @@ __stchk:
         jr      c,stchk_over
         ret
 stchk_over:
-        call    __cflush        ; flush buffered output before the diagnostic
+        ; HL = SP - __hlimit (negative). Negate to get overflow = __hlimit - SP.
+        ld      a,l
+        cpl
+        ld      l,a
+        ld      a,h
+        cpl
+        ld      h,a
+        inc     hl              ; HL = overflow bytes (positive)
+        call    __cflush        ; preserves all regs except F
         ld      de,stchk_msg
-        ld      c,9             ; BDOS print-string ('$'-terminated)
+        ld      c,9
+        call    5               ; print prefix through "0x"
+        ld      a,h
+        call    stchk_pb        ; high byte of overflow
+        ld      a,l
+        call    stchk_pb        ; low byte of overflow
+        ld      de,stchk_sep
+        ld      c,9
+        call    5               ; print " limit 0x"
+        ld      hl,__stack_size ; configured limit (immediate, not a memory ref)
+        ld      a,h
+        call    stchk_pb
+        ld      a,l
+        call    stchk_pb
+        ld      de,stchk_end
+        ld      c,9
         call    5
         ld      hl,00ffh
         call    __cpm_set_retcode
         jp      0000h
+stchk_pb:                       ; print byte in A as two uppercase hex digits
+        push    af
+        rrca
+        rrca
+        rrca
+        rrca                    ; high nibble -> bits 3:0
+        call    stchk_pn
+        pop     af              ; restore original byte; fall through for low nibble
+stchk_pn:                       ; print low nibble of A as one hex digit
+        and     0fh
+        add     a,'0'
+        cp      '9'+1
+        jr      c,stchk_pn1
+        add     a,7             ; A-F
+stchk_pn1:
+        ld      e,a
+        ld      c,2
+        call    5
+        ret
 stchk_msg:
-        db      0dh,0ah,'?stack overflow',0dh,0ah,'$'
+        db      0dh,0ah,'?stack overflow: exceeded by 0x','$'
+stchk_sep:
+        db      ' limit 0x','$'
+stchk_end:
+        db      0dh,0ah,'$'
 
         public  _atoi
 _atoi:
@@ -6317,104 +6363,78 @@ lmul_bs:
         pop     ix
         ret
 
-; __m16u: unsigned 16x16 -> 32 multiply.
-;   The caller pushes both operands in the 32-bit convention (push de;push hl
-;   each), but these are sign/zero-extended 16-bit values, so only the LOW
-;   words carry information.  This helper reads just those low words
-;   (LHS_L at ix+8, RHS_L at ix+4) and ignores the high zero-extension words,
-;   producing the same DE:HL result the full 32x32 __lmul would for two
-;   zero-extended operands -- at a fraction of the cost (one 16-iteration
-;   register loop, no cross products).  Caller still cleans 8 bytes.
-;   NB: name kept to <=6 significant chars and distinct from __lmul/__m16s,
-;   because L80 only treats the first 6 characters of a public as significant.
-        public  __m16u
-__m16u:
-        push    ix
-        ld      ix,0
-        add     ix,sp
-        ld      c,(ix+8)                ; BC = LHS low word (multiplicand)
-        ld      b,(ix+9)
-        ld      e,(ix+4)                ; DE = RHS low word (multiplier/low acc)
-        ld      d,(ix+5)
+; __m1u: unsigned 16x16 -> 32 multiply, register ABI.
+;   Entry: BC = LHS low word, HL = RHS low word.  Exit: DE:HL = product.
+;   Used by dcc when both long operands were freshly widened from 16-bit.
+        public  __m1u
+__m1u:
+        ex      de,hl                   ; DE = multiplier/low accumulator
         ld      hl,0                    ; HL = high accumulator
         ld      a,16
-lmulu_b:
-        bit     0,e                     ; multiplier LSB
-        jr      z,lmulu_bn
-        add     hl,bc                   ; HL += multiplicand; CF = carry out
-        jr      lmulu_bs
-lmulu_bn:
-        or      a                       ; CF = 0 for a clean shift
-lmulu_bs:
-        rr      h                       ; shift CF:HL:DE right by one (33-bit)
+lm1u_b:
+        bit     0,e
+        jr      z,lm1u_bn
+        add     hl,bc
+        jr      lm1u_bs
+lm1u_bn:
+        or      a
+lm1u_bs:
+        rr      h
         rr      l
         rr      d
         rr      e
         dec     a
-        jr      nz,lmulu_b
-        ex      de,hl                   ; DE = high, HL = low
-        ld      sp,ix
-        pop     ix
+        jr      nz,lm1u_b
+        ex      de,hl
         ret
 
-; __m16s: signed 16x16 -> 32 multiply.
-;   Like __m16u, but the two low words are signed.  Compute the result sign
-;   from the operand signs, multiply the magnitudes with the same unsigned
-;   16-iteration core, then negate the 32-bit product if the signs differ.
-;   Matches (mod 2^32) what __lmul produces for two SIGN-extended operands.
-        public  __m16s
-__m16s:
-        push    ix
-        ld      ix,0
-        add     ix,sp
-        ld      l,(ix+8)                ; HL = LHS low word
-        ld      h,(ix+9)
-        ld      e,(ix+4)                ; DE = RHS low word
-        ld      d,(ix+5)
-        ld      a,h
-        xor     d
-        ld      (lmuls_sg),a            ; bit7 = sign of product
-        bit     7,h                     ; HL = |LHS|
-        jr      z,lmuls_ap
+; __m1s: signed 16x16 -> 32 multiply, register ABI.
+;   Entry: BC = LHS low word, HL = RHS low word.  Exit: DE:HL = product.
+        public  __m1s
+__m1s:
+        ld      a,b
+        xor     h
+        ld      (lm1s_sg),a             ; bit7 = sign of product
+        bit     7,b
+        jr      z,lm1s_ap
+        xor     a
+        sub     c
+        ld      c,a
+        sbc     a,a
+        sub     b
+        ld      b,a
+lm1s_ap:
+        bit     7,h
+        jr      z,lm1s_bp
         xor     a
         sub     l
         ld      l,a
         sbc     a,a
         sub     h
         ld      h,a
-lmuls_ap:
-        bit     7,d                     ; DE = |RHS|
-        jr      z,lmuls_bp
-        xor     a
-        sub     e
-        ld      e,a
-        sbc     a,a
-        sub     d
-        ld      d,a
-lmuls_bp:
-        ld      b,h                     ; BC = |LHS| (multiplicand)
-        ld      c,l
+lm1s_bp:
+        ex      de,hl                   ; DE = |RHS| multiplier/low accumulator
         ld      hl,0                    ; HL = high accumulator
         ld      a,16
-lmuls_b:
-        bit     0,e                     ; multiplier LSB
-        jr      z,lmuls_bn
+lm1s_b:
+        bit     0,e
+        jr      z,lm1s_bn
         add     hl,bc
-        jr      lmuls_bs
-lmuls_bn:
+        jr      lm1s_bs
+lm1s_bn:
         or      a
-lmuls_bs:
-        rr      h                       ; shift CF:HL:DE right by one
+lm1s_bs:
+        rr      h
         rr      l
         rr      d
         rr      e
         dec     a
-        jr      nz,lmuls_b
+        jr      nz,lm1s_b
         ex      de,hl                   ; HL = low, DE = high
-        ld      a,(lmuls_sg)
+        ld      a,(lm1s_sg)
         bit     7,a
-        jr      z,lmuls_done
-        ld      a,l                     ; negate 32-bit DE:HL (HL=low, DE=high)
+        ret     z
+        ld      a,l
         cpl
         ld      l,a
         ld      a,h
@@ -6429,13 +6449,10 @@ lmuls_bs:
         inc     hl
         ld      a,h
         or      l
-        jr      nz,lmuls_done
+        ret     nz
         inc     de
-lmuls_done:
-        ld      sp,ix
-        pop     ix
         ret
-lmuls_sg:       db      0
+lm1s_sg:        db      0
 
 ; __ldivu: unsigned 32-bit divide.  Returns DE:HL = LHS / RHS.
         public  __ldu
@@ -11833,64 +11850,65 @@ FMSET_AB_24:
         ld      b,24
 
 FMLP:
-        ld      a,e             ; FQ0 in register E
-        and     1
-        jp      z,FMNA
-        ; P += M
-        ld      a,(FP0)
-        ld      c,a
-        ld      a,(FM0)
-        add     a,c
-        ld      (FP0),a
-        ld      a,(FP1)
-        ld      c,a
-        ld      a,(FM1)
-        adc     a,c
-        ld      (FP1),a
-        ld      a,(FP2)
-        ld      c,a
-        ld      a,(FM2)
-        adc     a,c
-        ld      (FP2),a
-        ld      a,(FP3)
-        ld      c,a
-        ld      a,(FM3)
-        adc     a,c
-        ld      (FP3),a
-        ld      a,(FP4)
-        ld      c,a
-        ld      a,(FM4)
-        adc     a,c
-        ld      (FP4),a
-        ld      a,(FP5)
-        ld      c,a
-        ld      a,(FM5)
-        adc     a,c
-        ld      (FP5),a
-FMNA:
-        ; M <<= 1
-        ld      a,(FM0)
-        add     a,a
-        ld      (FM0),a
-        ld      a,(FM1)
-        rla
-        ld      (FM1),a
-        ld      a,(FM2)
-        rla
-        ld      (FM2),a
-        ld      a,(FM3)
-        rla
-        ld      (FM3),a
-        ld      a,(FM4)
-        rla
-        ld      (FM4),a
-        ld      a,(FM5)
-        rla
-        ld      (FM5),a
-        ; Q >>= 1 (registers only: H=FQ2, L=FQ1, E=FQ0)
+        ; Q >>= 1; carry = old bit-0 of E (the multiplier bit to test)
         srl     h
         rr      l
         rr      e
+        push    hl              ; save Q high bytes (H=FQ2, L=FQ1)
+        ld      hl,FM0          ; HL -> M[0]; pointer for both P+=M and M<<=1
+        jp      nc,FMNA         ; skip accumulate if this Q bit was 0
+
+        ; P += M  (HL = FM0; 'add' on byte 0 ignores the stale carry=1)
+        ld      a,(FP0)
+        add     a,(hl)
+        ld      (FP0),a
+        inc     hl
+        ld      a,(FP1)
+        adc     a,(hl)
+        ld      (FP1),a
+        inc     hl
+        ld      a,(FP2)
+        adc     a,(hl)
+        ld      (FP2),a
+        inc     hl
+        ld      a,(FP3)
+        adc     a,(hl)
+        ld      (FP3),a
+        inc     hl
+        ld      a,(FP4)
+        adc     a,(hl)
+        ld      (FP4),a
+        inc     hl
+        ld      a,(FP5)
+        adc     a,(hl)
+        ld      (FP5),a
+        ld      hl,FM0          ; reset HL -> M[0] for M shift below
+FMNA:
+        ; M <<= 1  (HL = FM0; 'add' on byte 0 ignores carry from P+=M)
+        ld      a,(hl)
+        add     a,a
+        ld      (hl),a
+        inc     hl
+        ld      a,(hl)
+        rla
+        ld      (hl),a
+        inc     hl
+        ld      a,(hl)
+        rla
+        ld      (hl),a
+        inc     hl
+        ld      a,(hl)
+        rla
+        ld      (hl),a
+        inc     hl
+        ld      a,(hl)
+        rla
+        ld      (hl),a
+        inc     hl
+        ld      a,(hl)
+        rla
+        ld      (hl),a
+        pop     hl              ; restore Q (H=FQ2, L=FQ1)
         dec     b
         jp      nz,FMLP
 

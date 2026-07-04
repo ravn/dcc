@@ -2,6 +2,22 @@
 
 Developer utility scripts for the `dcc` (CP/M-80 / Z80) toolchain.
 
+## `publish-package.ps1`
+
+Publishes or republishes the binary package release. By default it reads the
+version from `scripts/package-version.txt` (`v2.0.0`), deletes any existing
+GitHub release/tag for that version, recreates the tag at the current commit,
+and pushes the tag so `.github/workflows/release.yml` rebuilds the package
+assets.
+
+```pwsh
+pwsh ./scripts/publish-package.ps1
+pwsh ./scripts/publish-package.ps1 -Version v2.0.1 -Watch
+```
+
+The script requires `git` and the GitHub CLI (`gh`) on `PATH`, and refuses to
+publish from a dirty worktree unless `-AllowDirty` is passed.
+
 ## Host compilers to install
 
 The PowerShell scripts are intended to work on Windows, macOS, and Linux. For
@@ -10,12 +26,14 @@ the dcc host tools themselves, use the normal native compiler for each platform:
 | Platform | Recommended compiler | Install notes |
 | -------- | -------------------- | ------------- |
 | Windows | MSVC x64 | Install Visual Studio 2022 or Visual Studio Build Tools with **Desktop development with C++**. |
+| Windows ARM64 | MSVC ARM64 | Install Visual Studio Build Tools with **Desktop development with C++** plus the **MSVC ARM64/ARM64EC build tools** component. |
 | macOS | Apple clang | Install Xcode Command Line Tools with `xcode-select --install`. |
 | Linux | GCC | Install your distribution's C/C++ build tools. |
 
 `build-dcc.ps1` and `validate-unit-test.ps1` follow those defaults: MSVC on
-Windows, clang on macOS, and gcc on Linux. On Unix-like hosts, pass `-CC` or set
-`CC` when you intentionally want a different compiler.
+Windows, native ARM64 MSVC on Windows ARM64, clang on macOS, and gcc on Linux.
+On Unix-like hosts, pass `-CC` or set `CC` when you intentionally want a
+different compiler.
 
 ### Linux 32-bit GCC support for baseline validation
 
@@ -149,11 +167,11 @@ the regression suite, add it to the per-app `stack_size_for` table in
 
 ## `ma.ps1`
 
-Cross-platform build driver (PowerShell 7+ equivalent of `ma.sh`). Compiles a
+Cross-platform build driver (Windows PowerShell 5.1 and PowerShell 7+ equivalent of `ma.sh`). Compiles a
 single test app with optional peephole optimization, strips runtime symbols,
 and links to produce a `.COM` executable. The complete pipeline:
 
-1. Compile source with `dcc` (auto-detect floatio and stack-check flags)
+1. Compile source with `dcc` using default compiler options unless build flags are requested through environment variables
 2. Optimize with `dccpeep` (optional, fast mode only)
 3. Assemble app.MAC with M80
 4. Strip DCCRTL runtime using dccrtlstrip
@@ -163,7 +181,7 @@ and links to produce a `.COM` executable. The complete pipeline:
 ### Usage
 
 ```pwsh
-pwsh ./scripts/ma.ps1 <name> [full|fast|nopeep]
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\ma.ps1 <name> [full|fast|nopeep]
 ```
 
 - `<name>` — test app name (e.g., `triangle`, `sieve`, `ttt`)
@@ -173,9 +191,9 @@ pwsh ./scripts/ma.ps1 <name> [full|fast|nopeep]
 ### Examples
 
 ```pwsh
-pwsh ./scripts/ma.ps1 triangle
-pwsh ./scripts/ma.ps1 sieve nopeep
-pwsh ./scripts/ma.ps1 cobint -Mode fast -BuildDir mybuild
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\ma.ps1 triangle
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\ma.ps1 sieve nopeep
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\ma.ps1 cobint -Mode fast -BuildDir mybuild
 ```
 
 ### Parameters
@@ -189,21 +207,33 @@ pwsh ./scripts/ma.ps1 cobint -Mode fast -BuildDir mybuild
 
 ### Environment Variables
 
-- `DCC_STACK_SIZE` — C stack reserve in bytes (default: 512)
+- `DCC_STACK_SIZE` — C stack reserve in bytes; when unset, `dcc` uses its default
 - `DCC_FORCE_STACK_CHECK` — Enable `-fstack-check` for all builds
+- `DCC_FLOATIO` — Set to `1` to pass `-ffloatio` and keep float `printf` runtime support
+- `DCC_LONGIO` — Set to `1` to pass `-flongio` and keep long integer `printf` runtime support
+- `DCC_ARGS` — Extra whitespace-separated `dcc` options such as `-DNAME=1 -UOLD`
+- `NTVCM_ARGS` — Extra whitespace-separated `ntvcm` options such as `-p -s:4000000`
 - `DCC`, `DCCPEEP`, `DCCRTLSTRIP`, `NTVCM`, `M80`, `L80` — Tool paths
+
+Run `dcc-ma -Help` on Windows or `dcc-ma --help` on Linux/macOS for the full option map, including which `dcc` options
+are owned by the helper pipeline.
 
 ## `runall.ps1`
 
-Comprehensive test suite: builds and runs all test applications with output
-verification against per-app baselines in `tests/baselines/`. Uses `ma.ps1` to
-build each app and `tests/_test_overrides.json` for test-specific arguments and stack
-sizes. Comparison is keyed by app name, so test discovery order does not matter.
+Comprehensive test suite: builds and runs all main test applications with output
+verification against per-app baselines in `tests/baselines/`. Uses `dccmake` to
+build each app and `tests/_test_overrides.json` for test-specific runtime and
+build settings. Comparison is keyed by app name, so test discovery order does not matter.
+Pass `-Extended` to run the extended c-testsuite corpus after the main suite.
 See [`tests/README.md`](../tests/README.md) for the test/baseline relationship.
 
 **Runs in parallel by default** (each app builds in its own `build/<app>/`
-subdirectory so concurrent builds don't clobber shared artifacts). Use
-`-Serial` to fall back to sequential builds in the shared `build/` directory.
+subdirectory so concurrent builds don't clobber shared artifacts). In parallel
+mode the whole run is isolated under a per-invocation `build/run-<pid>/` folder,
+which is **removed automatically on exit** so `build/` does not accumulate one
+folder per run; pass `-KeepBuild` to retain it (e.g. to inspect a failing
+build's artifacts). Use `-Serial` to fall back to sequential builds in the
+shared `build/` directory.
 The lightweight stack-overflow guard (`-fstack-check`) is **on by default**;
 pass `-NoStackCheck` to build without it.
 Pass `-Report` to append per-app run-time and `.COM` size measurements while
@@ -231,8 +261,10 @@ build mode. Use `-Mode full` when you want both fast and nopeep builds.
 | `-BaselineDir` | `tests/baselines` | Directory of per-app `<app>.txt` baselines |
 | `-Mode` | `fast` | Build mode: `fast` (optimized), `nopeep` (unoptimized), or `full` |
 | `-Help` | (off) | Show help text and exit without building or running tests |
+| `-Extended` | (off) | Also run the extended c-testsuite corpus after the main suite |
 | `-Serial` | (off) | Run sequentially instead of the default parallel mode |
 | `-ThrottleLimit` | CPU core count | Max concurrent apps in parallel mode |
+| `-KeepBuild` | (off) | Keep the per-invocation `build/run-<pid>/` folder instead of removing it on exit (parallel mode) |
 | `-Report` | (off) | Append per-app execution time and `.COM` size metrics to a CSV report; implies `-NoStackCheck` |
 | `-ReportFile` | `perf_results.csv` | CSV path used by `-Report` |
 | `-ReportClockHz` | `400000000` | ntvcm clock speed used for measured report runs; set to `0` for full-speed report runs |
@@ -259,6 +291,8 @@ pwsh ./scripts/runall.ps1 -NoStackCheck         # build without the stack guard
 pwsh ./scripts/runall.ps1 -ThrottleLimit 8      # cap concurrency
 pwsh ./scripts/runall.ps1 -Mode fast            # optimized build only
 pwsh ./scripts/runall.ps1 -Mode nopeep          # unoptimized build only
+pwsh ./scripts/runall.ps1 -Extended             # also run extended c-testsuite
+pwsh ./scripts/runall.ps1 -KeepBuild            # keep build/run-<pid>/ for debugging
 pwsh ./scripts/runall.ps1 -Report               # append perf_results.csv
 pwsh ./scripts/runall.ps1 -ReportClockHz 0 -Report  # full-speed report run
 ```
@@ -266,7 +300,8 @@ pwsh ./scripts/runall.ps1 -ReportClockHz 0 -Report  # full-speed report run
 Parallel mode is markedly faster on multi-core machines. Each app builds in its
 own `build/<app>/` subdirectory so concurrent builds don't clobber shared
 artifacts, and a live `[ n/total] PASS/FAIL` status prints as each app
-completes.
+completes. The run's `build/run-<pid>/` folder is removed on exit unless
+`-KeepBuild` is passed.
 
 ### Output
 

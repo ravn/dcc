@@ -59,6 +59,34 @@ int init_label_is_string_literal_label(const char *p)
     return *p == 0;
 }
 
+static void mark_init_label_extrn(const char *p)
+{
+    char base[64];
+    int i;
+    int n;
+    struct Sym *s;
+
+    if (init_label_is_number(p) || init_label_is_string_literal_label(p))
+        return;
+
+    for (n = 0; p[n] && p[n] != '+' && p[n] != '-' && n < (int)sizeof(base) - 1; ++n)
+        base[n] = p[n];
+    base[n] = 0;
+
+    s = find_global(base);
+    if (s == NULL) {
+        for (i = 0; i < nglobals; ++i) {
+            if (!strcmp(asm_name_for(sym_asm_name(&globals[i])), base)) {
+                s = &globals[i];
+                break;
+            }
+        }
+    }
+    emit_extrn_if_needed(s);
+}
+
+static void emit_init_zero_bytes(int bytes);
+
 void emit_init_label_or_number(const char *p, int bytes)
 {
     long v;
@@ -77,6 +105,7 @@ void emit_init_label_or_number(const char *p, int bytes)
      * verbatim so M80 can compute the relocatable value.  Ordinary C symbol
      * names still need the normal target name mapping.
      */
+    mark_init_label_extrn(p);
     if (init_label_is_string_literal_label(p)) {
         fprintf(outf, "\tdw %s\n", p);
     } else if (strchr(p, '+') || strchr(p, '-')) {
@@ -86,7 +115,17 @@ void emit_init_label_or_number(const char *p, int bytes)
     }
 
     if (bytes > 2)
-        fprintf(outf, "\tds %d\n", bytes - 2);
+        emit_init_zero_bytes(bytes - 2);
+}
+
+static void emit_init_zero_bytes(int bytes)
+{
+    while (bytes >= 2) {
+        fprintf(outf, "\tdw 0\n");
+        bytes -= 2;
+    }
+    if (bytes > 0)
+        fprintf(outf, "\tdb 0\n");
 }
 
 void emit_data(void)
@@ -202,7 +241,7 @@ void emit_data(void)
             }
 
             if (s->size > used_bytes)
-                fprintf(outf, "\tds %d\n", s->size - used_bytes);
+                emit_init_zero_bytes(s->size - used_bytes);
         } else {
             emit_init_numeric(s->init_value, type_size(s->type));
         }

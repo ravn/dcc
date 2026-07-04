@@ -10,6 +10,7 @@
  */
 
 #include "dcc.h"
+#include "dcc_ast.h"
 int parse_float_init_literal(unsigned long *bits)
 {
     int sign;
@@ -275,6 +276,9 @@ void emit_store_const_to_local_array_elem(struct Sym *s, int elem_type, int inde
 {
     int elem_size;
 
+    if (type_is_bool(elem_type))
+        v = v ? 1 : 0;
+
     elem_size = type_size(elem_type);
     if (elem_size <= 0) elem_size = 2;
 
@@ -297,6 +301,9 @@ void emit_store_const_to_local_array_elem(struct Sym *s, int elem_type, int inde
 
 void emit_store_const_to_local_offset(struct Sym *s, int off, int type, long v)
 {
+    if (type_is_bool(type))
+        v = v ? 1 : 0;
+
     emit_load_sym_addr(s);
     emit_add_const_to_hl(off);
     emit("\tpush hl\n");
@@ -320,10 +327,20 @@ void emit_store_expr_to_local_offset(struct Sym *s, int off, int type)
     emit_add_const_to_hl(off);
     emit("\tpush hl\n");
 
-    gen_expr_no_comma();
+    ast_emit_init_expr();
+
+    if (type_is_bool(type)) {
+        if (!type_is_bool(g_expr_type))
+            emit_bool_normalize_hl(g_expr_type);
+        emit("\tex de,hl\n\tpop hl\n");
+        emit_store_de_to_addr_hl(type);
+        return;
+    }
 
     if (type_is_long(type)) {
-        if (!type_is_long(g_expr_type))
+        if (type_is_float(g_expr_type))
+            emit_convert_float_to_intlike(type);
+        else if (!type_is_long(g_expr_type))
             emit_extend_to_long_typed(g_expr_type);
         emit_store_de_to_addr_hl(type);
     } else if (type_is_float(type)) {
@@ -331,7 +348,9 @@ void emit_store_expr_to_local_offset(struct Sym *s, int off, int type)
             emit_convert_int_to_float(g_expr_type);
         emit_store_de_to_addr_hl(type);
     } else {
-        if (type_size(type) > 1 && !type_is_long(g_expr_type))
+        if (type_is_float(g_expr_type))
+            emit_convert_float_to_intlike(type);
+        else if (type_size(type) > 1 && !type_is_long(g_expr_type))
             emit_promote_byte_to_int(g_expr_type);
         emit("\tex de,hl\n\tpop hl\n");
         emit_store_de_to_addr_hl(type);
@@ -407,6 +426,7 @@ void emit_init_auto_struct_scalar(struct Sym *s, int off, int type)
 void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int count, int elem_size)
 {
     int n;
+    int maxn;
     int total_bytes;
 
     if (elem_size <= 0) elem_size = type_size(elem_type);
@@ -429,7 +449,14 @@ void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int 
         next_token();
 
     n = 0;
+    maxn = 0;
     while (tok.kind != TOK_EOF && tok.kind != '}') {
+        if (tok.kind == '[') {
+            next_token();
+            n = parse_const_int_expr();
+            expect(']');
+            expect('=');
+        }
         if (count > 0 && n >= count) {
             error_here("too many initializer elements");
             skip_initializer_or_decl_tail();
@@ -442,11 +469,13 @@ void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int 
             emit_init_auto_struct_scalar(s, baseoff + n * elem_size, elem_type);
 
         n++;
+        if (n > maxn) maxn = n;
         if (!accept(',')) break;
         if (tok.kind == '}') break;
     }
     expect('}');
 
+    if (maxn > n) n = maxn;
     if (count > 0 && n < count) {
         total_bytes = (count - n) * elem_size;
         emit_zero_local_bytes(s, baseoff + n * elem_size, total_bytes);
@@ -485,7 +514,7 @@ int next_parent_field_index(int sid, int start)
 {
     int k;
     for (k = start; k < nfield_defs; ++k)
-        if (field_defs[k].parent_struct_id == sid)
+        if (field_defs[k].parent_struct_id == sid && !field_defs[k].is_promoted)
             return k;
     return -1;
 }
@@ -503,6 +532,7 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
     int total;
     int is_union;
     int had_brace;
+    int end_used;
 
     sid = type_struct_id(type);
     total = type_size(type);
@@ -519,7 +549,7 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
         struct FieldDef *first;
         first = NULL;
         for (i = 0; i < nfield_defs; ++i) {
-            if (field_defs[i].parent_struct_id == sid) {
+            if (field_defs[i].parent_struct_id == sid && !field_defs[i].is_promoted) {
                 first = &field_defs[i];
                 break;
             }
@@ -540,11 +570,8 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
             if (had_brace && accept(',')) {
                 if (tok.kind != '}') {
                     error_here("too many union initializer elements");
-                    while (tok.kind != TOK_EOF && tok.kind != '}') {
-                        skip_initializer_or_decl_tail();
-                        if (tok.kind == ',') next_token();
-                        else break;
-                    }
+                    while (tok.kind != TOK_EOF && tok.kind != '}')
+                        next_token();
                 }
             }
         }
@@ -558,9 +585,29 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
 
     for (i = 0; i < nfield_defs && tok.kind != TOK_EOF && tok.kind != '}'; ++i) {
         struct FieldDef *fd;
-        fd = &field_defs[i];
-        if (fd->parent_struct_id != sid)
-            continue;
+        if (tok.kind == '.') {
+            next_token();
+            if (tok.kind != TOK_ID) {
+                error_here("expected a field designator, such as '.field = value'");
+                while (tok.kind != TOK_EOF && tok.kind != '}')
+                    next_token();
+                break;
+            }
+            fd = find_field_def(sid, tok.text);
+            if (fd == NULL) {
+                error_here("unknown field initializer designator");
+                while (tok.kind != TOK_EOF && tok.kind != '}')
+                    next_token();
+                break;
+            }
+            i = (int)(fd - field_defs);
+            next_token();
+            expect('=');
+        } else {
+            fd = &field_defs[i];
+            if (fd->parent_struct_id != sid || fd->is_promoted)
+                continue;
+        }
 
         if (fd->offset > used)
             emit_zero_local_bytes(s, baseoff + used, fd->offset - used);
@@ -579,7 +626,7 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
             while (k >= 0 && k < nfield_defs && tok.kind != TOK_EOF && tok.kind != '}') {
                 struct FieldDef *bfd;
                 bfd = &field_defs[k];
-                if (bfd->parent_struct_id == sid) {
+                if (bfd->parent_struct_id == sid && !bfd->is_promoted) {
                     if (bfd->bit_width <= 0 || bfd->offset != unit_off)
                         break;
                     unit |= bitfield_init_part(bfd, parse_struct_init_const_value());
@@ -608,7 +655,8 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
                 k = next;
             }
             emit_store_const_bitfield_unit_to_local(s, baseoff + unit_off, unit);
-            used = unit_off + 2;
+            end_used = unit_off + 2;
+            if (end_used > used) used = end_used;
             if (k > i)
                 i = k - 1;
             if (stop)
@@ -623,9 +671,11 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
         else
             emit_init_auto_struct_scalar(s, baseoff + fd->offset, fd->type);
 
-        used = fd->offset + fd->size;
+        end_used = fd->offset + fd->size;
+        if (end_used > used) used = end_used;
         if (!accept(',')) break;
         if (tok.kind == '}') break;
+        if (tok.kind == '.') i = -1;
     }
     expect('}');
 
@@ -723,6 +773,7 @@ void emit_init_auto_array_level(struct Sym *s, int elem_type, int *np, int level
 {
     int start;
     int limit;
+    int maxn;
 
     if (!accept('{')) {
         emit_init_auto_array_scalar(s, elem_type, np);
@@ -731,12 +782,29 @@ void emit_init_auto_array_level(struct Sym *s, int elem_type, int *np, int level
 
     start = np[0];
     limit = start + sym_array_elems_from_level(s, level);
+    maxn = np[0];
 
     while (tok.kind != TOK_EOF && tok.kind != '}') {
+        if (tok.kind == '[') {
+            int idx;
+            int span;
+
+            next_token();
+            idx = parse_const_int_expr();
+            expect(']');
+            expect('=');
+            span = sym_array_elems_from_level(s, level + 1);
+            if (span <= 0) span = 1;
+            if (idx < 0)
+                error_here("negative array initializer designator");
+            else
+                np[0] = start + idx * span;
+        }
         if (tok.kind == '{' && s->dim_count > 0 && level + 1 < s->dim_count)
             emit_init_auto_array_level(s, elem_type, np, level + 1);
         else
             emit_init_auto_array_scalar(s, elem_type, np);
+        if (np[0] > maxn) maxn = np[0];
 
         if (!accept(','))
             break;
@@ -745,6 +813,8 @@ void emit_init_auto_array_level(struct Sym *s, int elem_type, int *np, int level
     }
     expect('}');
 
+    if (maxn > np[0])
+        np[0] = maxn;
     while (np[0] < limit) {
         emit_store_const_to_local_array_elem(s, elem_type, np[0], 0);
         np[0] = np[0] + 1;
@@ -792,6 +862,13 @@ void gen_local_decl_after_type(int base)
 
         strncpy(source_name, name, sizeof(source_name) - 1);
         source_name[sizeof(source_name) - 1] = 0;
+
+        if (tok.kind == '(') {
+            skip_prototype_function_suffix();
+            if (!accept(','))
+                break;
+            continue;
+        }
 
         if (g_for_decl_seq >= 0) {
             const char *rn;
@@ -901,7 +978,7 @@ void gen_local_decl_after_type(int base)
             if (accept('=')) {
                 unsigned long ignored_const_value;
                 if (!try_parse_local_const_initializer(type, &ignored_const_value)) {
-                    gen_expr_no_comma();
+                    ast_emit_init_expr();
                 }
             }
         } else if (accept('=')) {
@@ -926,13 +1003,17 @@ void gen_local_decl_after_type(int base)
                 next_token();
                 emit_load_sym_addr(s);
                 emit("\tpush hl\n");
-                gen_expr_no_comma();
+                ast_emit_init_expr();
                 if (type_is_long(type)) {
-                    if (!type_is_long(g_expr_type))
+                    if (type_is_float(g_expr_type))
+                        emit_convert_float_to_intlike(type);
+                    else if (!type_is_long(g_expr_type))
                         emit_extend_to_long_typed(g_expr_type);
                     emit_store_de_to_addr_hl(type);
                 } else {
-                    if (type_size(type) > 1 && !type_is_long(g_expr_type))
+                    if (type_is_float(g_expr_type))
+                        emit_convert_float_to_intlike(type);
+                    else if (type_size(type) > 1 && !type_is_long(g_expr_type))
                         emit_promote_byte_to_int(g_expr_type);
                     emit("\tex de,hl\n\tpop hl\n");
                     emit_store_de_to_addr_hl(type);
@@ -957,7 +1038,7 @@ void gen_local_decl_after_type(int base)
                      */
                     emit_load_sym_addr(s);
                     emit("\tpush hl\n");
-                    gen_expr_no_comma();
+                    ast_emit_init_expr();
                     if (!type_is_float(g_expr_type))
                         emit_convert_int_to_float(g_expr_type);
                     emit_store_de_to_addr_hl(type);
@@ -965,15 +1046,19 @@ void gen_local_decl_after_type(int base)
             } else {
                 emit_load_sym_addr(s);
                 emit("\tpush hl\n");
-                gen_expr_no_comma();
+                ast_emit_init_expr();
                 if (type_is_long(type)) {
                     /* For long locals, emit_store_de_to_addr_hl pops the
                      * address itself via "pop de", so don't consume it here. */
-                    if (!type_is_long(g_expr_type))
+                    if (type_is_float(g_expr_type))
+                        emit_convert_float_to_intlike(type);
+                    else if (!type_is_long(g_expr_type))
                         emit_extend_to_long_typed(g_expr_type);
                     emit_store_de_to_addr_hl(type);
                 } else {
-                    if (type_size(type) > 1 && !type_is_long(g_expr_type))
+                    if (type_is_float(g_expr_type))
+                        emit_convert_float_to_intlike(type);
+                    else if (type_size(type) > 1 && !type_is_long(g_expr_type))
                         emit_promote_byte_to_int(g_expr_type);
                     emit("\tex de,hl\n\tpop hl\n");
                     emit_store_de_to_addr_hl(type);

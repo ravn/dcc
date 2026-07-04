@@ -1,8 +1,9 @@
 # Introduction
 
-**dcc** is an open source C89 compiler for **CP/M 2.2 on the Z80**. It
-translates a `.c` file to M80 assembly. M80 assembles the result, and L80 links
-it into a CP/M `.COM` program.
+**dcc** is an open source C compiler for **CP/M 2.2 on the Z80**. It has a C89
+core plus target-appropriate C99/C11 front-end compatibility. For every source
+file it accepts, dcc translates the `.c` file to M80 assembly; M80 assembles the
+result, and L80 links it into a CP/M `.COM` program.
 
 dcc runs on Windows, macOS, and Linux, but the programs it builds run under
 CP/M. The [ntvcm](https://github.com/davidly/ntvcm) emulator and other popular
@@ -19,7 +20,7 @@ build path from C source to `.COM` file.
 
 - Start with [Setting up the toolchain](00-setup-toolchain.md).
 - See [Building and linking](02-build-and-link.md) for the normal build flow.
-- See [C89 conformance and C99 extensions](01-c89-conformance.md),
+- See [C conformance and target exceptions](01-c-conformance.md),
   [Types and conventions](03-types-and-conventions.md), and
   [Operators](04-operators.md) for the language rules.
 - Use the library reference for [assert.h](standard-lib/01-assert.md),
@@ -73,6 +74,12 @@ optimizer pass.
 
 ## Engineering Notes
 
-dcc changes are built often, run under the emulator, and compared against
-baselines. The main constraints are small memory, old tools, fixed file formats,
-and reproducible tests.
+The dcc C Compiler was engineered agentically, with plenty of human supervision,
+patience, and love. It is unit tested against baselines grounded in modern desktop
+C compilers and a platform-appropriate subset of the community-driven
+[c-testsuite](https://github.com/c-testsuite/c-testsuite).
+
+## Contributions and Feedback Welcome
+
+This is an Open Source C compiler, community contributions welcome and/or report issues via the GitHub Issues for this project.
+

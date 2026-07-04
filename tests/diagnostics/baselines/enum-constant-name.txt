@@ -1,0 +1,4 @@
+<source>:2: error DCC-E0521: enum constant name expected near '='
+        = 1
+        ^
+dcc: 1 error(s)

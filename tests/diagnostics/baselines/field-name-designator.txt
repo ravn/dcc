@@ -1,0 +1,4 @@
+<source>:6: error DCC-E0501: expected a field designator, such as '.field = value' near '='
+        . = 1
+          ^
+dcc: 1 error(s)

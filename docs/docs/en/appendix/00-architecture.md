@@ -47,18 +47,22 @@ sees the real set of runtime symbols the program calls.
 
 ## Compiler Shape
 
-dcc is a single-pass, syntax-directed translator. It does not build an AST or an
-intermediate representation. As the parser recognizes a construct, it emits the
-corresponding Z80 assembly.
+dcc's compiler implementation is AST-driven for function bodies: statements and
+expressions are parsed into typed AST nodes, and the AST walker emits the Z80
+assembly. Code generation is a **single AST path** — every expression and
+statement, including local-declaration initializers, is lowered through the AST
+emitter (initializers build into an isolated arena so they never disturb the
+surrounding statement walk). The AST is "function-local" only in scope:
+top-level declarations, the preprocessor, and the global type/symbol tables
+remain direct table-driven front-end machinery rather than AST nodes.
 
 ```mermaid
 flowchart LR
     SRC([".c source"]) --> PP["preprocess +<br/>#include splice"]
     PP --> LEX["lexer<br/>(next_token)"]
-    LEX --> PARSE["recursive-descent parse<br/>+ emit (one pass)"]
-    PARSE --> ASM([".MAC assembly"])
-    PARSE -. consults .-> ORA["type oracle<br/>(side-effect-free)"]
-    ORA -. type verdict .-> PARSE
+    LEX --> BUILD["dcc_ast_build.c<br/>build function-local AST"]
+    BUILD --> GEN["dcc_ast_gen*.c<br/>emit from AST"]
+    GEN --> ASM([".MAC assembly"])
 ```
 
 The phases are:
@@ -66,48 +70,85 @@ The phases are:
 | Classic phase | Conventional design | dcc's approach |
 | --- | --- | --- |
 | Lexical analysis | Separate tokenizer | `next_token` lexer in `dcc_preproc.c` (integrated with the preprocessor) |
-| Parsing | Build an AST | Recursive-descent parse with **no AST**; actions emit code inline |
-| Semantic analysis | Walk the AST, annotate types | Done *during* the parse against live symbol/type tables |
+| Parsing | Build an AST | Recursive-descent parse into a function-local AST |
+| Semantic analysis | Walk the AST, annotate types | Done during AST construction against live symbol/type tables |
 | Intermediate representation | One or more IRs (e.g. three-address code, SSA) | **None** — C maps straight to Z80 |
 | Machine-independent optimization | Passes over the IR | Mostly absent by design; some peephole/idiom fast paths in codegen |
-| Code generation | Lower IR to target | Emitted directly by the parser's semantic actions |
+| Code generation | Lower IR to target | AST walker emits Z80/M80 assembly through shared emit helpers |
 | Machine-dependent optimization | Target peephole pass | Separate program `dccpeep` over the emitted text |
 
-### Type prediction
+### Typed expression lowering
 
-Without an AST, the parser must choose 16-bit, 32-bit, or float code before it
-emits each operand of an operator, conditional arm, or branch condition.
+The AST carries expression result types, so codegen can choose 16-bit, 32-bit,
+pointer, struct, or float lowering from the tree it is emitting — the full
+typed operand is always in hand before any code is emitted.
 
-dcc uses two mechanisms:
+## Compiler Features
 
-- A shallow source-text peek (`peek_simple_unary_type`, `snippet_simple_type`)
-  checks the first token or two of the upcoming operand.
-- The type oracle (`dcc_type_oracle.c`) walks the full expression grammar and
-  returns the type the generator will produce, applying the usual arithmetic
-  conversions without emitting code.
+dcc is intentionally small, but the compiler front end still provides a
+user-facing feature set around diagnostics, C89/C99 compatibility extensions,
+target-model checks, and size-oriented dead-code elimination in the generated
+program.
 
-```mermaid
-flowchart TB
-    GEN["code generator<br/>reaches an operator"] --> SNAP["snapshot lexer state<br/>(posi, tok, line, flags)"]
-    SNAP --> WALK["type oracle walks the<br/>full operand grammar"]
-    WALK --> VERDICT["return C type verdict"]
-    VERDICT --> RESTORE["restore lexer state"]
-    RESTORE --> EMIT["re-parse + emit<br/>correctly-typed code"]
-```
+### Error messages by category
 
-The oracle snapshots and restores lexer state before returning. It supplies
-whole-expression type information without a full AST or a second code-generating
-pass.
+Compiler diagnostics are emitted through `dcc_diag_emit.c`. Each diagnostic is
+assigned a stable `DCC-E####` code, reported with the source file and line, and
+prints the original source line with a caret when the compiler has an exact
+token position. The compile-fail diagnostic tests under `tests/diagnostics/`
+lock these messages and carets against exact baselines.
+
+| Category | Code range | Examples |
+| --- | --- | --- |
+| Name lookup | `DCC-E0201` | undeclared identifiers |
+| Preprocessor and include handling | `DCC-E0301`-`DCC-E0321` | malformed `#include`, unknown directives, unmatched `#elif`/`#else`/`#endif`, bad macro arity |
+| Constant expressions | `DCC-E0401`-`DCC-E0403` | non-constant expressions, division by zero, missing expression operands |
+| Struct/union/enum/type semantics | `DCC-E0501`-`DCC-E0540` | field designators, `offsetof`, bit-fields, duplicate enum constants, missing type names, multiple storage classes |
+| Array and pointer constraints | `DCC-E0601`-`DCC-E0602` | variable-length arrays, scalar subscripting |
+| Statement control flow | `DCC-E0701`-`DCC-E0706` | `break`/`continue` outside valid contexts, stray `case`/`default`, duplicate or undefined labels |
+| Functions and declarations | `DCC-E0801`-`DCC-E0806` | parameter declaration errors, redefinitions, too few or too many function-call arguments |
+| Initializers and assignment compatibility | `DCC-E0901`-`DCC-E0920` | invalid address initializers, non-constant initializers, string/array/struct initializer errors, integer-to-pointer assignment |
+| Unsupported or malformed constructs | `DCC-E1001`-`DCC-E1005` | unsupported AST forms, malformed syntax, oversized string literals, unsupported `sizeof` expressions |
+| General syntax and top-level parsing | `DCC-E1101`-`DCC-E1107` | expected tokens such as `;`, `)`, `]`, `=`, or an external declaration |
+| CP/M/Z80 target-model limits | `DCC-E1201`-`DCC-E1203` | unsupported `double`, `long long`, and 64-bit integer typedef names |
+
+The categories are deliberately broad: the numeric code says where the problem
+was detected, while the message text names the exact source-level issue.
+
+### Dead code detection and elimination
+
+dcc does not run a whole-program control-flow analysis pass, and it does not
+warn about arbitrary unreachable user statements. Instead, dead-code handling is
+pragmatic and size-focused at the points where the toolchain has reliable local
+knowledge:
+
+- **Dead expression results.** During AST lowering, expression statements and
+  condition-only contexts set internal "result is dead" state so the emitter can
+  choose forms that perform side effects without preserving an unused value.
+- **Dead stores and labels in assembly.** `dccpeep` runs to a fixpoint over the
+  emitted `.MAC` text. Among its cleanups are jump/label threading, jump-to-next
+  removal, redundant load/store removal, and conservative dead IX-frame store
+  elimination when a stack slot is overwritten before it can be read.
+- **Dead static inline bodies.** Simple `static inline` functions can be
+  buffered and emitted only when a real out-of-line body is needed, avoiding
+  unused helper text in the generated assembly.
+- **Dead runtime blocks.** `dccrtlstrip` performs conservative mark-and-sweep
+  dead-block elimination over `DCCRTL.MAC`: it roots symbols referenced by the
+  app, follows runtime-to-runtime references to a fixpoint, and writes
+  `RTLMIN.MAC` containing only reachable runtime blocks.
+
+This split keeps the compiler simple while still attacking the biggest sources
+of wasted code: unused expression values, local assembly redundancies, unused
+inline bodies, and unreferenced runtime support.
 
 ## Inside dcc: module architecture
 
 The compiler is one binary built from focused modules that all share a single
-umbrella header, `dcc.h`. Because parsing and code generation are interleaved
-and share a large amount of file-scope state (the source buffer, the lookahead
-token, the symbol/type tables, per-function codegen flags), the natural layout
-is the classic single-binary compiler shape: **one shared header, many
-cooperating `.c` files**, with all mutable state defined once in
-`dcc_state.c`.
+umbrella header, `dcc.h`. The parser, AST builder, AST emitter, and low-level
+emit helpers share file-scope compiler state (the source buffer, the lookahead
+token, the symbol/type tables, per-function codegen flags), so the natural
+layout is the classic single-binary compiler shape: **one shared header, many
+cooperating `.c` files**, with all mutable state defined once in `dcc_state.c`.
 
 ```mermaid
 graph TB
@@ -128,25 +169,30 @@ graph TB
         SYM["dcc_symbols.c"]
         CONST["dcc_constexpr.c"]
         FOLD["dcc_fold.c"]
-        ORACLE["dcc_type_oracle.c"]
     end
 
-    subgraph CG["3 - Code generation"]
+    subgraph AST["3 - Function-local AST"]
+      ASTN["dcc_ast.c / dcc_ast.h"]
+      ASTB["dcc_ast_build.c"]
+      ASTG["dcc_ast_gen*.c<br/>(5 TUs)"]
+    end
+
+    subgraph CG["4 - Code generation helpers"]
         EXPR["dcc_expr.c<br/>expressions, calls"]
         OPS["dcc_ops.c<br/>arithmetic, bitwise"]
         CMP["dcc_cmp.c<br/>compare, branch"]
         ASSIGN["dcc_assign.c"]
-        STMT["dcc_stmt.c<br/>if/while/for/switch"]
+        STMT["dcc_stmt.c<br/>compound + switch helpers"]
         DECL["dcc_decl.c<br/>local decls, initializers"]
     end
 
-    subgraph TOP["4 - Top level + output"]
+    subgraph TOP["5 - Top level + output"]
         FUNC["dcc_func.c<br/>functions, frame layout"]
         DATA["dcc_data.c<br/>data-section emission"]
     end
 
     SHARED -.included by all.-> FE
-    FE ==> TYP ==> CG ==> TOP
+    FE ==> TYP ==> AST ==> CG ==> TOP
 ```
 
 The thick arrows are the dominant translation pipeline (front end → types →
@@ -158,8 +204,9 @@ other — the arrows show the usual direction, not a hard layering rule.
 | --- | --- | --- |
 | Shared | `dcc.h`, `dcc_state.c` | Contract + single definition of all shared state |
 | Front end | `dcc.c`, `dcc_preproc.c`, `dcc_diag_emit.c`, `dcc_asmname.c` | Driver/CLI, preprocessor + lexer, diagnostics + emit primitives, C-name-to-asm-symbol mapping |
-| Types / symbols | `dcc_types.c`, `dcc_symbols.c`, `dcc_constexpr.c`, `dcc_fold.c`, `dcc_type_oracle.c` | Type system, symbol tables, constant-expression evaluation, constant folding, the type oracle |
-| Code generation | `dcc_expr.c`, `dcc_ops.c`, `dcc_cmp.c`, `dcc_assign.c`, `dcc_stmt.c`, `dcc_decl.c`, `dcc_stmt_fast.c` | Expression, operator, comparison, assignment, statement, and declaration lowering |
+| Types / symbols | `dcc_types.c`, `dcc_symbols.c`, `dcc_constexpr.c`, `dcc_fold.c` | Type system, symbol tables, constant-expression evaluation, constant folding |
+| Function-local AST | `dcc_ast.h`, `dcc_ast.c`, `dcc_ast_build.c`, `dcc_ast_gen.c` + `dcc_ast_gen_support.c` / `_expr.c` / `_cond.c` / `_stmt.c` (behind `dcc_ast_gen_internal.h`) | AST node storage, typed statement/expression building, and the AST-driven Z80 emitter — split into classifiers/type resolvers (`dcc_ast_gen.c`), the `ast_gen_supported` dispatch and folds (`_support.c`), expression emitters (`_expr.c`), condition/branch emitters (`_cond.c`), and switch/for/statement emitters (`_stmt.c`) |
+| Code generation helpers | `dcc_expr.c`, `dcc_ops.c`, `dcc_cmp.c`, `dcc_assign.c`, `dcc_stmt.c`, `dcc_decl.c`, `dcc_stmt_fast.c` | Shared low-level emit helpers — expression, operator, comparison, assignment, declaration, and compound-block/switch-table lowering — all invoked *by the AST emitter* |
 | Top level / output | `dcc_func.c`, `dcc_data.c` | Function/frame parsing and data-section emission |
 
 ## Inside dccpeep: a fixpoint peephole optimizer
@@ -208,20 +255,19 @@ Key design points:
 
 ## The runtime: a block-structured library sized for stripping
 
-The runtime `DCCRTL.MAC` is a single ~16,500-line assembly source, but its
+The runtime `DCCRTL.MAC` is a single ~19,000-line assembly source, but its
 *architecture* is what makes the toolchain's "pay only for what you use"
 property possible. Rather than one monolithic blob, the runtime is written as
-**~220 independent blocks**, each delimited by a `public` label and each
-depending only on a small shared prelude. A program never links the whole
-library — `dccrtlstrip` keeps only the blocks the application actually
-references (the mark-and-sweep details are in the companion appendix
-[*Runtime optimization*](01-dccrtlstrip.md)). The architectural
+**~280 parsed blocks** around `public` entry points and shared preludes. A
+program never links the whole library — `dccrtlstrip` keeps only the blocks the
+application actually references (the mark-and-sweep details are in the companion
+appendix [*Runtime optimization*](01-dccrtlstrip.md)). The architectural
 consequence is that **every routine has a well-defined, measurable size cost**.
 
 ```mermaid
 flowchart TB
-    subgraph RT["DCCRTL.MAC (~16,500 lines, ~220 public blocks)"]
-        BASE["always-present baseline<br/>~226 lines, 6 blocks<br/>(start, argv/console, heap, exit)"]
+    subgraph RT["DCCRTL.MAC (~19,000 lines, ~280 parsed blocks)"]
+      BASE["always-present baseline<br/>~297 lines, 7 blocks<br/>(start, argv/console, heap, exit)"]
         IO["stdio blocks<br/>printf, file I/O core"]
         MEM["memory blocks<br/>malloc/free/realloc"]
         LONG["32-bit long blocks"]
@@ -250,11 +296,11 @@ The gap between the two is the whole story of the runtime's size architecture: a
 small `self` with a large `marginal` means the routine sits on top of a big
 shared substrate (the file-I/O core, or the float arithmetic core).
 
-### The always-present baseline (~226 lines)
+### The always-present baseline (~297 lines)
 
-Six blocks are always linked because they are reachable from the forced `start`
-root: program entry and heap/BSS setup, the command-tail `argv` builder (which
-also contains the console writer `__conout`), the heap-state words, and
+Seven blocks are always linked because they are reachable from the forced
+`start` root: program entry and heap/BSS setup, the command-tail `argv` builder
+(which also contains the console writer `__conout`), the heap-state words, and
 `exit`. Console output therefore costs essentially nothing extra — `putchar`
 and `puts` call into code that is already present.
 
@@ -264,16 +310,16 @@ The runtime's size is dominated by a few shared cores. Routines that sit on a
 core are cheap individually but expensive to introduce, because the first one
 links the whole core:
 
-| Feature group | Shared core it links | Marginal cost (lines) |
-| --- | --- | ---: |
-| Console output (`putchar`, `puts`, integer `printf`) | none (baseline only) | ~12–840 |
-| File-stream + low-level I/O (`fopen`, `fread`, `fputs`, `fprintf`) | FCB/DMA file core (~470) | ~470–1,500 |
-| `scanf` / `sscanf` / `fscanf` | shared 697-line scan core | ~1,290–1,305 |
-| Memory (`malloc`/`free`/`realloc`/`calloc`) | heap helpers (`__mlh`, `__frcoal`) | ~130–650 |
-| 32-bit `long` arithmetic | long mul/div/mod helpers | ~30–340 |
-| `float` operators | normalise/round core (~700) | ~700–1,050 |
-| `math.h` (`sinf`, `expf`, `powf`, …) | float core + conversions | ~1,500–3,300 |
-| `string.h` / `ctype.h` | none (self-contained) | ~15–100 |
+| Feature group | Shared core it tends to link |
+| --- | --- |
+| Console output (`putchar`, `puts`, integer `printf`) | baseline console writer or self-contained formatter |
+| File-stream + low-level I/O (`fopen`, `fread`, `fputs`, `fprintf`) | FCB/DMA file core |
+| `scanf` / `sscanf` / `fscanf` | shared scan core |
+| Memory (`malloc`/`free`/`realloc`/`calloc`) | heap helpers and size arithmetic |
+| 32-bit `long` arithmetic | long multiply/divide/modulo helpers |
+| `float` operators | float normalise/round core |
+| `math.h` (`sinf`, `expf`, `powf`, …) | float core plus conversions and chained math helpers |
+| `string.h` / `ctype.h` | usually self-contained routines |
 
 The exact per-routine `self`/`marginal` numbers — and the transitive
 dependencies behind each one — are tabulated on the auto-generated
@@ -287,24 +333,23 @@ sizing a program are:
   links a shared core. Additional routines in the same family are then nearly
   free.
 - **`math.h` is the single biggest lever** — the `exp`/`log`/`pow` and
-  hyperbolic group runs ~2,000–3,300 lines because each chains other math
-  routines on top of the float core.
+  hyperbolic group are expensive because each chains other math routines on top
+  of the float core.
 
 Those numbers are recomputed from `DCCRTL.MAC` on every docs build, so editing
 the runtime and rebuilding the docs is all that is needed to refresh them.
 
-- dcc is a **single-pass, syntax-directed** C89 compiler with **no AST and no
-  IR** — code is emitted as the parser recognises each construct, in the
-  tradition of the earliest C compilers.
-- The one structural weakness of that design (knowing operand types before
-  emitting them) is addressed by a **side-effect-free type oracle**, a
-  "1.5-pass" technique that restores accurate whole-expression typing without a
-  tree.
+## Architecture summary
+
+- dcc is an **AST-driven** C89 compiler for function bodies, with direct
+  lowering from typed AST nodes to Z80/M80 assembly.
+- Typed AST expression nodes drive mixed-width (16/32-bit, pointer, float)
+  codegen decisions from the tree being emitted.
 - Machine-dependent optimization is split out into **`dccpeep`**, a
   fixpoint peephole optimizer over the assembly text, with separate time (`-Ot`)
   and size (`-Os`) strategies.
-- The runtime `DCCRTL.MAC` is **block-structured** (~220 independent `public`
-  blocks over a ~226-line baseline), so every routine has a measurable
+- The runtime `DCCRTL.MAC` is **block-structured** (~280 parsed blocks over a
+  ~297-line baseline), so every routine has a measurable
   `self`/`marginal` size cost and `dccrtlstrip` can link only the blocks a
   program references.
 - The back half of the pipeline reuses the proven off-the-shelf Microsoft

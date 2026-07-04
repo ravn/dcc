@@ -1,0 +1,4 @@
+<source>:1: error DCC-E0901: identifier expected after & in initializer near '1'
+    int *p = &1;
+              ^
+dcc: 1 error(s)

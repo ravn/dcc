@@ -33,6 +33,10 @@ void skip_type_qualifiers(void)
 }
 
 int parse_type(void);
+int is_unsupported_target_type_name(const char *name)
+{
+    return name && (!strcmp(name, "double") || !strcmp(name, "int64_t") || !strcmp(name, "uint64_t"));
+}
 int parse_const_int_expr(void);
 
 int type_struct_id(int type)
@@ -57,6 +61,7 @@ int type_size(int type)
         return 0;
     }
     if ((type & 15) == TYPE_CHAR) return 1;
+    if ((type & 15) == TYPE_BOOL) return 1;
     if ((type & 15) == TYPE_VOID) return 0;
     if ((type & 15) == TYPE_LONG) return 4;
     if ((type & 15) == TYPE_FLOAT) return 4;
@@ -75,11 +80,10 @@ int type_is_float(int type)
     return (type & 15) == TYPE_FLOAT;
 }
 
-void error_float_unsupported(const char *what)
+int type_is_bool(int type)
 {
-    error_here(what);
-    emit("\tld hl,0\n");
-    g_expr_type = TYPE_INT;
+    if (type & (TYPE_PTR | TYPE_PTR2)) return 0;
+    return (type & 15) == TYPE_BOOL;
 }
 
 int object_array_size(int type, int count)
@@ -131,7 +135,7 @@ int type_scalar_atom_count(int type)
         int d;
 
         fd = &field_defs[i];
-        if (fd->parent_struct_id != sid)
+        if (fd->parent_struct_id != sid || fd->is_promoted)
             continue;
 
         fcount = 1;
@@ -193,6 +197,7 @@ int type_index_elem_size(int type)
         int base = type & 15;
         if (type & TYPE_STRUCT)
             return type_size(type & ~(TYPE_PTR | TYPE_PTR2));
+        if (base == TYPE_BOOL) return 1;
         if (base == TYPE_CHAR) return 1;
         if (base == TYPE_VOID) return 1;
         if (base == TYPE_LONG) return 4;
@@ -333,6 +338,37 @@ struct FieldDef *find_field_def(int struct_id, const char *field_name)
     return NULL;
 }
 
+static void promote_anonymous_aggregate_fields(int parent_struct_id, struct FieldDef *anon_fd)
+{
+    int child_sid;
+    int i;
+    int limit;
+
+    if (anon_fd == NULL || !(anon_fd->type & TYPE_STRUCT) || type_ptr_depth(anon_fd->type) != 0)
+        return;
+
+    child_sid = type_struct_id(anon_fd->type);
+    if (child_sid <= 0 || child_sid > nstruct_defs)
+        return;
+
+    limit = nfield_defs;
+    for (i = 0; i < limit; ++i) {
+        if (field_defs[i].parent_struct_id != child_sid || field_defs[i].is_anonymous)
+            continue;
+        if (field_defs[i].name[0] == 0)
+            continue;
+        if (nfield_defs >= MAX_FIELDS)
+            fatal("too many struct fields");
+
+        field_defs[nfield_defs] = field_defs[i];
+        field_defs[nfield_defs].parent_struct_id = parent_struct_id;
+        field_defs[nfield_defs].offset += anon_fd->offset;
+        field_defs[nfield_defs].is_anonymous = 0;
+        field_defs[nfield_defs].is_promoted = 1;
+        nfield_defs++;
+    }
+}
+
 void parse_struct_definition(int struct_id)
 {
     struct StructDef *sd;
@@ -356,15 +392,29 @@ void parse_struct_definition(int struct_id)
         ftype = parse_type();
 
         for (;;) {
+            int is_funcptr_field;
+            int is_anonymous_field;
+            int field_index;
             while (accept('*')) { skip_type_qualifiers(); ftype = type_add_ptr(ftype); }
 
-            if (tok.kind != TOK_ID) {
-                error_here("field name expected");
-                break;
+            is_funcptr_field = 0;
+            is_anonymous_field = 0;
+            if (parse_funcptr_declarator(&ftype, fname, sizeof(fname))) {
+                is_funcptr_field = 1;
+            } else {
+                if (tok.kind != TOK_ID) {
+                    if (tok.kind == ';' && (ftype & TYPE_STRUCT) && type_ptr_depth(ftype) == 0) {
+                        fname[0] = 0;
+                        is_anonymous_field = 1;
+                    } else {
+                        error_here("field name expected");
+                        break;
+                    }
+                } else {
+                    dcc_copy_str(fname, sizeof(fname), tok.text);
+                    next_token();
+                }
             }
-
-            dcc_copy_str(fname, sizeof(fname), tok.text);
-            next_token();
 
             if (tok.kind == ':') {
                 int bw;
@@ -400,7 +450,7 @@ void parse_struct_definition(int struct_id)
                 dcc_copy_str(field_defs[nfield_defs].name, sizeof(field_defs[nfield_defs].name), fname);
                 if ((ftype & 15) != TYPE_INT || type_ptr_depth(ftype) != 0)
                     error_here("bitfield type must be int or unsigned int");
-                field_defs[nfield_defs].type = (ftype & TYPE_UNSIGNED) ?
+                field_defs[nfield_defs].type = ((ftype & TYPE_UNSIGNED) || g_parse_type_was_enum) ?
                     (TYPE_UNSIGNED | TYPE_INT) : TYPE_INT;
                 field_defs[nfield_defs].parent_struct_id = struct_id;
                 field_defs[nfield_defs].offset = bit_unit_offset;
@@ -434,6 +484,14 @@ void parse_struct_definition(int struct_id)
             field_defs[nfield_defs].elem_type = ftype;
             field_defs[nfield_defs].elem_size = bytes;
 
+            if (is_funcptr_field && g_funcptr_decl_array_len > 0) {
+                field_defs[nfield_defs].is_array = 1;
+                field_defs[nfield_defs].array_len = g_funcptr_decl_array_len;
+                field_defs[nfield_defs].dims[0] = g_funcptr_decl_array_len;
+                field_defs[nfield_defs].dim_count = 1;
+                bytes *= g_funcptr_decl_array_len;
+            }
+
             while (accept('[')) {
                 int flen;
                 flen = parse_const_int_expr();
@@ -447,6 +505,8 @@ void parse_struct_definition(int struct_id)
             }
 
             field_defs[nfield_defs].size = bytes;
+            field_defs[nfield_defs].is_anonymous = is_anonymous_field;
+            field_index = nfield_defs;
             nfield_defs++;
 
             sd->field_count++;
@@ -456,6 +516,9 @@ void parse_struct_definition(int struct_id)
             } else {
                 sd->size += bytes;
             }
+
+            if (is_anonymous_field)
+                promote_anonymous_aggregate_fields(struct_id, &field_defs[field_index]);
 
             if (!accept(',')) break;
         }
@@ -506,41 +569,86 @@ int parse_base_type(void)
     int saw_any;
     int saw_unsigned;
     int saw_long;
+    int saw_long_long;
     int saw_short;
     int saw_char;
     int saw_void;
     int saw_float;
+    int saw_bool;
+    int storage_class_seen;
 
     t = 0;
     saw_any = 0;
     saw_unsigned = 0;
     saw_long = 0;
+    saw_long_long = 0;
     saw_short = 0;
     saw_char = 0;
     saw_void = 0;
     saw_float = 0;
+    saw_bool = 0;
+    storage_class_seen = 0;
     g_typedef_array_len = 0;
     g_typedef_is_func = 0;
     decl_is_register = 0;
     decl_is_const = 0;
+    decl_is_inline = 0;
+    g_parse_type_was_enum = 0;
 
     /* C89 declaration specifiers are order-independent. */
     for (;;) {
-        if (tok.kind == TOK_REGISTER) { decl_is_register = 1; next_token(); continue; }
-        if (tok.kind == TOK_CONST) { decl_is_const = 1; next_token(); continue; }
-        if (tok.kind == TOK_VOLATILE ||
-            tok.kind == TOK_AUTO || tok.kind == TOK_INLINE) {
+        if (tok.kind == TOK_REGISTER) {
+            if (storage_class_seen)
+                error_here("multiple storage classes in declaration");
+            storage_class_seen = 1;
+            decl_is_register = 1;
             next_token();
             continue;
         }
-        if (tok.kind == TOK_EXTERN) { decl_is_extern = 1; next_token(); continue; }
-        if (tok.kind == TOK_STATIC) { decl_is_static = 1; next_token(); continue; }
+        if (tok.kind == TOK_CONST) { decl_is_const = 1; next_token(); continue; }
+        if (tok.kind == TOK_INLINE) { decl_is_inline = 1; next_token(); continue; }
+        if (tok.kind == TOK_VOLATILE ||
+            tok.kind == TOK_AUTO) {
+            if (tok.kind == TOK_AUTO) {
+                if (storage_class_seen)
+                    error_here("multiple storage classes in declaration");
+                storage_class_seen = 1;
+            }
+            next_token();
+            continue;
+        }
+        if (tok.kind == TOK_EXTERN) {
+            if (storage_class_seen)
+                error_here("multiple storage classes in declaration");
+            storage_class_seen = 1;
+            decl_is_extern = 1;
+            next_token();
+            continue;
+        }
+        if (tok.kind == TOK_STATIC) {
+            if (storage_class_seen)
+                error_here("multiple storage classes in declaration");
+            storage_class_seen = 1;
+            decl_is_static = 1;
+            next_token();
+            continue;
+        }
         if (tok.kind == TOK_UNSIGNED) { saw_unsigned = 1; saw_any = 1; next_token(); continue; }
         if (tok.kind == TOK_SIGNED) { saw_any = 1; next_token(); continue; }
-        if (tok.kind == TOK_LONG) { saw_long = 1; saw_any = 1; next_token(); continue; }
+        if (tok.kind == TOK_LONG) {
+            if (saw_long && !saw_long_long) {
+                error_here("long long is not supported by dcc's CP/M/Z80 target; use long");
+                saw_long_long = 1;
+            }
+            saw_long = 1;
+            saw_any = 1;
+            next_token();
+            continue;
+        }
         if (tok.kind == TOK_SHORT) { saw_short = 1; saw_any = 1; next_token(); continue; }
         if (tok.kind == TOK_INT) { saw_any = 1; next_token(); continue; }
         if (tok.kind == TOK_FLOAT) { saw_float = 1; saw_any = 1; next_token(); continue; }
+        if (tok.kind == TOK_BOOL) { saw_bool = 1; saw_any = 1; next_token(); continue; }
         if (tok.kind == TOK_CHAR) { saw_char = 1; saw_any = 1; next_token(); continue; }
         if (tok.kind == TOK_VOID) { saw_void = 1; saw_any = 1; next_token(); continue; }
 
@@ -580,7 +688,12 @@ int parse_base_type(void)
                     char ename[64];
                     int ei;
                     int dup;
-                    if (tok.kind != TOK_ID) { error_here("enum constant name expected"); break; }
+                    if (tok.kind != TOK_ID) {
+                        error_here("enum constant name expected");
+                        while (tok.kind != TOK_EOF && tok.kind != '}')
+                            next_token();
+                        break;
+                    }
                     dcc_copy_str(ename, sizeof(ename), tok.text);
                     next_token();
 
@@ -588,7 +701,13 @@ int parse_base_type(void)
                      * not just bare numeric literals.  This accepts forms such
                      * as B = A + 2, C = (1 << 4), D = sizeof(int), and
                      * negative expressions. */
-                    if (accept('=')) cur_val = parse_enum_const_value();
+                    if (accept('=')) {
+                        cur_val = parse_enum_const_value();
+                        if (tok.kind != ',' && tok.kind != '}') {
+                            while (tok.kind != TOK_EOF && tok.kind != '}')
+                                next_token();
+                        }
+                    }
 
                     dup = 0;
                     for (ei = 0; ei < nenum_consts; ++ei) {
@@ -612,8 +731,26 @@ int parse_base_type(void)
                 expect('}');
             }
             t = TYPE_INT;
+            g_parse_type_was_enum = 1;
             saw_any = 1;
             break;
+        }
+
+        if (!saw_any && tok.kind == TOK_ID && !strcmp(tok.text, "double")) {
+            error_here("double is not supported by dcc's CP/M/Z80 target; use float");
+            saw_float = 1;
+            saw_any = 1;
+            next_token();
+            continue;
+        }
+
+        if (!saw_any && tok.kind == TOK_ID &&
+            (!strcmp(tok.text, "int64_t") || !strcmp(tok.text, "uint64_t"))) {
+            error_here("64-bit integer types are not supported by dcc's CP/M/Z80 target; use long");
+            saw_long = 1;
+            saw_any = 1;
+            next_token();
+            continue;
         }
 
         if (!saw_any && tok.kind == TOK_ID && (td = find_typedef(tok.text)) >= 0) {
@@ -631,7 +768,8 @@ int parse_base_type(void)
         error_here("type expected");
         t = TYPE_INT;
     } else if (t == 0) {
-        if (saw_float) t = TYPE_FLOAT;
+        if (saw_bool) t = TYPE_BOOL;
+        else if (saw_float) t = TYPE_FLOAT;
         else if (saw_void) t = TYPE_VOID;
         else if (saw_char) t = TYPE_CHAR;
         else if (saw_long) t = TYPE_LONG;

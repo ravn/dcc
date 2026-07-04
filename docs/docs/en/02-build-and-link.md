@@ -9,16 +9,29 @@ commands below work from any folder that holds your `.c` sources.
 
 ## The build script
 
-The primary build command is the cross-platform `scripts/ma.ps1` script. It
-compiles, optimizes, strips the runtime, assembles, and links in one step. From
-your operating-system terminal or the VS Code terminal, change to the dcc
-checkout, start PowerShell, and run the script there:
+The primary installed build command is `dcc-ma`. It compiles, optimizes,
+strips the runtime, assembles, and links in one step.
+
+With an installed package, use the common wrapper command on Windows, macOS, and
+Linux:
+
+```sh
+dcc-ma foo --mode fast       # builds foo.c -> FOO.COM
+dcc-ma foo --mode nopeep     # skip the dccpeep optimizer
+```
+
+From a source checkout, run the implementation script directly:
+
+```sh
+./scripts/ma.sh foo --mode fast
+```
+
+On Windows, use the PowerShell driver. It works with the Windows PowerShell 5.1
+already included with Windows, as well as PowerShell 7+:
 
 ```pwsh
-cd /path/to/dcc
-pwsh
-./scripts/ma.ps1 foo -Mode fast    # builds foo.c -> FOO.COM
-./scripts/ma.ps1 foo -Mode nopeep  # skip the dccpeep optimizer
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\ma.ps1 foo -Mode fast    # builds foo.c -> FOO.COM
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\ma.ps1 foo -Mode nopeep  # skip the dccpeep optimizer
 ```
 
 This runs the compiler, the optional `dccpeep` peephole optimizer,
@@ -126,10 +139,10 @@ script resolves each tool from your `PATH` or from the `DCC`, `DCCPEEP`, and
         ntvcm l80 "/P:100,RTLMIN,FOO,FOO/N/E"
         ```
 
-    === "Linux"
+    === "Ubuntu"
 
         Define a CRLF helper: prefer `unix2dos` if it is installed, otherwise
-        use Perl (available on common Linux systems).
+        use Perl (available on Ubuntu).
 
         ```sh
         to_crlf() {
@@ -170,6 +183,98 @@ script resolves each tool from your `PATH` or from the `DCC`, `DCCPEEP`, and
 
         ```sh
         to_crlf RTLMIN.MAC
+        ntvcm m80 "=RTLMIN.MAC" /X /O /Z
+        ntvcm l80 "/P:100,RTLMIN,FOO,FOO/N/E"
+        ```
+
+    === "Ubuntu ARM64"
+
+        Define a CRLF helper: prefer `unix2dos` if it is installed, otherwise
+        use Perl (available on Ubuntu).
+
+        ```sh
+        to_crlf() {
+            if command -v unix2dos >/dev/null 2>&1; then
+                unix2dos "$1" >/dev/null 2>&1 || true
+            else
+                perl -0pi -e 's/\r?\n/\r\n/g' "$1"
+            fi
+        }
+        ```
+
+        Compile the C source to M80 assembly, then optionally run the peephole
+        optimizer.
+
+        ```sh
+        dcc -I /path/to/dcc -stack 512 foo.c -o FOO.MAC
+        dccpeep FOO.MAC _PEEPOUT.MAC
+        mv _PEEPOUT.MAC FOO.MAC
+        ```
+
+        Convert the app assembly to CP/M CRLF text and assemble it with M80 under
+        `ntvcm`.
+
+        ```sh
+        to_crlf FOO.MAC
+        ntvcm m80 "=FOO.MAC" /X /O /Z /L
+        ```
+
+        Copy and trim the runtime to only the blocks used by the app.
+
+        ```sh
+        cp /path/to/dcc/DCCRTL.MAC DCCRTL.MAC
+        to_crlf DCCRTL.MAC
+        dccrtlstrip -r DCCRTL.MAC -o RTLMIN.MAC FOO.MAC
+        ```
+
+        Convert, assemble, and link the trimmed runtime with the app.
+
+        ```sh
+        to_crlf RTLMIN.MAC
+        ntvcm m80 "=RTLMIN.MAC" /X /O /Z
+        ntvcm l80 "/P:100,RTLMIN,FOO,FOO/N/E"
+        ```
+
+    === "Windows ARM64"
+
+        Define a CRLF helper using PowerShell/.NET APIs.
+
+        ```powershell
+        function Convert-ToCrlf($Path) {
+            $text = [IO.File]::ReadAllText($Path) -replace "`r?`n", "`r`n"
+            [IO.File]::WriteAllText($Path, $text)
+        }
+        ```
+
+        Compile the C source to M80 assembly, then optionally run the peephole
+        optimizer.
+
+        ```powershell
+        dcc -I C:\path\to\dcc -stack 512 foo.c -o FOO.MAC
+        dccpeep FOO.MAC _PEEPOUT.MAC
+        Move-Item -Force _PEEPOUT.MAC FOO.MAC
+        ```
+
+        Convert the app assembly to CP/M CRLF text and assemble it with M80 under
+        `ntvcm`.
+
+        ```powershell
+        Convert-ToCrlf FOO.MAC
+        ntvcm m80 "=FOO.MAC" /X /O /Z /L
+        ```
+
+        Copy and trim the runtime to only the blocks used by the app.
+
+        ```powershell
+        Copy-Item C:\path\to\dcc\DCCRTL.MAC DCCRTL.MAC
+        Convert-ToCrlf DCCRTL.MAC
+        dccrtlstrip -r DCCRTL.MAC -o RTLMIN.MAC FOO.MAC
+        ```
+
+        Convert, assemble, and link the trimmed runtime with the app.
+
+        ```powershell
+        Convert-ToCrlf RTLMIN.MAC
         ntvcm m80 "=RTLMIN.MAC" /X /O /Z
         ntvcm l80 "/P:100,RTLMIN,FOO,FOO/N/E"
         ```
@@ -261,7 +366,7 @@ against an app/test name (and pass any program arguments after `--`):
     scripts/stacksize.sh cobint -- e.cob
     ```
 
-=== "Linux"
+=== "Ubuntu"
 
     ```sh
     # simple app
@@ -269,6 +374,26 @@ against an app/test name (and pass any program arguments after `--`):
 
     # app that needs a data-file argument
     scripts/stacksize.sh cobint -- e.cob
+    ```
+
+=== "Ubuntu ARM64"
+
+    ```sh
+    # simple app
+    scripts/stacksize.sh triangle
+
+    # app that needs a data-file argument
+    scripts/stacksize.sh cobint -- e.cob
+    ```
+
+=== "Windows ARM64"
+
+    ```bat
+    rem simple app
+    scripts\stacksize.bat triangle
+
+    rem app that needs a data-file argument
+    scripts\stacksize.bat cobint -- e.cob
     ```
 
 Both honour the same `START` / `STEP` / `MAX` / `MODE` / `EMU` environment

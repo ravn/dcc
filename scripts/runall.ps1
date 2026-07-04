@@ -5,11 +5,14 @@ Comprehensive test suite: builds and runs all test applications with output
 verification against baseline.
 
 .DESCRIPTION
-Builds all *.c files in tests/ folder using ma.ps1, executes each under the
+Builds all *.c files in tests/ folder using dccmake, executes each under the
 emulator, and compares output against per-app baselines in tests/baselines/
 (one <app>.txt per test). Comparison is keyed by app name, so test discovery
 order does not matter. Uses tests/_test_overrides.json for test-specific arguments and
 stack sizes.
+
+Pass -Extended to also run scripts/runall-extended.ps1 after the main app suite,
+verifying the imported c-testsuite single-exec corpus as part of the same run.
 
 Supports per-test arguments (e.g., ttt with "10" as input) and custom stack
 size overrides (e.g., cobint needs 1536 bytes, triangle needs 768).
@@ -49,6 +52,9 @@ Z80 cycle count (host-independent), the .COM size, and the ntvcm clock rate:
 .PARAMETER Help
     Show this help text and exit without building or running tests.
 
+.PARAMETER Extended
+    Also run the extended c-testsuite single-exec corpus after the main app suite.
+
 .PARAMETER Serial
   Build and verify apps sequentially in the shared build directory. By default
   the suite runs in parallel; use -Serial as a fallback (e.g. for debugging or
@@ -66,11 +72,18 @@ Z80 cycle count (host-independent), the .COM size, and the ntvcm clock rate:
 .PARAMETER ReportClockHz
     ntvcm clock speed used for measured app runs in -Report mode (default: 400000000).
 
+.PARAMETER KeepBuild
+    In parallel mode the suite builds into a per-invocation folder
+    (build/run-<pid>) so concurrent runs stay isolated, and removes it on exit to
+    keep build/ from accumulating run-* folders. Pass -KeepBuild to retain that
+    folder (e.g. to inspect failing build artifacts).
+
 .EXAMPLE
   pwsh ./scripts/runall.ps1
     pwsh ./scripts/runall.ps1 -Help
   pwsh ./scripts/runall.ps1 -NoStackCheck
   pwsh ./scripts/runall.ps1 -Mode nopeep
+    pwsh ./scripts/runall.ps1 -Extended
   pwsh ./scripts/runall.ps1 -Serial
   pwsh ./scripts/runall.ps1 -ThrottleLimit 8
     pwsh ./scripts/runall.ps1 -Report
@@ -95,12 +108,14 @@ param(
     [ValidateSet("fast", "nopeep", "full")]
     [string]$Mode = "fast",
     [switch]$Help,
+    [switch]$Extended,
     [int]$RunTimeout = 60,
     [switch]$Serial,
     [int]$ThrottleLimit = [Environment]::ProcessorCount,
     [switch]$Report,
     [string]$ReportFile = "perf_results.csv",
     [long]$ReportClockHz = 400000000,
+    [switch]$KeepBuild,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs
 )
@@ -123,6 +138,9 @@ if ($Help) {
     Get-Help -Detailed $PSCommandPath
     return
 }
+
+$script:RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).ProviderPath
+Set-Location $script:RepoRoot
 
 # Parallel is the default; -Serial or -Report forces the sequential fallback.
 $Parallel = -not ($Serial -or $Report)
@@ -154,22 +172,41 @@ function Restore-TerminalState {
     }
 }
 
-trap {
-    Restore-TerminalState
-    throw
+# Per-run isolation directory (parallel mode only). Recorded here so it can be
+# removed on exit, keeping the build/ tree from accumulating one run-* folder
+# per invocation. Pass -KeepBuild to retain it for debugging.
+$script:RunBuildRoot = $null
+
+function Remove-RunBuildDir {
+    if ($KeepBuild) { return }
+    if ($script:RunBuildRoot -and (Test-Path $script:RunBuildRoot -PathType Container)) {
+        try {
+            Remove-Item -LiteralPath $script:RunBuildRoot -Recurse -Force -ErrorAction Stop
+        }
+        catch { }
+    }
 }
 
-# Dot-source the build driver once so Invoke-MaBuild runs in-process. This
-# avoids spawning a fresh pwsh per build, which is the dominant cost over a
-# full suite (hundreds of builds). ma.ps1 has its own param block, so preserve
-# this script's parameter values before dot-sourcing it.
-$requestedMode = $Mode
-$requestedBuildDir = $BuildDir
-$requestedEmulator = $Emulator
-. (Join-Path $PSScriptRoot "ma.ps1")
-$Mode = $requestedMode
-$BuildDir = $requestedBuildDir
-$Emulator = $requestedEmulator
+trap {
+    Restore-TerminalState
+    Remove-RunBuildDir
+    # Re-throw the original error record so its message/position survive rather
+    # than surfacing a generic "ScriptHalted" from a bare throw.
+    throw $_
+}
+
+function New-RunBuildId {
+    return "run-$PID"
+}
+
+if ($Parallel) {
+    # Isolate this invocation by process id so concurrent runs never clobber
+    # each other's per-app build dirs. The folder is removed on exit (see
+    # Remove-RunBuildDir) unless -KeepBuild is set, so build/ does not fill up
+    # with run-* folders.
+    $BuildDir = Join-Path $BuildDir (New-RunBuildId)
+    $script:RunBuildRoot = $BuildDir
+}
 
 # Get machine name for reporting (platform-specific)
 $machineName = $null
@@ -214,6 +251,9 @@ if (-not (Test-Path $appOverridesPath)) {
         if ($app.args) { $appOverrides[$app.name]['args'] = $app.args }
         if ($app.stdin) { $appOverrides[$app.name]['stdin'] = $app.stdin }
         if ($app.stack_size) { $appOverrides[$app.name]['stack_size'] = $app.stack_size }
+        if ($app.dcc_args) { $appOverrides[$app.name]['dcc_args'] = $app.dcc_args }
+        if ($null -ne $app.dcc_floatio) { $appOverrides[$app.name]['dcc_floatio'] = $app.dcc_floatio }
+        if ($null -ne $app.dcc_longio) { $appOverrides[$app.name]['dcc_longio'] = $app.dcc_longio }
         if ($app.ignore) { $appOverrides[$app.name]['ignore'] = $app.ignore }
     }
 }
@@ -267,6 +307,40 @@ function Get-AppStdin {
     return ""
 }
 
+function Get-DccArgs {
+    param([string]$app)
+    if ($appOverrides.ContainsKey($app) -and $appOverrides[$app]['dcc_args']) {
+        return $appOverrides[$app]['dcc_args']
+    }
+    return ""
+}
+
+function Get-DccFloatio {
+    param([string]$app)
+    if ($appOverrides.ContainsKey($app) -and $appOverrides[$app].ContainsKey('dcc_floatio')) {
+        return $appOverrides[$app]['dcc_floatio']
+    }
+    return $true
+}
+
+function Get-DccLongio {
+    param([string]$app)
+    if ($appOverrides.ContainsKey($app) -and $appOverrides[$app].ContainsKey('dcc_longio')) {
+        return $appOverrides[$app]['dcc_longio']
+    }
+    return $true
+}
+
+function ConvertTo-BooleanSetting {
+    param([object]$Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [bool]) { return $Value }
+    $text = $Value.ToString().Trim().ToLowerInvariant()
+    if ($text -in @("1", "true", "yes", "on")) { return $true }
+    if ($text -in @("0", "false", "no", "off")) { return $false }
+    throw "Invalid boolean setting: $Value"
+}
+
 function Get-IgnoreApp {
     param([string]$app)
     return ($appOverrides.ContainsKey($app) -and $appOverrides[$app]['ignore'])
@@ -276,6 +350,119 @@ function Test-IsNtvcmEmulator {
     param([string]$Command)
     $leaf = [System.IO.Path]::GetFileNameWithoutExtension($Command)
     return ($leaf -ieq "ntvcm")
+}
+
+function Get-DccMakeCommand {
+    $override = $env:DCCMAKE -replace '^\s+|\s+$', ''
+    if ($override) { return $override }
+    $local = Join-Path (Get-Location).Path ($(if ($IsWindows) { "dccmake.exe" } else { "dccmake" }))
+    if (Test-Path -LiteralPath $local -PathType Leaf) { return $local }
+    return "dccmake"
+}
+
+function Invoke-DccMakeBuild {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+        [string]$Mode = "fast",
+        [string]$BuildDir = "build",
+        [string]$Emulator = "ntvcm",
+        [string]$SourcePath = "",
+        [int]$StackSize = 0,
+        [string]$DccArgs = "",
+        [object]$DccFloatio = $null,
+        [object]$DccLongio = $null,
+        [switch]$Quiet
+    )
+
+    $modeLower = $Mode.ToLowerInvariant()
+    if ($modeLower -eq "full") {
+        $fastOk = Invoke-DccMakeBuild -Name $Name -Mode fast -BuildDir $BuildDir -Emulator $Emulator -SourcePath $SourcePath -StackSize $StackSize -DccArgs $DccArgs -DccFloatio $DccFloatio -DccLongio $DccLongio -Quiet:$Quiet
+        $nopeepOk = Invoke-DccMakeBuild -Name $Name -Mode nopeep -BuildDir $BuildDir -Emulator $Emulator -SourcePath $SourcePath -StackSize $StackSize -DccArgs $DccArgs -DccFloatio $DccFloatio -DccLongio $DccLongio -Quiet:$Quiet
+        return ($fastOk -and $nopeepOk)
+    }
+    $usePeep = @("fast", "peep", "opt", "optimized", "o", "1", "yes", "true") -contains $modeLower
+
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($Name)
+    $lowerBase = $base.ToLowerInvariant()
+    $upperBase = $base.ToUpperInvariant()
+
+    $sourceFile = ""
+    if ($SourcePath) {
+        if (Test-Path -LiteralPath $SourcePath -PathType Leaf) {
+            $sourceFile = (Resolve-Path -LiteralPath $SourcePath).ProviderPath
+        }
+    }
+    else {
+        foreach ($candidate in @(
+            (Join-Path "tests" "$base.c"),
+            (Join-Path "tests" "$base.C"),
+            (Join-Path "tests" "$lowerBase.c"),
+            (Join-Path "tests" "$upperBase.C"),
+            "$base.c",
+            "$base.C",
+            "$lowerBase.c",
+            "$upperBase.C"
+        )) {
+            if (Test-Path $candidate -PathType Leaf) {
+                $sourceFile = $candidate
+                break
+            }
+        }
+    }
+
+    if (-not $sourceFile) {
+        Write-Error "Source file not found for: $Name" -ErrorAction Continue
+        return $false
+    }
+
+    if (-not (Test-Path $BuildDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $BuildDir -Force | Out-Null
+    }
+
+    $dccmake = Get-DccMakeCommand
+    $args = @(
+        "dcc-input=$sourceFile",
+        "dcc-output=$base",
+        "dcc-build-dir=$BuildDir",
+        "dcc-peep=$([string]$usePeep)",
+        "ntvcm-tool=$Emulator"
+    )
+    if ($null -ne $DccFloatio) {
+        $args += "dcc-floatio=$([string](ConvertTo-BooleanSetting $DccFloatio))"
+    }
+    if ($null -ne $DccLongio) {
+        $args += "dcc-flongio=$([string](ConvertTo-BooleanSetting $DccLongio))"
+    }
+    if ($StackSize -gt 0) {
+        $args += @("-s", "$StackSize")
+    }
+    if ($DccArgs) {
+        $args += @($DccArgs -split '\s+' | Where-Object { $_ })
+    }
+
+    $buildOut = & $dccmake @args 2>&1
+    $exitCode = $LASTEXITCODE
+    if (-not $Quiet) { $buildOut | Write-Host }
+    if ($exitCode -ne 0) {
+        Write-Error "dccmake failed for $Name ($Mode) with exit code $exitCode" -ErrorAction Continue
+        return $false
+    }
+
+    $buildWarnings = @($buildOut | Where-Object { $_ -match '%Mult\. Def\.|%Phase error|%Undefined' })
+    if ($buildWarnings) {
+        $buildWarnings | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+        Write-Error "Build warnings treated as errors for $Name" -ErrorAction Continue
+        return $false
+    }
+
+    $appCom = Join-Path $BuildDir "$upperBase.COM"
+    if (Test-Path -LiteralPath $appCom -PathType Leaf) {
+        return $true
+    }
+
+    Write-Error "Build failed: .COM file not produced for $Name" -ErrorAction Continue
+    return $false
 }
 
 # CP/M data fixtures are every file in tests/ that is not a C source or repo
@@ -297,6 +484,9 @@ function Get-FixtureFiles {
 # interpreters read these files from the current working directory, and apps are
 # run from the build dir (below), so the fixtures must live there too.
 function Stage-FixtureInputs {
+    if (-not (Test-Path $BuildDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $BuildDir -Force | Out-Null
+    }
     foreach ($f in $fixtureList) {
         Copy-FixtureUpper -Fixture $f -DestDir $BuildDir
     }
@@ -338,9 +528,8 @@ function Copy-FixtureUpper {
 # Build, run, and verify a single app across the requested modes. Returns a
 # result object with a collected log (Lines) so callers can print output in a
 # deterministic, grouped order (important under parallel execution). This is
-# self-contained: it only depends on Invoke-MaBuild / ConvertTo-CRLF (from
-# ma.ps1) and Test-MatchesBaseline, all of which are made available in both
-# serial and parallel contexts.
+# self-contained: it depends on Invoke-DccMakeBuild and Test-MatchesBaseline,
+# both of which are made available in both serial and parallel contexts.
 function Invoke-AppTest {
     param(
         [string]$AppName,
@@ -352,6 +541,9 @@ function Invoke-AppTest {
         [string]$RunArgs,
         [string]$RunStdin,
         [string]$StackSize,
+        [string]$DccArgs,
+        [object]$DccFloatio,
+        [object]$DccLongio,
         [string[]]$EmulatorRunArgs,
         [object[]]$Fixtures,
         [bool]$StageFixtures = $true
@@ -383,15 +575,12 @@ function Invoke-AppTest {
 
     foreach ($buildMode in $Modes) {
         $displayMode = if ($buildMode -eq "peep") { "fast" } else { $buildMode }
-        if ($StackSize) { $env:DCC_STACK_SIZE = $StackSize }
+        $stackSizeInt = if ($StackSize) { [int]$StackSize } else { 0 }
         $ok = $false
         try {
-            $ok = Invoke-MaBuild -Name $AppName -Mode $buildMode -BuildDir $BuildDir -Emulator $Emulator -Quiet
+            $ok = Invoke-DccMakeBuild -Name $AppName -Mode $buildMode -BuildDir $BuildDir -Emulator $Emulator -StackSize $stackSizeInt -DccArgs $DccArgs -DccFloatio $DccFloatio -DccLongio $DccLongio -Quiet
         }
         catch { $ok = $false }
-        finally {
-            if ($StackSize) { Remove-Item env:DCC_STACK_SIZE -ErrorAction SilentlyContinue }
-        }
 
         if (-not $ok) {
             $lines.Add("  Building $AppName ($displayMode)... FAILED")
@@ -466,7 +655,23 @@ function Invoke-AppTest {
             $actual = ($output -replace "`r`n", "`n").TrimEnd("`n")
             if (-not (Test-MatchesBaseline -Actual $actual -Baseline $expected -Placeholders $Placeholders)) {
                 $lines.Add("    OUTPUT MISMATCH (vs $BaselineDir/$AppName.txt)")
-                $lines.Add("    Got: " + (($actual -split "`n" | Select-Object -First 3) -join ' | '))
+                $expLines = if ($expected) { @($expected -split "`n") } else { @() }
+                $actLines = if ($actual)   { @($actual   -split "`n") } else { @() }
+                $maxLen = [Math]::Max($expLines.Count, $actLines.Count)
+                for ($i = 0; $i -lt $maxLen; $i++) {
+                    $e = if ($i -lt $expLines.Count) { $expLines[$i] } else { $null }
+                    $a = if ($i -lt $actLines.Count) { $actLines[$i] } else { $null }
+                    if ($null -eq $a) {
+                        $lines.Add("    DIFF- $e")
+                    } elseif ($null -eq $e) {
+                        $lines.Add("    DIFF+ $a")
+                    } elseif ($e -ceq $a) {
+                        $lines.Add("    DIFF  $e")
+                    } else {
+                        $lines.Add("    DIFF- $e")
+                        $lines.Add("    DIFF+ $a")
+                    }
+                }
                 $appPassed = $false
             }
             else {
@@ -517,13 +722,17 @@ function Get-Baseline {
 # content in the single baseline file (no per-app rules elsewhere) while still
 # tolerating values that legitimately change between builds/platforms.
 #
-#   {{DATE}} - C __DATE__ value, e.g. "Jun 16 2026"
-#   {{TIME}} - C __TIME__ value, e.g. "20:01:50"
-#   {{SEP}}  - path separator, "/" (Unix) or "\" (Windows)
+#   {{DATE}}  - C __DATE__ value, e.g. "Jun 16 2026"
+#   {{TIME}}  - C __TIME__ value, e.g. "20:01:50"
+#   {{SEP}}   - path separator, "/" (Unix) or "\" (Windows)
+#   {{UINT}}  - unsigned decimal integer
+#   {{HEX4}}  - four uppercase hex digits, e.g. "0040"
 $Placeholders = [ordered]@{
     '{{DATE}}' = '[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}'
     '{{TIME}}' = '\d{2}:\d{2}:\d{2}'
     '{{SEP}}'  = '[/\\]'
+    '{{UINT}}' = '\d+'
+    '{{HEX4}}' = '[0-9A-F]{4}'
 }
 
 # Compare actual output against a baseline that may contain placeholder tokens.
@@ -537,13 +746,13 @@ function Test-MatchesBaseline {
         [System.Collections.IDictionary]$Placeholders
     )
     if (-not $Placeholders) { $Placeholders = $script:Placeholders }
-    if ($Baseline -notmatch '\{\{[A-Z]+\}\}') {
+    if ($Baseline -notmatch '\{\{[A-Z][A-Z0-9]*\}\}') {
         return ($Actual -ceq $Baseline)
     }
     # Build a regex from the baseline: escape literal text segments, and insert
     # each placeholder's pattern in place of its token. Escaping only the
     # literal parts avoids double-escaping the tokens themselves.
-    $tokenRegex = [regex]'\{\{([A-Z]+)\}\}'
+    $tokenRegex = [regex]'\{\{([A-Z][A-Z0-9]*)\}\}'
     $sb = [System.Text.StringBuilder]::new()
     $last = 0
     foreach ($m in $tokenRegex.Matches($Baseline)) {
@@ -610,6 +819,9 @@ foreach ($app in $testFiles) {
         RunArgs      = (Get-AppArgs $app)
         RunStdin     = (Get-AppStdin $app)
         StackSize    = (Get-StackSize $app)
+        DccArgs      = (Get-DccArgs $app)
+        DccFloatio   = (Get-DccFloatio $app)
+        DccLongio    = (Get-DccLongio $app)
     })
 }
 
@@ -619,6 +831,7 @@ Write-Host "STARTING BUILD AND RUN SUITE" -ForegroundColor Cyan
 Write-Host "Mode: $optimisationSummary" -ForegroundColor Cyan
 if ($Parallel) {
     Write-Host "(parallel, throttle = $ThrottleLimit)" -ForegroundColor Cyan
+    Write-Host "Build root: $BuildDir" -ForegroundColor Cyan
 }
 Write-Host "========================================" -ForegroundColor Cyan
 
@@ -633,6 +846,9 @@ function Show-AppResult {
     foreach ($line in $result.Lines) {
         $color = if ($line -match 'FAILED|MISMATCH|WARNING|ERROR') { 'Red' }
                  elseif ($line -match 'matches baseline') { 'Green' }
+                 elseif ($line -match '^    DIFF-') { 'Red' }
+                 elseif ($line -match '^    DIFF\+') { 'Green' }
+                 elseif ($line -match '^    DIFF  ') { 'DarkGray' }
                  else { 'Gray' }
         Write-Host $line -ForegroundColor $color
     }
@@ -712,6 +928,41 @@ function Write-PerformanceReport {
     }
 }
 
+function Invoke-ExtendedSuite {
+    param(
+        [string]$Mode,
+        [string]$Emulator,
+        [int]$RunTimeout,
+        [string]$BuildDir,
+        [bool]$StackCheck,
+        [bool]$Serial,
+        [int]$ThrottleLimit
+    )
+
+    $extendedScript = Join-Path $PSScriptRoot "runall-extended.ps1"
+    $extendedBuildDir = Join-Path $BuildDir "extended-tests"
+    $extendedArgs = @(
+        "-NoProfile",
+        "-File", $extendedScript,
+        "-Mode", $Mode,
+        "-Emulator", $Emulator,
+        "-RunTimeout", $RunTimeout,
+        "-BuildDir", $extendedBuildDir,
+        "-All",
+        "-ThrottleLimit", $ThrottleLimit
+    )
+    if (-not $StackCheck) { $extendedArgs += "-NoStackCheck" }
+    if ($Serial) { $extendedArgs += "-Serial" }
+
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "STARTING EXTENDED C-TESTSUITE" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+
+    & pwsh @extendedArgs
+    $script:ExtendedSuiteExitCode = $LASTEXITCODE
+}
+
 $results = @()
 $totalToRun = $workItems.Count
 
@@ -720,10 +971,12 @@ if ($Parallel) {
     # per-app build dirs (build/<app>) prevent the shared-file clobbering that
     # would otherwise occur (DCCRTL.MAC, RTLMIN.MAC, tool COMs, .COM outputs).
     $repoRoot     = (Get-Location).Path
-    $maPath       = (Join-Path $PSScriptRoot "ma.ps1")
     $tmbDef       = ${function:Test-MatchesBaseline}.ToString()
     $iatDef       = ${function:Invoke-AppTest}.ToString()
     $cfuDef       = ${function:Copy-FixtureUpper}.ToString()
+    $ctbsDef      = ${function:ConvertTo-BooleanSetting}.ToString()
+    $gdmDef       = ${function:Get-DccMakeCommand}.ToString()
+    $idmbDef      = ${function:Invoke-DccMakeBuild}.ToString()
     $stackCheckOn = [bool]$StackCheck
     $runArgs      = @($emulatorRunArgs)
 
@@ -736,9 +989,11 @@ if ($Parallel) {
         Set-Location $using:repoRoot
         if ($using:stackCheckOn) { $env:DCC_FORCE_STACK_CHECK = "1" }
         # Bring the needed functions into this runspace.
-        . $using:maPath                                   # Invoke-MaBuild, ConvertTo-CRLF
         ${function:Test-MatchesBaseline} = $using:tmbDef
         ${function:Copy-FixtureUpper}    = $using:cfuDef
+        ${function:ConvertTo-BooleanSetting} = $using:ctbsDef
+        ${function:Get-DccMakeCommand}   = $using:gdmDef
+        ${function:Invoke-DccMakeBuild}  = $using:idmbDef
         ${function:Invoke-AppTest}       = $using:iatDef
 
         $appBuildDir = Join-Path $using:BuildDir $item.App
@@ -746,7 +1001,9 @@ if ($Parallel) {
             -BaselineDir $using:BaselineDir -Emulator $using:Emulator `
             -Placeholders $using:Placeholders -RunArgs $item.RunArgs `
             -RunStdin $item.RunStdin `
-            -StackSize $item.StackSize -EmulatorRunArgs $using:runArgs `
+            -StackSize $item.StackSize -DccArgs $item.DccArgs `
+            -DccFloatio $item.DccFloatio -DccLongio $item.DccLongio `
+            -EmulatorRunArgs $using:runArgs `
             -Fixtures $using:fixtureList -StageFixtures $true
     } | ForEach-Object {
         $result = $_
@@ -767,6 +1024,10 @@ if ($Parallel) {
             foreach ($detail in $result.Lines) {
                 if ($detail -match 'FAILED|MISMATCH|WARNING|ERROR') {
                     Write-Host "        $($detail.Trim())" -ForegroundColor Red
+                } elseif ($detail -match '^    DIFF-') {
+                    Write-Host "        $($detail.Trim())" -ForegroundColor Red
+                } elseif ($detail -match '^    DIFF\+') {
+                    Write-Host "        $($detail.Trim())" -ForegroundColor Green
                 }
             }
         }
@@ -779,7 +1040,9 @@ else {
         $result = Invoke-AppTest -AppName $item.App -Modes $modes -BuildDir $BuildDir `
             -BaselineDir $BaselineDir -Emulator $Emulator -Placeholders $Placeholders `
             -RunArgs $item.RunArgs -RunStdin $item.RunStdin `
-            -StackSize $item.StackSize -EmulatorRunArgs $emulatorRunArgs `
+            -StackSize $item.StackSize -DccArgs $item.DccArgs `
+            -DccFloatio $item.DccFloatio -DccLongio $item.DccLongio `
+            -EmulatorRunArgs $emulatorRunArgs `
             -Fixtures $fixtureList -StageFixtures $false
         Show-AppResult $result
         $results += $result
@@ -793,6 +1056,17 @@ foreach ($result in $results) {
     } else {
         $failed++
         $failedApps += $result.App
+    }
+}
+
+$extendedPassed = $null
+if ($Extended) {
+    Invoke-ExtendedSuite -Mode $Mode -Emulator $Emulator -RunTimeout $RunTimeout `
+        -BuildDir $BuildDir -StackCheck $StackCheck -Serial (-not $Parallel) -ThrottleLimit $ThrottleLimit
+    $extendedExitCode = $script:ExtendedSuiteExitCode
+    $extendedPassed = ($extendedExitCode -eq 0)
+    if (-not $extendedPassed) {
+        $failed++
     }
 }
 
@@ -811,15 +1085,22 @@ Write-Host "  Total apps:   $($testFiles.Count)"
 Write-Host "  Passed:       $passed" -ForegroundColor Green
 Write-Host "  Failed:       $failed" -ForegroundColor $(if ($failed -eq 0) { "Green" } else { "Red" })
 Write-Host "  Skipped:      $skipped"
+if ($Extended) {
+    Write-Host "  Extended:     $(if ($extendedPassed) { 'passed' } else { 'failed' })" -ForegroundColor $(if ($extendedPassed) { "Green" } else { "Red" })
+}
 Write-Host "  Total time:   $suiteElapsedStr"
 Write-Host "  Optimisation: $optimisationSummary"
 
-if ($failed -gt 0) {
+if ($failedApps.Count -gt 0) {
     Write-Host ""
     Write-Host "Failed apps:" -ForegroundColor Red
     foreach ($app in $failedApps) {
         Write-Host "  - $app" -ForegroundColor Red
     }
+}
+if ($Extended -and -not $extendedPassed) {
+    Write-Host ""
+    Write-Host "Extended c-testsuite failed" -ForegroundColor Red
 }
 
 if ($Report) {
@@ -832,9 +1113,14 @@ if ($null -ne $_savedStty) { stty $_savedStty 2>$null }
 if ($failed -eq 0) {
     Write-Host ">>> SUCCESS: All tests passed <<<" -ForegroundColor Green
     Restore-TerminalState
+    Remove-RunBuildDir
     exit 0
 } else {
     Write-Host ">>> FAILURE: $failed test(s) failed <<<" -ForegroundColor Red
+    if ($script:RunBuildRoot -and -not $KeepBuild) {
+        Write-Host "  (build artifacts removed; re-run with -KeepBuild to retain them for debugging)" -ForegroundColor DarkGray
+    }
     Restore-TerminalState
+    Remove-RunBuildDir
     exit 1
 }
