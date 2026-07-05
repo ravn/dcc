@@ -266,15 +266,9 @@ static int inline_word(int wi)
     return 1;
 }
 
-#if 1
-#define push(v) do { st[sp] = (v); sp++; } while(0)
-#define pop()   (sp--, st[sp])
-#define peek()  (st[sp - 1])
-#else
-static void push(int v) { if (sp >= MAXSTACK) die("stack full"); st[sp++] = v; }
-static int pop(void) { if (sp <= 0) die("stack empty"); return st[--sp]; }
-static int peek(void) { if (sp <= 0) die("stack empty"); return st[sp - 1]; }
-#endif
+static inline void push(int v) { st[sp++] = v; }
+static inline int pop(void) { return st[--sp]; }
+static inline int peek(void) { return st[sp - 1]; }
 
 static void grow_mem(int need)
 {
@@ -304,15 +298,13 @@ static void grow_mem(int need)
     mcap = ncap;
 }
 
-static int cell_at(int a)
+static inline int cell_at(int a)
 {
-    int v;
     if (a < 0 || a + 1 >= mcap) die("bad address");
-    v = mem[a] | (mem[a + 1] << 8);
-    return (short)v;
+    return (short)(mem[a] | (mem[a + 1] << 8));
 }
 
-static void set_cell(int a, int v)
+static inline void set_cell(int a, int v)
 {
     if (a < 0 || a + 1 >= mcap) die("bad address");
     mem[a] = (unsigned char)(v & 255);

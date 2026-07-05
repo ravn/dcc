@@ -1,6 +1,6 @@
 # Types and conventions
 
-dcc uses a compact 16-bit model. Knowing the exact widths up front avoids most
+The DCC C Compiler uses a compact 16-bit model. Knowing the exact widths up front avoids most
 overflow and precision surprises.
 
 ## Type sizes
@@ -26,8 +26,8 @@ The practical consequences:
 - Use `unsigned` / `unsigned long` when you need wraparound arithmetic or a
   logical right shift; signed right shift sign-extends.
 - `float` carries about 7 decimal digits (a 24-bit significand). Integers up to
-  2<sup>24</sup> (16,777,216) are exact; beyond that, converting a large `long`
-  to `float` rounds to the nearest single. See [Floating point math](standard-lib/08-math.md)
+  `2^24` (16,777,216) are exact; beyond that, converting a large `long`
+  to `float` rounds to the nearest single. See [Floating-point math](standard-lib/08-math.md)
   for the full set of precision gotchas.
 
 ## Useful constants
@@ -79,7 +79,7 @@ reference.
 
 ## Floating limits (`float.h`)
 
-[`float.h`](standard-lib/03-float.md) describes dcc's single-precision reality:
+[`float.h`](standard-lib/03-float.md) describes DCC C Compiler's single-precision reality:
 
 | Macro | Value |
 | --- | ---: |
@@ -92,7 +92,7 @@ reference.
 | `FLT_MIN_EXP` / `FLT_MAX_EXP` | -125 / 128 |
 | `FLT_MIN_10_EXP` / `FLT_MAX_10_EXP` | -37 / 38 |
 
-dcc has no `double` or `long double`. The `DBL_*` and `LDBL_*` macros are
+The DCC C Compiler has no `double` or `long double`. The `DBL_*` and `LDBL_*` macros are
 defined as aliases of the `FLT_*` values so source that references those names
 still compiles, but they intentionally reflect the single-precision target:
 
@@ -104,7 +104,7 @@ still compiles, but they intentionally reflect the single-precision target:
 ## Zero-initialized data
 
 In a normal final application build, uninitialized globals and uninitialized
-function-scope `static` objects are backed by dcc's synthetic BSS range. The
+function-scope `static` objects are backed by the DCC C Compiler's synthetic BSS range. The
 compiler emits the range as `__bssb .. __bsse`, and the runtime `start`
 entrypoint zeroes that range before calling `main`. So an uninitialized global
 array is guaranteed to be all zeros, as C89 requires:

@@ -1,6 +1,6 @@
 # Operators
 
-dcc supports the full C89 operator set. The only things to watch are the
+The DCC C Compiler supports the full C89 operator set. The only things to watch are the
 behaviours that follow from the 16-bit `int` / 32-bit `long` model.
 
 ## The full set
@@ -47,5 +47,5 @@ int   k = (int)(cond ? 2 : 3.5f);  /* the ?: is float; cast back to int */
 
 Mind the single-precision limit whenever a wide `long` meets a `float`: the
 integer side rounds to the nearest `float` first, so compare as integers when
-you need full 32-bit precision. See [Floating point math](standard-lib/08-math.md) for the
+you need full 32-bit precision. See [Floating-point math](standard-lib/08-math.md) for the
 details.

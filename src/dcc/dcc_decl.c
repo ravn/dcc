@@ -843,6 +843,7 @@ void gen_local_decl_after_type(int base)
     char name[64];
     char source_name[64];
     struct Sym *s;
+    int freshly_allocated;
 
     for (;;) {
         type = base;
@@ -947,16 +948,34 @@ void gen_local_decl_after_type(int base)
             total_elems = g_typedef_array_len;
         }
 
+        /* Must reach the identical conclusion scan_local_decl_after_type
+         * already reached for this same declarator during the earlier
+         * frame-sizing pass - both independently re-run the same
+         * speculative parse over the same source text, so they agree. */
+        if (try_narrow_local_int_array(name, type, arrlen, total_elems)) {
+            type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
+            /* See the identical comment in scan_local_decl_after_type
+             * (dcc_func.c): first_stride_bytes was computed from the
+             * pre-narrowing int element size, so it must be invalidated
+             * here too or Sym.elem_size below keeps the stale, too-wide
+             * stride even though Sym.type is now correctly narrowed. */
+            current_field_array_elem_size = 0;
+        } else if (try_narrow_register_scalar(name, type, decl_is_register, arrlen, total_elems)) {
+            type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
+        }
+
         s = find_local_decl(name);
         if (!s)
             s = try_const_fold_local(name, source_name, type,
                                      total_elems > 0 || g_last_array_dim_count > 0);
+        freshly_allocated = 0;
         if (!s) {
             bytes = type_size(type);
             if (total_elems > 0)
                 bytes = object_array_size(type, total_elems);
 
             s = add_local_alloc(name, type, bytes);
+            freshly_allocated = 1;
             if (arrlen > 0 || g_last_array_dim_count > 0) {
                 s->is_array = 1;
                 s->array_len = arrlen;
@@ -1064,6 +1083,20 @@ void gen_local_decl_after_type(int base)
                     emit_store_de_to_addr_hl(type);
                 }
             }
+        } else if (freshly_allocated && !local_name_used_ahead(source_name)) {
+            /* No initializer, and never referenced again in this scope:
+             * add_local_alloc just appended this Sym as the last local and
+             * reserved its frame space, so popping both back off is safe -
+             * nothing later in this same declarator loop has allocated
+             * anything above it yet. freshly_allocated (rather than just
+             * !s->is_const_value) guards against the redefinition-error
+             * recovery case, where s is an unrelated pre-existing symbol and
+             * bytes/nlocals do not describe it. Must match
+             * scan_local_decl_after_type's identical decision exactly, since
+             * that earlier frame-sizing pass already committed to the frame
+             * size this function's prologue was emitted with. */
+            nlocals--;
+            local_size -= bytes;
         }
 
         if (!accept(',')) break;

@@ -1,21 +1,16 @@
 # Introduction
 
-**dcc** is an open source C compiler for **CP/M 2.2 on the Z80**. It has a C89
-core plus target-appropriate C99/C11 front-end compatibility. For every source
-file it accepts, dcc translates the `.c` file to M80 assembly; M80 assembles the
+**DCC C Compiler** is an open source C compiler for **CP/M 2.2 on the Z80**. It supports C89 plus CP/M-relevant C99/C11 features. For every source
+file it accepts, the DCC C Compiler translates the `.c` file to M80 assembly; M80 assembles the
 result, and L80 links it into a CP/M `.COM` program.
 
-dcc runs on Windows, macOS, and Linux, but the programs it builds run under
+The DCC C Compiler runs on Windows, macOS, and Linux, but the programs it builds run under
 CP/M. The [ntvcm](https://github.com/davidly/ntvcm) emulator and other popular
-CP/M Z80 emulators run those programs.
+CP/M Z80 emulators run those programs, as do real Z80 CP/M 2.2 and 3.0 systems.
 
-The repository contains tests and build scripts, but dcc is not tied to the
-repository. Once the tools are on your `PATH`, you can build CP/M programs from
-any project directory.
+![DCC C Compiler banner](images/dcc-retro-banner.svg)
 
-![dcc compiler banner](images/dcc-retro-banner.svg)
-
-This manual describes the language accepted by dcc, the runtime library, and the
+This manual describes the language accepted by the DCC C Compiler, the runtime library, and the
 build path from C source to `.COM` file.
 
 - Start with [Setting up the toolchain](00-setup-toolchain.md).
@@ -35,7 +30,7 @@ build path from C source to `.COM` file.
 - Read [Limitations](11-limitations.md) before depending on hosted-C behavior.
 - Try the [worked examples](12-examples.md) when you want complete programs.
 - Use [Agentic skills](00-agent-skills.md) if you want an AI assistant to load the
-  dcc-specific rules while working in another project.
+  DCC C Compiler rules while working in another project.
 
 ## Runtime
 
@@ -59,7 +54,7 @@ the final `.COM` file. The build steps are shown in
 
 ## Performance Snapshot
 
-The chart compares `.COM` programs produced by dcc with CP/M-era and modern
+The chart compares `.COM` programs produced by the DCC C Compiler with CP/M-era and modern
 CP/M-targeting compilers. Times come from `ntvcm -p` cycle counts converted to
 the emulator's `approx ms at 4Mhz` value for Z80-mode runs. Sizes are CP/M file
 sizes rounded to 128-byte records. Lower is better for `ms` and `bytes`.
@@ -68,18 +63,23 @@ sizes rounded to 128-byte records. Lower is better for `ms` and `bytes`.
 
 The benchmark names are the test programs: strings and memory (`tstring`),
 sieve, digits of `e`, allocation (`tm`), tic-tac-toe (`ttt`), hexadecimal pi
-digits (`pihex`), and matrix multiply (`mm`). Rows labelled `xcomp` are dcc
+digits (`pihex`), and matrix multiply (`mm`). Rows labelled `xcomp` are DCC C Compiler
 output before `dccpeep`; rows labelled `dccpeep optimized` are after the
 optimizer pass.
 
 ## Engineering Notes
 
-The dcc C Compiler was engineered agentically, with plenty of human supervision,
+DCC C Compiler was engineered agentically, with plenty of human supervision,
 patience, and love. It is unit tested against baselines grounded in modern desktop
 C compilers and a platform-appropriate subset of the community-driven
 [c-testsuite](https://github.com/c-testsuite/c-testsuite).
 
 ## Contributions and Feedback Welcome
 
-This is an Open Source C compiler, community contributions welcome and/or report issues via the GitHub Issues for this project.
+This is an open source C compiler. Community contributions are welcome; please report issues through the project's GitHub Issues page.
 
+## Star the Repository
+
+If the DCC C Compiler is useful to you, please consider starring the
+[GitHub repository](https://github.com/davidly/dcc). It helps other CP/M and Z80
+developers find the project.

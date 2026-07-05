@@ -9,7 +9,7 @@ macros.
 
 ## Runtime model
 
-dcc has only one floating type: 32-bit IEEE-style `float`. There is no distinct
+The DCC C Compiler has only one floating type: 32-bit IEEE-style `float`. There is no distinct
 `double` or `long double` representation. The `DBL_*` and `LDBL_*` macros are
 therefore aliases of the `FLT_*` values so portable source can compile, but they
 intentionally describe the same single-precision target.
@@ -36,5 +36,5 @@ int nearly_same(float a, float b)
 }
 ```
 
-See [Floating point math](08-math.md) for math-library accuracy and mixed-type
+See [Floating-point math](08-math.md) for math-library accuracy and mixed-type
 gotchas.

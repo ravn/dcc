@@ -197,24 +197,24 @@ static int find_para(const char *name)
     return 0;
 }
 
-static int stmt_for_para_i(int p)
+static inline int stmt_for_para_i(int p)
 {
     return para[p].first;
 }
 
-static int tpeek(void)
+static inline int tpeek(void)
 {
     if (tp >= tend) return 0;
     return tc[tp];
 }
 
-static int tget(void)
+static inline int tget(void)
 {
     if (tp >= tend) return 0;
     return tc[tp++];
 }
 
-static int acc(int k)
+static inline int acc(int k)
 {
     if (tpeek() == k) { tp++; return 1; }
     return 0;
@@ -613,28 +613,23 @@ static void exec_stmt_tokens(void)
     int k;
     while (tp < tend && !stopped && !jumped) {
         k = tpeek();
-        if (k == KW_ELSE) return;
-        if (k == KW_MOVE) do_move();
-        else if (k == KW_COMPUTE) do_compute();
-        else if (k == KW_ADD) do_add();
-        else if (k == KW_SUBTRACT) do_subtract();
-        else if (k == KW_MULTIPLY) do_multiply();
-        else if (k == KW_DIVIDE) do_divide();
-        else if (k == KW_DISPLAY) do_display();
-        else if (k == KW_PERFORM) do_perform();
-        else if (k == KW_GO || k == KW_GOTO) do_goto();
-        else if (k == KW_IF) exec_if();
-        else if (k == KW_STOP) { stopped = 1; return; }
-        else if (k == KW_EXIT) { tp++; return; }
-        else tp++;
+        switch (k) {
+        case KW_ELSE: return;
+        case KW_MOVE: do_move(); break;
+        case KW_COMPUTE: do_compute(); break;
+        case KW_ADD: do_add(); break;
+        case KW_SUBTRACT: do_subtract(); break;
+        case KW_MULTIPLY: do_multiply(); break;
+        case KW_DIVIDE: do_divide(); break;
+        case KW_DISPLAY: do_display(); break;
+        case KW_PERFORM: do_perform(); break;
+        case KW_GO: case KW_GOTO: do_goto(); break;
+        case KW_IF: exec_if(); break;
+        case KW_STOP: stopped = 1; return;
+        case KW_EXIT: tp++; return;
+        default: tp++; break;
+        }
     }
-}
-
-static void exec_one(int si)
-{
-    tp = stmt[si].ts;
-    tend = stmt[si].te;
-    exec_stmt_tokens();
 }
 
 static void exec_range(int start, int end)
@@ -643,7 +638,11 @@ static void exec_range(int start, int end)
     pc = start;
     while (pc <= end && !stopped) {
         jumped = 0;
-        exec_one(pc);
+
+        tp = stmt[pc].ts;
+        tend = stmt[pc].te;
+        exec_stmt_tokens();
+
         if (jumped) pc = jtarget;
         else pc++;
         if (pc < start || pc > end) break;

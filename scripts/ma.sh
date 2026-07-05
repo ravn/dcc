@@ -13,9 +13,12 @@ examples:
   DCC_ARGS="-DDEBUG=1" NTVCM_ARGS="-p -s:4000000" dcc-ma hello fast
 
 build modes:
-    full       build optimized and unoptimized outputs (default)
-    fast       run dccpeep after dcc
+    fast       run dccpeep after dcc (default)
     nopeep     skip dccpeep
+    full       build fast then nopeep, in that order - since both write to
+               the same output path, nopeep's un-optimized build is what
+               is left behind; mainly useful to see both dccpeep and no-
+               dccpeep console output in one run, not to keep both files
 
 script options:
     --source-path FILE  explicit C source path
@@ -75,7 +78,7 @@ esac
 name_arg="$1"
 shift
 
-mode="full"
+mode="fast"
 build_dir="build"
 source_path=""
 emulator="ntvcm"
@@ -106,7 +109,7 @@ while [ $# -gt 0 ]; do
             mode="$2"
             shift 2
             ;;
-        full|fast|peep|nopeep|opt|optimized|o|noopt|unopt|u|1|0|yes|no|true|false)
+        full|fast|peep|nopeep|opt|optimized|o|-o|noopt|unopt|u|-u|1|0|yes|no|true|false)
             mode="$1"
             shift
             ;;
@@ -209,18 +212,21 @@ run_one() {
     local mode_lc use_peep
     mode_lc=$(printf '%s' "$build_mode" | tr '[:upper:]' '[:lower:]')
     case "$mode_lc" in
-        fast|peep|opt|optimized|o|1|yes|true) use_peep=1 ;;
-        nopeep|noopt|unopt|u|0|no|false) use_peep=0 ;;
+        fast|peep|opt|optimized|o|-o|1|yes|true) use_peep=1 ;;
+        nopeep|noopt|unopt|u|-u|0|no|false) use_peep=0 ;;
         *) echo "unknown optimization mode: $build_mode" >&2; return 1 ;;
     esac
 
-    local DCC DCCPEEP DCCRTLSTRIP NTVCM M80 L80
-    DCC=${DCC:-dcc}
-    DCCPEEP=${DCCPEEP:-dccpeep}
-    DCCRTLSTRIP=${DCCRTLSTRIP:-dccrtlstrip}
-    NTVCM=${NTVCM:-$emulator}
-    M80=${M80:-m80}
-    L80=${L80:-l80}
+    # Each `local NAME="${NAME:-default}"` must combine the declaration and
+    # the default-value assignment in one statement - a bare `local NAME`
+    # followed by a separate `NAME=${NAME:-default}` shadows any inherited
+    # exported override with an empty local first, silently discarding it.
+    local DCC="${DCC:-dcc}"
+    local DCCPEEP="${DCCPEEP:-dccpeep}"
+    local DCCRTLSTRIP="${DCCRTLSTRIP:-dccrtlstrip}"
+    local NTVCM="${NTVCM:-$emulator}"
+    local M80="${M80:-m80}"
+    local L80="${L80:-l80}"
 
     mkdir -p "$build_dir"
 
@@ -307,6 +313,18 @@ run_one() {
     local dcc_floatio dcc_longio dcc_stackchk dcc_stack_size
     dcc_floatio="${DCC_FLOATIO:-0}"
     dcc_longio="${DCC_LONGIO:-0}"
+
+    # Auto-detect float/long printf format usage from the source, so ordinary
+    # programs don't pull in the larger _pffio/_pflng runtime helpers unless
+    # they actually use %f or %ld/%lu/%lx/%ls. An explicit DCC_FLOATIO=1/
+    # DCC_LONGIO=1 in the environment always wins; this only fills in the
+    # default when neither was already forced on.
+    if [ "$dcc_floatio" != "1" ] && grep -Eiq '%[-+ #0-9.*]*[fF]' "$source_file"; then
+        dcc_floatio=1
+    fi
+    if [ "$dcc_longio" != "1" ] && grep -Eiq '%[-+ #0-9.*]*l[duxXs]' "$source_file"; then
+        dcc_longio=1
+    fi
 
     dcc_stackchk=""
     if [ "${DCC_FORCE_STACK_CHECK:-0}" = "1" ] || grep -q 'DCC_STACK_CHECK' "$source_file"; then

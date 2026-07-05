@@ -1,8 +1,8 @@
 # Utilities
 
-Developer scripts for building and testing dcc programs.
+Developer scripts for building and testing DCC C Compiler programs.
 
-Run these scripts from the dcc checkout or from an installed package. Linux and
+Run these scripts from the DCC C Compiler checkout or from an installed package. Linux and
 macOS packages include a native shell build driver, so normal package users do
 not need PowerShell to build a single app.
 
@@ -69,7 +69,7 @@ dcc-ma cobint --mode fast --build-dir mybuild
 - `DCC_LONGIO` — Set to `1` to pass `-flongio` and keep long integer `printf` runtime support
 - `DCC_ARGS` — Extra whitespace-separated `dcc` options such as `-DNAME=1 -UOLD`
 - `NTVCM_ARGS` — Extra whitespace-separated `ntvcm` options such as `-p -s:4000000`
-- `DCC_HOME` — dcc package/install root; used to find `include/`, `lib/`, and CP/M tools
+- `DCC_HOME` — DCC C Compiler package/install root; used to find `include/`, `lib/`, and CP/M tools
 - `DCC_INCLUDE` — extra include directories, separated by the host path separator
 - `DCC_LIB` — extra runtime/tool asset roots, separated by the host path separator
 - `DCC_RUNTIME` — explicit path to `DCCRTL.MAC`
@@ -78,11 +78,167 @@ dcc-ma cobint --mode fast --build-dir mybuild
 Run `dcc-ma -Help` on Windows or `dcc-ma --help` on Linux/macOS for the full option map, including which
 `dcc` options are owned by the helper pipeline.
 
+## Toolchain Commands
+
+The DCC C Compiler toolchain is a small set of host tools, CP/M tools, and
+runtime assets. The build drivers resolve these commands from explicit settings
+or environment variables first, then from the local checkout or `PATH`.
+
+| Tool | Role | Notes |
+| ---- | ---- | ----- |
+| `dcc` | C compiler | Host command that translates C source to M80-compatible `.MAC` assembly |
+| `dccmake` | Build pipeline helper | Owns the normal compile, optimize, strip, assemble, and link pipeline; see [Build Pipeline Helper (`dccmake`)](#build-pipeline-helper-dccmake) |
+| `dccpeep` | Peephole optimizer | Host command that rewrites generated `.MAC` files when `dcc-peep=true` |
+| `dccrtlstrip` | Runtime stripper | Host command that scans app `.MAC` files and writes a reduced runtime; see [DCCRTL strip appendix](01-dccrtlstrip.md) |
+| `DCCRTL.MAC` | Runtime source | Full CP/M runtime consumed by `dccrtlstrip` |
+| `ntvcm` | CP/M emulator | Runs CP/M tools such as M80 and L80, and runs the final `.COM` programs |
+| `m80.com` | CP/M assembler | Assembles app and runtime `.MAC` files to `.REL` files under `ntvcm` |
+| `l80.com` | CP/M linker | Links `RTLMIN.REL` and app `.REL` files into a `.COM` executable under `ntvcm` |
+
+## Build Pipeline Helper (`dccmake`)
+
+`dccmake` is the lower-level build helper used by the test runner and by
+repeatable local builds. It compiles one or more C source files, optionally runs
+`dccpeep`, strips the runtime with `dccrtlstrip`, assembles with M80 under
+`ntvcm`, and links the final `.COM` with L80.
+
+Use `dccmake` directly when you want one command that owns the whole DCC C
+Compiler pipeline but still lets you choose the exact source files, output name,
+runtime, include directories, and tool paths.
+
+### dccmake CLI Usage
+
+```sh
+dccmake [key=value ...] [dcc-style-options]
+dccmake --dcc-input main.c,module.c --dcc-output APP
+dccmake main.c module.c dcc-output=APP dcc-peep=true
+```
+
+Command-line settings may be written as `key=value`, `--key=value`, or
+`--key value`. Positional `.c` arguments are treated as `dcc-input` files. Files
+after the first input are compiled with `-module` automatically.
+
+### dccmake CLI Examples
+
+```sh
+dccmake tests/sieve.c dcc-output=SIEVE
+dccmake tests/sieve.c dcc-output=SIEVE dcc-peep=false
+dccmake main.c module1.c module2.c dcc-output=APP dcc-include-directory=include
+dccmake tests/attnc99.c dcc-output=ATTNC99 dcc-stack-bytes=768 dcc-peep=true
+```
+
+`dccmake` also accepts common `dcc`-style options and maps them onto pipeline
+settings:
+
+```sh
+dccmake tests/tprintf.c dcc-output=TPRINTF -ffloatio
+dccmake tests/app.c dcc-output=APP -I include -DDEBUG=1 -UOLD
+dccmake tests/app.c dcc-output=APP -stack 1024 -fstack-check
+```
+
+### dccmake.txt Files
+
+When a `dccmake.txt` file exists in the current directory, `dccmake` reads it
+first and then applies command-line settings as overrides. The file uses one
+`key=value` setting per line. Blank lines are ignored, and text after `#` is a
+comment.
+
+Values may reference environment variables with `${NAME}`. The variable must be
+set, and malformed references are errors. This is useful for checking a project
+configuration into source control without hard-coding checkout-specific paths.
+
+```text
+# dccmake configuration for ATTNC99
+dcc-input=attnc99.c
+dcc-output=ATTNC99
+dcc-floatio=false
+dcc-flongio=false
+dcc-peep=true
+dcc-build-dir=build
+dcc-runtime=${DCC_DIR}/DCCRTL.MAC
+dcc-include-directory=${DCC_DIR}
+dcc-tool=${DCC_DIR}/dcc
+dccpeep-tool=${DCC_DIR}/dccpeep
+dccrtlstrip-tool=${DCC_DIR}/dccrtlstrip
+ntvcm-tool=${NTVCM_DIR}/ntvcm
+m80-command=${DCC_DIR}/m80.com
+l80-command=${DCC_DIR}/l80.com
+```
+
+With that file in place, set the tool roots and build the app:
+
+```sh
+export DCC_DIR=$HOME/GitHub/dcc
+export NTVCM_DIR=$HOME/GitHub/ntvcm
+
+dccmake
+```
+
+The generated CP/M executable lands in the configured build directory, for
+example `build/ATTNC99.COM`. If you want the `.COM` beside your source file and
+do not need to keep the intermediate `.MAC`, `.REL`, `.PRN`, and stripped
+runtime files, copy it back and remove the build directory:
+
+```sh
+mv -f build/*.COM .
+rm -rf build
+```
+
+Command-line values override the file, so this builds the same app without the
+peephole optimizer:
+
+```sh
+dccmake dcc-peep=false
+```
+
+### dccmake Settings
+
+| Setting | Default | Purpose |
+| ------- | ------- | ------- |
+| `dcc-input` | (required) | Comma-separated C sources; positional `.c` arguments are also accepted |
+| `dcc-output` | First input base name | CP/M 8-character output base name |
+| `dcc-floatio` | Environment/default | Pass `-ffloatio` to `dcc` and keep float `printf` runtime support |
+| `dcc-flongio` | Environment/default | Pass `-flongio` to `dcc` and keep long integer `printf` runtime support |
+| `dcc-stack-bytes` | `512` | Stack reserve passed to `dcc` with `-stack` |
+| `dcc-stack-check` | Environment/default | Pass `-fstack-check` to `dcc` |
+| `dcc-include-directory` | Auto-adds `.` when standard headers are in the current directory | Comma-separated include directories; `dcc-include` is an alias |
+| `dcc-define` | none | Comma-separated `NAME[=value]` entries passed to `dcc` as `-D`; `dcc-defines` is an alias |
+| `dcc-undefine` | none | Comma-separated names passed to `dcc` as `-U`; `dcc-undefines` is an alias |
+| `dcc-peep` | `true` | Run `dccpeep` after compiling each `.MAC` file |
+| `dcc-build-dir` | `build` | Artifact directory |
+| `dcc-runtime` | `DCC_RUNTIME`, local `DCCRTL.MAC`, or `DCCRTL.MAC` | Runtime source passed to `dccrtlstrip` |
+| `dcc-tool` | `DCC`, local `dcc`, or `dcc` | DCC compiler command |
+| `dccpeep-tool` | `DCCPEEP`, local `dccpeep`, or `dccpeep` | Peephole optimizer command |
+| `dccrtlstrip-tool` | `DCCRTLSTRIP`, local `dccrtlstrip`, or `dccrtlstrip` | Runtime stripper command |
+| `ntvcm-tool` | `NTVCM` or `ntvcm` | Emulator command used to run M80 and L80 |
+| `m80-command` | `M80` or `m80` | CP/M assembler command passed to `ntvcm` |
+| `l80-command` | `L80` or `l80` | CP/M linker command passed to `ntvcm` |
+
+Source input basenames and the output name must be CP/M 8.3-clean. For example,
+`module1.c` is valid, but a generated module output base longer than eight
+characters is not.
+
+### dccmake dcc-style Options
+
+| Option | Equivalent setting |
+| ------ | ------------------ |
+| `-f`, `-ffloatio` | `dcc-floatio=true` |
+| `-fl`, `-flongio` | `dcc-flongio=true` |
+| `-s <bytes>`, `-stack <bytes>`, `-stack=<bytes>` | `dcc-stack-bytes=<bytes>` |
+| `-fstack-check` | `dcc-stack-check=true` |
+| `-I <dir>`, `-Idir` | Add an include directory |
+| `-D <name>[=value]`, `-Dname=value` | Pass a define to `dcc` |
+| `-U <name>`, `-Uname` | Pass an undefine to `dcc` |
+| `-v`, `--version` | Print `dccmake` version |
+
+`-c` and `-module` are rejected because `dccmake` decides module mode from the
+input order.
+
 ## Test Suite Runner (`runall.ps1`)
 
 Builds and runs the test suite against per-app baselines in `tests/baselines/`.
 It uses `dccmake` for builds and `tests/_test_overrides.json` for test-specific
-runtime arguments, stack sizes, and optional dcc build flags.
+runtime arguments, stack sizes, and optional DCC C Compiler build flags.
 
 Runs in parallel by default:
 
@@ -173,7 +329,7 @@ Compiles each `tests/*.c` program with a native host C compiler, runs the host
 executable, and compares stdout with `tests/baselines/<app>.txt`. This is a
 read-only baseline check: it never rewrites baseline files. It is useful for
 checking that the unit-test sources and expected output still make sense on a
-normal C implementation before comparing them with dcc's CP/M/Z80 output.
+normal C implementation before comparing them with the DCC C Compiler output.
 
 Host compiler selection follows `scripts/build-dcc.ps1`:
 
@@ -223,7 +379,7 @@ compiler can build and link 32-bit executables. The script probes this
 automatically: if the probe succeeds, Linux GCC host validations run with
 `-m32`; if it fails, the script keeps using the normal compiler mode.
 
-This matters because dcc has 16-bit pointers and 32-bit `long`, so a 32-bit host
+This matters because the DCC C Compiler has 16-bit pointers and 32-bit `long`, so a 32-bit host
 build can run a few host-only tests that are skipped on a normal 64-bit Linux
 compiler. Install the normal C build tools plus the 32-bit development libraries
 for your distribution, then rerun the validator.
@@ -275,7 +431,7 @@ one test, keyed by `name`:
 | `args` | string | no | `""` | Command-line arguments passed to the program when run. Multi-token strings are split on whitespace (e.g. `"a bb ccc"`) |
 | `stdin` | string | no | `""` | Text piped to the program's standard input during execution (for keyboard/input-driven tests) |
 | `stack_size` | integer | no | `512` | C stack reserve in bytes, passed to `dcc` as `-stack`. Used by recursive apps that need more headroom |
-| `dcc_args` | string | no | `""` | Extra dcc-style build arguments passed through `dccmake` (for example `-DNAME=1 -UOLD`) |
+| `dcc_args` | string | no | `""` | Extra DCC C Compiler build arguments passed through `dccmake` (for example `-DNAME=1 -UOLD`) |
 | `dcc_floatio` | boolean | no | environment/default | When set, controls `dccmake` `dcc-floatio` and dcc `-ffloatio` for this app |
 | `dcc_longio` | boolean | no | environment/default | When set, controls `dccmake` `dcc-flongio` and dcc `-flongio` for this app |
 | `ignore` | boolean | no | `false` | When `true`, the test is skipped entirely (not built or run) |
@@ -361,7 +517,7 @@ controls which CSV columns are populated: `-Mode full` fills both `peep_*` and
 
 ## Stack Size Measurement (`stacksize.sh` / `stacksize.bat`)
 
-Finds the minimum C stack reserve an app needs under dcc's lightweight
+Finds the minimum C stack reserve an app needs under DCC C Compiler's lightweight
 stack-overflow guard (`-fstack-check`). See the
 [Building and linking](../02-build-and-link.md#measuring-the-stack-an-app-needs)
 section for full documentation, or run `scripts/stacksize.sh --help`.

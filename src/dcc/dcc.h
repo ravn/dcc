@@ -245,8 +245,15 @@ struct Sym {
     struct AstNode *inline_stmt_body;   /* simple void inline statement body */
     int inline_param_use_count[MAX_PROTO_PARAMS];
     char inline_param_names[MAX_PROTO_PARAMS][64];
-    FILE *inline_body_file; /* buffered out-of-line body for dead static inline elimination */
-    int inline_body_needed;
+    struct AstNode *narrow_return_expr; /* captured return expr of a zero-arg,
+                                         * single-return function - independent
+                                         * of is_inline, used only to bound
+                                         * calls like rndrm() for array-narrowing
+                                         * analysis (see dcc_array_narrow.c) */
+    FILE *deferred_body_file; /* buffered out-of-line body for dead static-function
+                               * elimination - both a static inline's fallback body
+                               * and a plain (non-inline) static function's only body */
+    int deferred_body_needed;
     int has_proto;
     int proto_nargs;
     int proto_variadic;
@@ -595,6 +602,8 @@ void expect(int k);
 /* ---- types ---- */
 int find_enum_const(const char *name);
 int is_type_qualifier_token(int k);
+int is_restrict_qualifier_token(void);
+void skip_parameter_array_qualifiers(void);
 void skip_type_qualifiers(void);
 int type_struct_id(int type);
 int make_struct_type(int id);
@@ -845,9 +854,15 @@ int current_function_param_count(void);
 int current_function_safe_to_omit_ix(int return_type, int local_bytes);
 void emit_function_prologue(const char *name, int local_bytes, int omit_ix_frame);
 void emit_function_epilogue(int implicit_zero_return);
-void emit_needed_inline_bodies(void);
+void emit_needed_deferred_bodies(void);
 void skip_initializer_or_decl_tail(void);
 int local_name_address_taken_ahead(const char *name);
+int local_name_used_ahead(const char *name);
+int narrow_array_is_byte_safe(const struct AstNode *scope, const char *arr_name);
+int narrow_scalar_is_byte_safe(const struct AstNode *scope, const char *name);
+int try_narrow_local_int_array(const char *name, int type, int arrlen, int total_elems);
+int try_narrow_register_scalar(const char *name, int type, int is_register,
+                               int arrlen, int total_elems);
 void scan_local_decl_after_type(int base);
 void scan_static_local_decl_after_type(int base);
 void scan_function_body(void);

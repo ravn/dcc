@@ -1069,6 +1069,72 @@ static void peep_format_ix_off(char *buf, int off)
         sprintf(buf, "%d", off);
 }
 
+static int peep_parse_ld_e_imm8(const char *s, int *out)
+{
+    char tmp[MAX_LINE];
+    char *endp;
+    long v;
+
+    strip_peep_comment_copy(tmp, s);
+    if (strncmp(tmp, "ld e,", 5) != 0)
+        return 0;
+
+    v = strtol(tmp + 5, &endp, 0);
+    if (*endp != 0 || v < 0 || v > 255)
+        return 0;
+
+    *out = (int)v;
+    return 1;
+}
+
+static int pass_ix_addr_byte_store_imm(void)
+{
+    int i;
+    int j;
+    int off;
+    int add;
+    int imm;
+    int changed = 0;
+    char line[MAX_LINE];
+    char offbuf[32];
+
+    for (i = 0; i + 5 < nlines; ++i) {
+        if (!eq(i, "push ix")) continue;
+        if (!eq(i + 1, "pop hl")) continue;
+        if (!peep_parse_ld_de_signed(lines[i + 2], &off)) continue;
+        if (!eq(i + 3, "add hl,de")) continue;
+
+        j = i + 4;
+        while (j < nlines && eq(j, "inc hl")) {
+            off++;
+            j++;
+        }
+        if (j + 1 < nlines && peep_parse_ld_de_signed(lines[j], &add) &&
+            eq(j + 1, "add hl,de")) {
+            off += add;
+            j += 2;
+            while (j < nlines && eq(j, "inc hl")) {
+                off++;
+                j++;
+            }
+        }
+
+        if (off < -128 || off > 127) continue;
+        if (j + 1 >= nlines) continue;
+        if (!peep_parse_ld_e_imm8(lines[j], &imm)) continue;
+        if (!eq(j + 1, "ld (hl),e")) continue;
+
+        peep_format_ix_off(offbuf, off);
+        sprintf(line, "ld (ix%s),%d", offbuf, imm);
+        replace1_tagged(i, line, "ix_addr_byte_store_imm");
+        delete_n(i + 1, j + 1 - i);
+        changed = 1;
+        if (i > 0) --i;
+    }
+
+    return changed;
+}
+
 /*
  * Dead IX-frame store elimination.
  *
@@ -2220,6 +2286,534 @@ static int pass_reuse_array_word_addr(void)
             insert_line(gap_end, "add hl,de");
             insert_line(gap_end, line);
             replace1_tagged(gap_end, lines[gap_end], "reuse_array_word_addr");
+        }
+
+        changed = 1;
+    }
+
+    return changed;
+}
+
+/* Byte-array counterpart of pass_ix_array_word_addr: same canonical raw
+ * shape, minus the "add hl,hl" doubling step (a byte array's stride is 1,
+ * so the index needs no scaling before being added to the base address).
+ * Matches:
+ *   push ix
+ *   pop hl
+ *   ld de,BASEOFF
+ *   add hl,de
+ *   push hl
+ *   ld l,(ix+O) / ld h,(ix+O+1)
+ *   [dec hl | inc hl]        (optional index adjustment)
+ *   ex de,hl
+ *   pop hl
+ *   add hl,de
+ * and rewrites in place to the canonical block peep_match_array_byte_addr_block
+ * recognizes:
+ *   ld l,(ix+O)
+ *   ld h,(ix+O+1)
+ *   [dec hl | inc hl]
+ *   push ix
+ *   pop de
+ *   add hl,de
+ *   ld de,ARROFF
+ *   add hl,de */
+static int pass_ix_array_byte_addr(void)
+{
+    int i;
+    int changed;
+    int baseoff;
+    int idxoff;
+    int step;
+    int j;
+    char line[160];
+
+    changed = 0;
+
+    for (i = 0; i + 9 < nlines; ++i) {
+        if (eq(i, "push ix") &&
+            eq(i + 1, "pop hl") &&
+            peep_parse_ld_de_signed(lines[i + 2], &baseoff) &&
+            eq(i + 3, "add hl,de") &&
+            eq(i + 4, "push hl") &&
+            peep_parse_ld_ix_pair(lines[i + 5], lines[i + 6], &idxoff)) {
+            j = i + 7;
+            step = 0;
+            if (eq(j, "dec hl")) {
+                step = -1;
+                j++;
+            } else if (eq(j, "inc hl")) {
+                step = 1;
+                j++;
+            }
+
+            if (eq(j, "ex de,hl") &&
+                eq(j + 1, "pop hl") &&
+                eq(j + 2, "add hl,de")) {
+                replace1_tagged(i, lines[i + 5], "ix_array_byte_addr");
+                replace1(i + 1, lines[i + 6]);
+                if (step < 0)
+                    replace1(i + 2, "dec hl");
+                else if (step > 0)
+                    replace1(i + 2, "inc hl");
+                else
+                    replace1(i + 2, "push ix");
+
+                if (step != 0)
+                    replace1(i + 3, "push ix");
+                else
+                    replace1(i + 3, "pop de");
+                if (step != 0)
+                    replace1(i + 4, "pop de");
+                else
+                    replace1(i + 4, "add hl,de");
+                if (step != 0)
+                    replace1(i + 5, "add hl,de");
+                else {
+                    sprintf(line, "ld de,%d", baseoff);
+                    replace1(i + 5, line);
+                }
+                if (step != 0) {
+                    sprintf(line, "ld de,%d", baseoff);
+                    replace1(i + 6, line);
+                } else {
+                    replace1(i + 6, "add hl,de");
+                }
+                if (step != 0)
+                    replace1(i + 7, "add hl,de");
+
+                if (step != 0)
+                    delete_n(i + 8, (j + 3) - (i + 8));
+                else
+                    delete_n(i + 7, (j + 3) - (i + 7));
+
+                changed = 1;
+                if (i > 0) --i;
+            }
+        }
+    }
+
+    return changed;
+}
+
+/* Matches the canonical array-byte-address block that pass_ix_array_byte_addr
+ * produces:
+ *   ld l,(ix+O)
+ *   ld h,(ix+O+1)
+ *   [dec hl | inc hl]        (optional; step = -1/+1, else 0)
+ *   push ix
+ *   pop de
+ *   add hl,de
+ *   ld de,ARROFF
+ *   add hl,de
+ * On success returns the block's length in lines (7 or 8) and sets
+ * *out_idxoff, *out_step, *out_arroff; returns 0 (outputs untouched) on no
+ * match. */
+static int peep_match_array_byte_addr_block(int i, int *out_idxoff,
+                                                    int *out_step, int *out_arroff)
+{
+    int idxoff;
+    int step;
+    int arroff;
+    int j;
+
+    if (!peep_parse_ld_ix_pair(lines[i], lines[i + 1], &idxoff))
+        return 0;
+    j = i + 2;
+    step = 0;
+    if (eq(j, "dec hl")) { step = -1; j++; }
+    else if (eq(j, "inc hl")) { step = 1; j++; }
+
+    if (!eq(j, "push ix")) return 0;
+    if (!eq(j + 1, "pop de")) return 0;
+    if (!eq(j + 2, "add hl,de")) return 0;
+    if (!peep_parse_ld_de_signed(lines[j + 3], &arroff)) return 0;
+    if (!eq(j + 4, "add hl,de")) return 0;
+
+    *out_idxoff = idxoff;
+    *out_step = step;
+    *out_arroff = arroff;
+    return (j + 5) - i;
+}
+
+/* Byte-array counterpart of pass_reuse_array_word_addr. Two array-byte-
+ * address blocks for the SAME array and SAME index variable, separated only
+ * by a push hl / <straight-line gap that reads but never writes the index
+ * variable, no label> / pop hl / ld (hl),R (single-byte store through the
+ * address) - the second address is recomputed from scratch even though HL,
+ * right after that single-byte store, is unchanged (still exactly
+ * &array[idxA]+stepA, since - unlike the word-store tail's "inc hl" - a
+ * one-byte store never moves HL). Common in the same e.c shape as the word
+ * version: `a[n] = x % n; ... a[n-1] ...` once `a` has been narrowed from
+ * int to unsigned char. */
+static int pass_reuse_array_byte_addr(void)
+{
+    int i;
+    int changed;
+    int idxoffA, stepA, arroffA, lenA;
+    int idxoffB, stepB, arroffB, lenB;
+    int gap_end;
+    int k;
+    int delta;
+    char line[64];
+
+    changed = 0;
+
+    for (i = 0; i + 6 < nlines; ++i) {
+        lenA = peep_match_array_byte_addr_block(i, &idxoffA, &stepA, &arroffA);
+        if (!lenA)
+            continue;
+        if (!eq(i + lenA, "push hl"))
+            continue;
+
+        gap_end = 0;
+        for (k = i + lenA + 1; k + 1 < nlines; ++k) {
+            if (starts_label(lines[k]))
+                break;                       /* control-flow join: unsafe */
+            if (peep_writes_ix_off(lines[k], idxoffA))
+                break;                       /* index variable changed */
+            if (peep_line_is_unsafe_call(lines[k]))
+                break;                       /* could alias the index variable */
+            if (eq(k, "pop hl")) {
+                if (eq(k + 1, "ld (hl),a") || eq(k + 1, "ld (hl),b") ||
+                    eq(k + 1, "ld (hl),c") || eq(k + 1, "ld (hl),d") ||
+                    eq(k + 1, "ld (hl),e"))
+                    gap_end = k + 2;
+                break;   /* pop hl found (matched or not): gap ends here */
+            }
+        }
+        if (gap_end == 0)
+            continue;
+
+        lenB = peep_match_array_byte_addr_block(gap_end, &idxoffB, &stepB, &arroffB);
+        if (!lenB)
+            continue;
+        if (idxoffB != idxoffA || arroffB != arroffA)
+            continue;
+
+        /* HL == &array[idxA]+stepA unchanged right after the byte-store
+         * tail (no "+1" term here - a single-byte store never advances HL,
+         * unlike the word version's second-byte "inc hl"). Block B wants
+         * &array[idxA]+stepB, so delta is simply stepB - stepA. */
+        delta = stepB - stepA;
+
+        delete_n(gap_end, lenB);
+        if (delta == 0) {
+            /* HL already holds exactly the address block B wanted. */
+            changed = 1;
+            continue;
+        }
+        if (delta >= -4 && delta <= 4) {
+            int n = delta > 0 ? delta : -delta;
+            int m;
+            for (m = 0; m < n; ++m)
+                insert_line(gap_end, delta > 0 ? "inc hl" : "dec hl");
+            replace1_tagged(gap_end, lines[gap_end], "reuse_array_byte_addr");
+        } else {
+            sprintf(line, "ld de,%d", delta);
+            insert_line(gap_end, "add hl,de");
+            insert_line(gap_end, line);
+            replace1_tagged(gap_end, lines[gap_end], "reuse_array_byte_addr");
+        }
+
+        changed = 1;
+    }
+
+    return changed;
+}
+
+static int peep_parse_dec_ix_byte(const char *s, int *off)
+{
+    char tmp[MAX_LINE];
+    char *p;
+    char *endp;
+
+    strip_peep_comment_copy(tmp, s);
+    if (strncmp(tmp, "dec (ix", 7) != 0)
+        return 0;
+    p = tmp + 7;
+    *off = (int)strtol(p, &endp, 10);
+    if (*endp != ')' || endp[1] != 0)
+        return 0;
+    return 1;
+}
+
+/* Recognizes a byte-sized ix-local used purely as a self-guarding
+ * decrementing loop counter - dcc_array_narrow.c's `while(--n)` idiom,
+ * once narrowing has made the counter's own storage a single byte (see
+ * try_narrow_register_scalar in dcc_func.c) - and promotes it to register
+ * C for the loop's duration, eliminating the ix-frame reload on every use.
+ *
+ * Matches:
+ *   LABEL:
+ *   dec (ix+O)
+ *   jp z, EXIT
+ *   <body, ending in a bare "jp LABEL">
+ * where every reference to (ix+O) inside the body is one of exactly two
+ * whitelisted "zero-extend into a 16-bit register pair" shapes -
+ *   ld e,(ix+O)        ld l,(ix+O)
+ *   ld d,0              ld h,0
+ * - and every call inside the body is to __mods or __divs specifically:
+ * runtime helpers documented (see DCCRTL.MAC) to preserve BC across the
+ * call, so C can stand in for the whole loop with no spill/reload at all.
+ *
+ * Declines (the safe default, missing the optimization but never
+ * misapplying it) if any other reference to the counter's slot, any other
+ * call, or any other label appears in the body - this pass does not try
+ * to reason about what such a reference might mean. */
+static int pass_byte_loop_counter_to_reg_c(void)
+{
+    int i;
+    int changed;
+    int off;
+    char label[128];
+    char target[128];
+    char tgt[128];
+    int loop_end;
+    int k;
+    int ok;
+    char pat_ix[40];
+    char pat_lde[40];
+    char pat_lhl[40];
+    char prime[40];
+    char writeback[40];
+
+    changed = 0;
+
+    for (i = 0; i + 2 < nlines; ++i) {
+        if (!starts_label(lines[i]))
+            continue;
+        if (!peep_parse_dec_ix_byte(lines[i + 1], &off))
+            continue;
+        if (!parse_jp_cond_label(lines[i + 2], "z", target))
+            continue;
+
+        strcpy(label, lines[i]);
+        k = (int)strlen(label);
+        if (k > 0 && label[k - 1] == ':')
+            label[k - 1] = 0;
+
+        /* Find the matching loop-back jump to this same label, with no
+         * other label in between (single-entry, single-exit body). */
+        loop_end = -1;
+        for (k = i + 3; k < nlines; ++k) {
+            if (starts_label(lines[k]))
+                break;
+            if (is_uncond_jp(lines[k])) {
+                if (jump_target(lines[k], tgt) && strcmp(tgt, label) == 0)
+                    loop_end = k;
+                break;
+            }
+        }
+        if (loop_end < 0)
+            continue;
+
+        sprintf(pat_ix, "(ix%+d)", off);
+        sprintf(pat_lde, "ld e,(ix%+d)", off);
+        sprintf(pat_lhl, "ld l,(ix%+d)", off);
+
+        ok = 1;
+        for (k = i + 3; k < loop_end && ok; ++k) {
+            if (strncmp(lines[k], "call ", 5) == 0) {
+                if (!eq(k, "call __mods") && !eq(k, "call __divs"))
+                    ok = 0;
+                continue;
+            }
+            if (strstr(lines[k], pat_ix) == NULL)
+                continue;
+            if (eq(k, pat_lde) && eq(k + 1, "ld d,0")) {
+                ++k;
+                continue;
+            }
+            if (eq(k, pat_lhl) && eq(k + 1, "ld h,0")) {
+                ++k;
+                continue;
+            }
+            ok = 0;
+        }
+        if (!ok)
+            continue;
+
+        /* In-place replacements first, while every index computed above is
+         * still valid (no lines inserted/deleted yet). */
+        replace1_tagged(i + 1, "dec c", "byte_loop_counter_to_reg_c");
+        for (k = i + 3; k < loop_end; ++k) {
+            if (eq(k, pat_lde)) { replace1(k, "ld e,c"); continue; }
+            if (eq(k, pat_lhl)) { replace1(k, "ld l,c"); continue; }
+        }
+
+        /* Write the counter back to its frame slot right after the
+         * decrement (LD does not touch flags, so the Z flag "dec c" just
+         * set is still valid two lines later at the exit branch) - makes
+         * the transform safe regardless of whether anything after the
+         * loop still reads the slot, without needing to prove it doesn't. */
+        sprintf(writeback, "ld (ix%+d),c", off);
+        insert_line(i + 2, writeback);
+
+        /* Prime the register right before the loop label. */
+        sprintf(prime, "ld c,(ix%+d)", off);
+        insert_line_tagged(i, prime, "byte_loop_counter_to_reg_c");
+
+        changed = 1;
+    }
+
+    return changed;
+}
+
+/* Matches either raw shape dcc emits for an array address indexed by the
+ * register-promoted loop counter in C (see
+ * pass_byte_loop_counter_to_reg_c). Narrowing (and now registerizing) an
+ * index variable changes its own load shape each time - first from an
+ * ix-word-pair to an ix-byte-zero-extend, now to this register-based
+ * zero-extend - and pass_ix_array_byte_addr/pass_reuse_array_byte_addr
+ * were built around the ix-offset shapes, so they stop matching once the
+ * index lives in C; this is a dedicated counterpart for that case, keyed
+ * on the register instead of any ix-offset (so there is no "idxoff" to
+ * track - the index source is always exactly C).
+ *
+ * step == 0 (e.g. array[n]):
+ *   push ix
+ *   pop hl
+ *   ld de,BASEOFF
+ *   add hl,de
+ *   ld e,c
+ *   ld d,0
+ *   add hl,de
+ *
+ * step != 0 (e.g. array[n-1]):
+ *   push ix
+ *   pop hl
+ *   ld de,BASEOFF
+ *   add hl,de
+ *   push hl
+ *   ld l,c
+ *   ld h,0
+ *   [dec hl | inc hl]
+ *   ex de,hl
+ *   pop hl
+ *   add hl,de
+ *
+ * Returns the match length in lines (7 or 11), or 0 on no match. */
+static int peep_match_reg_array_addr_raw(int i, int *out_step, int *out_arroff)
+{
+    int arroff;
+    int j;
+    int step;
+
+    if (!eq(i, "push ix") || !eq(i + 1, "pop hl") ||
+        !peep_parse_ld_de_signed(lines[i + 2], &arroff) || !eq(i + 3, "add hl,de"))
+        return 0;
+
+    if (eq(i + 4, "ld e,c") && eq(i + 5, "ld d,0") && eq(i + 6, "add hl,de")) {
+        *out_step = 0;
+        *out_arroff = arroff;
+        return 7;
+    }
+
+    if (eq(i + 4, "push hl") && eq(i + 5, "ld l,c") && eq(i + 6, "ld h,0")) {
+        j = i + 7;
+        step = 0;
+        if (eq(j, "dec hl")) { step = -1; j++; }
+        else if (eq(j, "inc hl")) { step = 1; j++; }
+        if (eq(j, "ex de,hl") && eq(j + 1, "pop hl") && eq(j + 2, "add hl,de")) {
+            *out_step = step;
+            *out_arroff = arroff;
+            return (j + 3) - i;
+        }
+    }
+
+    return 0;
+}
+
+/* True if line `s` could change register C's value - dec c/inc c/ld c,X/
+ * pop bc. Used to prove C (the register-promoted loop counter) is
+ * unchanged across the gap pass_reuse_reg_array_byte_addr scans; a write
+ * to (ix+d) shadowing C is not a hazard here since nothing in this gap
+ * reads the shadow slot back into C. */
+static int peep_line_writes_reg_c(const char *s)
+{
+    char tmp[MAX_LINE];
+
+    strip_peep_comment_copy(tmp, s);
+    if (!strcmp(tmp, "dec c") || !strcmp(tmp, "inc c"))
+        return 1;
+    if (strncmp(tmp, "ld c,", 5) == 0)
+        return 1;
+    if (strncmp(tmp, "pop bc", 6) == 0)
+        return 1;
+    return 0;
+}
+
+/* Register-index counterpart of pass_reuse_array_byte_addr: two array-
+ * address blocks (see peep_match_reg_array_addr_raw) for the SAME array
+ * and the SAME register-promoted index, separated only by a push hl /
+ * <straight-line gap that neither writes C nor calls anything other than
+ * a dcc runtime helper, no label> / pop hl / ld (hl),R (single-byte store)
+ * - reuses the first address (adjusted by a few inc/dec hl) instead of
+ * recomputing the second one from scratch. */
+static int pass_reuse_reg_array_byte_addr(void)
+{
+    int i;
+    int changed;
+    int stepA, arroffA, lenA;
+    int stepB, arroffB, lenB;
+    int gap_end;
+    int k;
+    int delta;
+    char line[64];
+
+    changed = 0;
+
+    for (i = 0; i + 6 < nlines; ++i) {
+        lenA = peep_match_reg_array_addr_raw(i, &stepA, &arroffA);
+        if (!lenA)
+            continue;
+        if (!eq(i + lenA, "push hl"))
+            continue;
+
+        gap_end = 0;
+        for (k = i + lenA + 1; k + 1 < nlines; ++k) {
+            if (starts_label(lines[k]))
+                break;
+            if (peep_line_writes_reg_c(lines[k]))
+                break;
+            if (peep_line_is_unsafe_call(lines[k]))
+                break;
+            if (eq(k, "pop hl")) {
+                if (eq(k + 1, "ld (hl),a") || eq(k + 1, "ld (hl),b") ||
+                    eq(k + 1, "ld (hl),c") || eq(k + 1, "ld (hl),d") ||
+                    eq(k + 1, "ld (hl),e"))
+                    gap_end = k + 2;
+                break;
+            }
+        }
+        if (gap_end == 0)
+            continue;
+
+        lenB = peep_match_reg_array_addr_raw(gap_end, &stepB, &arroffB);
+        if (!lenB)
+            continue;
+        if (arroffB != arroffA)
+            continue;
+
+        delta = stepB - stepA;
+
+        delete_n(gap_end, lenB);
+        if (delta == 0) {
+            changed = 1;
+            continue;
+        }
+        if (delta >= -4 && delta <= 4) {
+            int n = delta > 0 ? delta : -delta;
+            int m;
+            for (m = 0; m < n; ++m)
+                insert_line(gap_end, delta > 0 ? "inc hl" : "dec hl");
+            replace1_tagged(gap_end, lines[gap_end], "reuse_reg_array_byte_addr");
+        } else {
+            sprintf(line, "ld de,%d", delta);
+            insert_line(gap_end, "add hl,de");
+            insert_line(gap_end, line);
+            replace1_tagged(gap_end, lines[gap_end], "reuse_reg_array_byte_addr");
         }
 
         changed = 1;
@@ -3618,6 +4212,138 @@ static int pass_dead_hl_load_before_ldhl(void)
             changed = 1;
             if (i > 0) --i;
         }
+    }
+
+    return changed;
+}
+
+static int peep_call_uses_stack_args_only(const char *s)
+{
+    char tmp[MAX_LINE];
+    const char *name;
+
+    strip_peep_comment_copy(tmp, s);
+    if (strncmp(tmp, "call ", 5) != 0)
+        return 0;
+
+    name = tmp + 5;
+    if (strncmp(name, "__", 2) == 0) {
+        return strcmp(name, "__scmp") == 0 ||
+               strcmp(name, "__ncmp") == 0 ||
+               strcmp(name, "__mset") == 0;
+    }
+
+    return name[0] == '_';
+}
+
+static int peep_call_uses_long_stack_args(const char *s)
+{
+    char tmp[MAX_LINE];
+    const char *name;
+
+    strip_peep_comment_copy(tmp, s);
+    if (strncmp(tmp, "call ", 5) != 0)
+        return 0;
+
+    name = tmp + 5;
+    if (strncmp(name, "__", 2) == 0) {
+        return strcmp(name, "__lts") == 0 ||
+               strcmp(name, "__les") == 0 ||
+               strcmp(name, "__lgs") == 0 ||
+               strcmp(name, "__lks") == 0 ||
+               strcmp(name, "__lds") == 0 ||
+               strcmp(name, "__ltu") == 0 ||
+               strcmp(name, "__lmu") == 0 ||
+               strcmp(name, "__lms") == 0 ||
+               strcmp(name, "__fgt") == 0 ||
+               strcmp(name, "__fadd") == 0;
+    }
+
+    return name[0] == '_';
+}
+
+/*
+ * A common by-reference load used as an immediate stack argument:
+ *
+ *   ld e,(hl)
+ *   inc hl
+ *   ld d,(hl)
+ *   ex de,hl
+ *   push hl
+ *   call _func
+ *
+ * The loaded word is already in DE.  For ordinary stack-argument calls the
+ * transient HL/DE register values are not part of the call ABI, so push DE
+ * directly and avoid the exchange.  Do not apply to register-ABI helpers.
+ */
+static int pass_word_load_push_de_call(void)
+{
+    int i;
+    int changed = 0;
+
+    for (i = 0; i + 5 < nlines; ++i) {
+        if (!eq(i,     "ld e,(hl)")) continue;
+        if (!eq(i + 1, "inc hl")) continue;
+        if (!eq(i + 2, "ld d,(hl)")) continue;
+        if (!eq(i + 3, "ex de,hl")) continue;
+        if (!eq(i + 4, "push hl")) continue;
+        if (!peep_call_uses_stack_args_only(lines[i + 5])) continue;
+
+        replace1_tagged(i + 3, "push de", "word_load_push_de_call");
+        delete_n(i + 4, 1);
+        changed = 1;
+        if (i > 0) --i;
+    }
+
+    return changed;
+}
+
+/*
+ * A 32-bit value loaded from memory is often pushed immediately as a long or
+ * float stack argument:
+ *
+ *   ld e,(hl) / inc hl / ld d,(hl)          ; DE = low word
+ *   inc hl / ld a,(hl) / inc hl / ld h,(hl)
+ *   ld l,a                                  ; HL = high word
+ *   ex de,hl
+ *   push de
+ *   push hl
+ *   call __helper
+ *
+ * Before the exchange, HL is already the high word and DE the low word.  Push
+ * them in that order and skip the exchange.  Constrain this to immediate
+ * stack-argument calls; register-ABI helpers are deliberately excluded.
+ */
+static int pass_long_load_push_no_ex_call(void)
+{
+    int i;
+    int call_line;
+    int changed = 0;
+
+    for (i = 0; i + 11 < nlines; ++i) {
+        if (!eq(i,      "ld e,(hl)")) continue;
+        if (!eq(i + 1,  "inc hl")) continue;
+        if (!eq(i + 2,  "ld d,(hl)")) continue;
+        if (!eq(i + 3,  "inc hl")) continue;
+        if (!eq(i + 4,  "ld a,(hl)")) continue;
+        if (!eq(i + 5,  "inc hl")) continue;
+        if (!eq(i + 6,  "ld h,(hl)")) continue;
+        if (!eq(i + 7,  "ld l,a")) continue;
+        if (!eq(i + 8,  "ex de,hl")) continue;
+        if (!eq(i + 9,  "push de")) continue;
+        if (!eq(i + 10, "push hl")) continue;
+
+        call_line = i + 11;
+        if (call_line < nlines && strncmp(lines[call_line], "extrn ", 6) == 0)
+            call_line++;
+        if (call_line >= nlines || !peep_call_uses_long_stack_args(lines[call_line]))
+            continue;
+
+        replace1_tagged(i + 8, "push hl", "long_load_push_no_ex_call");
+        replace1(i + 9, "push de");
+        delete_n(i + 10, 1);
+        changed = 1;
+        if (i > 0) --i;
     }
 
     return changed;
@@ -5509,6 +6235,72 @@ static int pass_shrink_minmax_frame1_after_value_c(void)
 }
 
 /*
+ * pass_minmax_board_ptr_loop:
+ *
+ * In _MinMax, after the loop counter has been moved to B, the hot blank-cell
+ * scan still recomputes &_g_board[B] at every iteration:
+ *
+ *   ld b,0
+ * Lloop:
+ *   ld hl,_g_board
+ *   ld e,b
+ *   ld d,0
+ *   add hl,de
+ *   ld a,(hl)
+ *   or a
+ *   jp nz,Ltail
+ *   ... recursive call, with HL saved/restored as the board-cell pointer ...
+ * Ltail:
+ *   inc b
+ *   ld a,b
+ *   cp 9
+ *   jp c,Lloop
+ *
+ * HL is the current board-cell pointer on every path reaching Ltail: the
+ * occupied-cell path never changes it, and the recursive path restores it via
+ * pass_minmax_save_board_addr.  Initialize HL once and walk it with inc hl.
+ */
+static int pass_minmax_board_ptr_loop(void)
+{
+    int start, end, i, j;
+    char loop_lab[128], tail_lab[128], got_lab[128];
+    char cond[16];
+
+    if (!peep_in_function_range("_MinMax:", &start, &end))
+        return 0;
+
+    for (i = start; i + 8 < end; i++) {
+        if (!eq(i, "ld b,0")) continue;
+        if (!label_name_at(i + 1, loop_lab)) continue;
+        if (!eq(i + 2, "ld hl,_g_board")) continue;
+        if (!eq(i + 3, "ld e,b")) continue;
+        if (!eq(i + 4, "ld d,0")) continue;
+        if (!eq(i + 5, "add hl,de")) continue;
+        if (!eq(i + 6, "ld a,(hl)")) continue;
+        if (!eq(i + 7, "or a")) continue;
+        if (!peep_parse_any_cond_jump(lines[i + 8], cond, tail_lab)) continue;
+        if (strcmp(cond, "nz") != 0) continue;
+
+        for (j = i + 9; j + 4 < end; j++) {
+            if (!label_name_at(j, got_lab) || strcmp(got_lab, tail_lab) != 0)
+                continue;
+            if (!eq(j + 1, "inc b")) continue;
+            if (!eq(j + 2, "ld a,b")) continue;
+            if (!eq(j + 3, "cp 9")) continue;
+            if (!peep_parse_any_cond_jump(lines[j + 4], cond, got_lab)) continue;
+            if (strcmp(cond, "c") != 0 || strcmp(got_lab, loop_lab) != 0) continue;
+
+            insert_line_tagged(j + 1, "inc hl", "minmax_board_ptr_loop");
+            insert_line_tagged(i + 1, "ld hl,_g_board", "minmax_board_ptr_loop");
+            delete_n(i + 3, 4);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
  * pass_minmax_byte_returns:
  *
  * MinMax is declared as returning int, but every value it returns fits in a
@@ -7273,6 +8065,40 @@ static int pass_once(void)
             replace1_tagged(i, "ld a,(hl)", "byte_zero_test");
             replace1(i + 1, "or a");
             delete_n(i + 2, 2);
+            changed = 1;
+            if (i > 0) i--;
+            continue;
+        }
+
+        /* Signed byte zero-test from memory:
+         *   ld l,(hl)
+         *   ld a,l
+         *   rlca
+         *   sbc a,a
+         *   ld h,a
+         *   ld a,h
+         *   or l
+         *   jr/jp z|nz,L
+         *
+         * The sign-extension is irrelevant for a zero/nonzero branch.  Test
+         * the byte directly, leaving HL untouched; only apply when the next
+         * consumer is a Z/NZ branch so no signed flags are being preserved.
+         */
+        if (i + 7 < nlines &&
+            eq(i,     "ld l,(hl)") &&
+            eq(i + 1, "ld a,l") &&
+            eq(i + 2, "rlca") &&
+            eq(i + 3, "sbc a,a") &&
+            eq(i + 4, "ld h,a") &&
+            eq(i + 5, "ld a,h") &&
+            eq(i + 6, "or l") &&
+            (strncmp(lines[i + 7], "jp z,", 5) == 0 ||
+             strncmp(lines[i + 7], "jp nz,", 6) == 0 ||
+             strncmp(lines[i + 7], "jr z,", 5) == 0 ||
+             strncmp(lines[i + 7], "jr nz,", 6) == 0)) {
+            replace1_tagged(i, "ld a,(hl)", "byte_signed_zero_test");
+            replace1(i + 1, "or a");
+            delete_n(i + 2, 5);
             changed = 1;
             if (i > 0) i--;
             continue;
@@ -10986,6 +11812,8 @@ int main(int argc, char **argv)
         if (pass_byte_minmax_board_and_assign()) changed = 1;
         if (pass_inline_simple_call_hl_from_loaded_pointer()) changed = 1;
         if (pass_dead_hl_load_before_ldhl()) changed = 1;
+        if (pass_word_load_push_de_call()) changed = 1;
+        if (pass_long_load_push_no_ex_call()) changed = 1;
         if (pass_elim_loop_back_signed_bias()) changed = 1;
         if (pass_cp_zero_to_or_a()) changed = 1;
         if (pass_hl_cmp_zero_to_or_hl()) changed = 1;
@@ -11007,6 +11835,7 @@ int main(int argc, char **argv)
         if (pass_shrink_minmax_frame2_after_loop_ctr_b()) changed = 1;
         if (pass_minmax_value_c()) changed = 1;
         if (pass_shrink_minmax_frame1_after_value_c()) changed = 1;
+        if (pass_minmax_board_ptr_loop()) changed = 1;
         if (pass_minmax_byte_returns()) changed = 1;
         if (pass_minmax_pack_frame()) changed = 1;
         if (pass_minmax_pack_call()) changed = 1;
@@ -11017,6 +11846,10 @@ int main(int argc, char **argv)
         if (pass_e_signed_le_zero()) changed = 1;
         if (pass_ix_array_word_addr()) changed = 1;
         if (pass_reuse_array_word_addr()) changed = 1;
+        if (pass_ix_array_byte_addr()) changed = 1;
+        if (pass_reuse_array_byte_addr()) changed = 1;
+        if (pass_byte_loop_counter_to_reg_c()) changed = 1;
+        if (pass_reuse_reg_array_byte_addr()) changed = 1;
         if (pass_ix_postdec_to_local()) changed = 1;
         if (pass_store_word_const_hl()) changed = 1;
         if (pass_findsolution_clear_board_loop()) changed = 1;
@@ -11054,6 +11887,7 @@ int main(int argc, char **argv)
         if (pass_cp_jz_jpc()) changed = 1;
         if (pass_bool_from_cmp()) changed = 1;
         if (pass_elim_dead_ix_stores()) changed = 1;
+        if (pass_ix_addr_byte_store_imm()) changed = 1;
         if (pass_remove_ix_store_reload_a()) changed = 1;
         if (pass_a_tracks_ix_byte()) changed = 1;
         if (pass_byte_postdec_copy()) changed = 1;

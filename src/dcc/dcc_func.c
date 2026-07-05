@@ -24,6 +24,23 @@ static int inline_param_index(struct Sym *s, const char *name)
     return -1;
 }
 
+static int inline_expr_touches_param(struct Sym *fn, const struct AstNode *n)
+{
+    int i;
+
+    if (n == NULL)
+        return 0;
+    if (n->kind == AST_IDENT)
+        return inline_param_index(fn, n->sval) >= 0;
+    if (inline_expr_touches_param(fn, n->a) || inline_expr_touches_param(fn, n->b) ||
+        inline_expr_touches_param(fn, n->c) || inline_expr_touches_param(fn, n->d))
+        return 1;
+    for (i = 0; i < n->list_len; ++i)
+        if (inline_expr_touches_param(fn, n->list[i]))
+            return 1;
+    return 0;
+}
+
 static int inline_expr_is_simple(struct Sym *fn, const struct AstNode *n)
 {
     int i;
@@ -46,13 +63,21 @@ static int inline_expr_is_simple(struct Sym *fn, const struct AstNode *n)
         }
         return find_global(n->sval) != NULL;
     case AST_UNARY:
-        if (n->op == TOK_INC || n->op == TOK_DEC)
+        /* ++/-- substituted verbatim onto a parameter would mutate the
+         * caller's argument expression, so only allow it on operands that
+         * don't reach a parameter (e.g. globals). */
+        if ((n->op == TOK_INC || n->op == TOK_DEC) && inline_expr_touches_param(fn, n->a))
+            return 0;
+        return inline_expr_is_simple(fn, n->a);
+    case AST_POSTFIX:
+        if (inline_expr_touches_param(fn, n->a))
             return 0;
         return inline_expr_is_simple(fn, n->a);
     case AST_BINARY:
     case AST_LOGAND:
     case AST_LOGOR:
     case AST_INDEX:
+    case AST_COMMA:
         return inline_expr_is_simple(fn, n->a) && inline_expr_is_simple(fn, n->b);
     case AST_ASSIGN:
         return inline_expr_is_simple(fn, n->a) && inline_expr_is_simple(fn, n->b);
@@ -75,16 +100,52 @@ static int inline_expr_is_simple(struct Sym *fn, const struct AstNode *n)
     }
 }
 
+static struct AstNode *inline_return_expr_from_seq(struct AstNode *body, int index);
+
 static struct AstNode *inline_stmt_return_expr(struct AstNode *n)
 {
     if (n == NULL)
         return NULL;
     if (n->kind == AST_RETURN)
         return n->a;
-    if (n->kind == AST_COMPOUND && n->list_len == 1 && n->list[0] != NULL &&
-        n->list[0]->kind == AST_RETURN)
-        return n->list[0]->a;
+    if (n->kind == AST_COMPOUND)
+        return inline_return_expr_from_seq(n, 0);
     return NULL;
+}
+
+static struct AstNode *inline_void_seq_to_expr(struct AstNode *n, int index)
+{
+    struct AstNode *stmt;
+    struct AstNode *rest;
+    struct AstNode *comma;
+    struct AstNode *zero;
+
+    if (n == NULL)
+        return NULL;
+    if (n->kind != AST_COMPOUND) {
+        /* A bare (unbraced) single statement. */
+        if (n->kind != AST_EXPR_STMT || n->a == NULL)
+            return NULL;
+        return n->a;
+    }
+    if (index >= n->list_len) {
+        zero = ast_new(&g_ast_inline_arena, AST_INT_LIT);
+        zero->ival = 0;
+        zero->type = TYPE_INT;
+        return zero;
+    }
+    stmt = n->list[index];
+    if (stmt == NULL || stmt->kind != AST_EXPR_STMT || stmt->a == NULL)
+        return NULL;
+    rest = inline_void_seq_to_expr(n, index + 1);
+    if (rest == NULL)
+        return NULL;
+    comma = ast_new(&g_ast_inline_arena, AST_COMMA);
+    comma->op = ',';
+    comma->a = stmt->a;
+    comma->b = rest;
+    comma->type = 0;
+    return comma;
 }
 
 static struct AstNode *inline_return_expr_from_seq(struct AstNode *body, int index)
@@ -94,6 +155,9 @@ static struct AstNode *inline_return_expr_from_seq(struct AstNode *body, int ind
     struct AstNode *else_expr;
     struct AstNode *rest_expr;
     struct AstNode *cond;
+    struct AstNode *comma;
+    struct AstNode *guard_expr;
+    struct AstNode *zero;
 
     if (body == NULL || body->kind != AST_COMPOUND || index >= body->list_len)
         return NULL;
@@ -105,12 +169,53 @@ static struct AstNode *inline_return_expr_from_seq(struct AstNode *body, int ind
     if (stmt->kind == AST_RETURN)
         return (index == body->list_len - 1) ? stmt->a : NULL;
 
+    if (stmt->kind == AST_EXPR_STMT && stmt->a != NULL) {
+        /* A side-effecting statement ahead of the eventual return: fold it
+         * into a comma expression so it still executes exactly once, in
+         * order, when the whole sequence is substituted at the call site. */
+        rest_expr = inline_return_expr_from_seq(body, index + 1);
+        if (rest_expr == NULL)
+            return NULL;
+        comma = ast_new(&g_ast_inline_arena, AST_COMMA);
+        comma->op = ',';
+        comma->a = stmt->a;
+        comma->b = rest_expr;
+        comma->type = 0;
+        return comma;
+    }
+
     if (stmt->kind != AST_IF)
         return NULL;
 
     then_expr = inline_stmt_return_expr(stmt->b);
-    if (then_expr == NULL)
-        return NULL;
+    if (then_expr == NULL) {
+        /* Not a return-producing branch: allow a side-effect-only guard
+         * with no else, e.g. `if (sp <= 0) die("empty");` ahead of the
+         * real return - folded as `(cond ? (side effects, 0) : 0), rest`
+         * so it still runs exactly once, in order. */
+        if (stmt->c != NULL)
+            return NULL;
+        guard_expr = inline_void_seq_to_expr(stmt->b, 0);
+        if (guard_expr == NULL)
+            return NULL;
+        rest_expr = inline_return_expr_from_seq(body, index + 1);
+        if (rest_expr == NULL)
+            return NULL;
+        zero = ast_new(&g_ast_inline_arena, AST_INT_LIT);
+        zero->ival = 0;
+        zero->type = TYPE_INT;
+        cond = ast_new(&g_ast_inline_arena, AST_COND);
+        cond->a = stmt->a;
+        cond->b = guard_expr;
+        cond->c = zero;
+        cond->type = 0;
+        comma = ast_new(&g_ast_inline_arena, AST_COMMA);
+        comma->op = ',';
+        comma->a = cond;
+        comma->b = rest_expr;
+        comma->type = 0;
+        return comma;
+    }
 
     if (stmt->c != NULL) {
         if (index != body->list_len - 1)
@@ -133,25 +238,45 @@ static struct AstNode *inline_return_expr_from_seq(struct AstNode *body, int ind
     return cond;
 }
 
-static int inline_void_stmt_body_is_simple(struct Sym *fn, const struct AstNode *n)
+static int inline_void_stmt_seq_is_simple(struct Sym *fn, const struct AstNode *n);
+
+static int inline_void_body_stmt_is_simple(struct Sym *fn, const struct AstNode *stmt)
+{
+    if (stmt == NULL)
+        return 0;
+    if (stmt->kind == AST_EXPR_STMT)
+        return stmt->a != NULL && inline_expr_is_simple(fn, stmt->a);
+    if (stmt->kind == AST_IF) {
+        if (!inline_expr_is_simple(fn, stmt->a))
+            return 0;
+        if (!inline_void_stmt_seq_is_simple(fn, stmt->b))
+            return 0;
+        if (stmt->c != NULL && !inline_void_stmt_seq_is_simple(fn, stmt->c))
+            return 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int inline_void_stmt_seq_is_simple(struct Sym *fn, const struct AstNode *n)
 {
     int i;
 
     if (n == NULL)
         return 0;
     if (n->kind != AST_COMPOUND)
-        return 0;
-    if (n->list_len <= 0)
-        return 0;
-    for (i = 0; i < n->list_len; ++i) {
-        const struct AstNode *stmt;
-        stmt = n->list[i];
-        if (stmt == NULL || stmt->kind != AST_EXPR_STMT || stmt->a == NULL)
+        return inline_void_body_stmt_is_simple(fn, n);
+    for (i = 0; i < n->list_len; ++i)
+        if (!inline_void_body_stmt_is_simple(fn, n->list[i]))
             return 0;
-        if (!inline_expr_is_simple(fn, stmt->a))
-            return 0;
-    }
     return 1;
+}
+
+static int inline_void_stmt_body_is_simple(struct Sym *fn, const struct AstNode *n)
+{
+    if (n == NULL || n->kind != AST_COMPOUND || n->list_len <= 0)
+        return 0;
+    return inline_void_stmt_seq_is_simple(fn, n);
 }
 
 static void record_inline_function_if_simple(struct Sym *s)
@@ -197,7 +322,17 @@ static void record_inline_function_if_simple(struct Sym *s)
     sv_tok_line = tok_line;
     sv_tok = tok;
 
+    /* This is a throwaway speculative parse of the function's own body,
+     * run before any of its locals are declared for this pass - a
+     * reference to one of them would otherwise resolve as "not found" and
+     * default to int (see ast_expr_type_for_sizeof's AST_IDENT case),
+     * which can trip a real type diagnostic (e.g. a bogus "incompatible
+     * integer to pointer assignment") for a perfectly valid program.
+     * asm_suppress_depth marks the parse as inert so dcc_error_at drops
+     * any such false positive. */
+    asm_suppress_depth++;
     body = ast_build_stmt(&g_ast_inline_arena);
+    asm_suppress_depth--;
 
     posi = sv_pos;
     tok_start_pos = sv_tok_start;
@@ -211,7 +346,7 @@ static void record_inline_function_if_simple(struct Sym *s)
     if ((s->type & 15) == TYPE_VOID) {
         if (!inline_void_stmt_body_is_simple(s, body))
             return;
-        if (body->list_len == 1)
+        if (body->list_len == 1 && body->list[0]->kind == AST_EXPR_STMT)
             s->inline_stmt_expr = body->list[0]->a;
         else
             s->inline_stmt_body = body;
@@ -232,6 +367,73 @@ static int static_inline_body_can_be_buffered(struct Sym *s)
     return s != NULL && s->is_static && s->is_inline &&
            (s->inline_return_expr != NULL || s->inline_stmt_expr != NULL ||
             s->inline_stmt_body != NULL);
+}
+
+/* Independent of is_inline/is_static: captures a zero-argument function's
+ * return expression (bare return, or an early-return if-chain collapsed to
+ * a ternary, exactly like the inline substitution shape) purely so
+ * dcc_array_narrow.c can recursively bound a call site like rndrm() when
+ * proving an array's values are provably in [0,255]. Deliberately does NOT
+ * reuse inline_expr_is_simple's gate - that check is about whether an
+ * expression is safe to *duplicate at a call site*, a different question
+ * from whether dcc_array_narrow.c's own (separate, narrower) rule set can
+ * bound it. */
+static void record_narrow_return_expr_if_simple(struct Sym *s)
+{
+    long sv_pos;
+    long sv_tok_start;
+    int sv_line;
+    int sv_tok_line;
+    struct Token sv_tok;
+    struct AstNode *body;
+    struct AstNode *ret_expr;
+
+    if (s == NULL || s->proto_nargs != 0 || s->proto_variadic || tok.kind != '{')
+        return;
+    if ((s->type & 15) == TYPE_VOID || type_size(s->type) != 2 ||
+        type_is_bool(s->type) || type_is_struct_object(s->type))
+        return;
+
+    sv_pos = posi;
+    sv_tok_start = tok_start_pos;
+    sv_line = line_no;
+    sv_tok_line = tok_line;
+    sv_tok = tok;
+
+    /* See the identical comment in record_inline_function_if_simple: this
+     * speculatively parses the whole body before any of its own locals are
+     * declared for this pass, so a reference to one can misresolve and
+     * trip a false-positive diagnostic; asm_suppress_depth marks the parse
+     * as inert so dcc_error_at drops it. */
+    asm_suppress_depth++;
+    body = ast_build_stmt(&g_ast_inline_arena);
+    asm_suppress_depth--;
+
+    posi = sv_pos;
+    tok_start_pos = sv_tok_start;
+    line_no = sv_line;
+    tok_line = sv_tok_line;
+    tok = sv_tok;
+
+    ret_expr = inline_return_expr_from_seq(body, 0);
+    if (ret_expr == NULL)
+        return;
+
+    s->narrow_return_expr = ret_expr;
+}
+
+/* Any other static function's body: buffer it too, so it can be dropped at
+ * end-of-file if nothing in this translation unit ever calls it or uses its
+ * address (see emit_needed_deferred_bodies / the deferred_body_needed
+ * marking sites in dcc_ast_gen_expr.c and the global-initializer symbol
+ * resolution in this file). `main` is excluded even though it is never
+ * `static` in valid, idiomatic C: the CRT startup shim below calls it via a
+ * raw fprintf'd `call` that bypasses the AST-based marking entirely, so a
+ * static `main` would otherwise look unreferenced and get silently
+ * dropped. */
+static int plain_static_body_can_be_buffered(struct Sym *s, const char *name)
+{
+    return s != NULL && s->is_static && strcmp(name, "main") != 0;
 }
 
 static void inline_temp_name(char *dst, int dstsz, int index)
@@ -319,7 +521,7 @@ static void reserve_inline_temp_locals(void)
     }
 }
 
-void emit_needed_inline_bodies(void)
+void emit_needed_deferred_bodies(void)
 {
     int i;
 
@@ -328,15 +530,15 @@ void emit_needed_inline_bodies(void)
         int c;
 
         s = &globals[i];
-        if (s->inline_body_file == NULL)
+        if (s->deferred_body_file == NULL)
             continue;
-        if (s->inline_body_needed) {
-            rewind(s->inline_body_file);
-            while ((c = fgetc(s->inline_body_file)) != EOF)
+        if (s->deferred_body_needed) {
+            rewind(s->deferred_body_file);
+            while ((c = fgetc(s->deferred_body_file)) != EOF)
                 fputc(c, outf);
         }
-        fclose(s->inline_body_file);
-        s->inline_body_file = NULL;
+        fclose(s->deferred_body_file);
+        s->deferred_body_file = NULL;
     }
 }
 
@@ -385,9 +587,17 @@ void skip_prototype_array_suffixes(int *ptype)
     memset(g_ptr_array_dims, 0, sizeof(g_ptr_array_dims));
 
     while (accept('[')) {
+        skip_parameter_array_qualifiers();
+
         if (tok.kind == ']') {
             n = 0;
             next_token();
+        } else if (tok.kind == '*') {
+            /* C99 `[*]` unspecified-size VLA marker in a prototype; it decays
+             * to a pointer exactly like `[]`. */
+            next_token();
+            expect(']');
+            n = 0;
         } else {
             n = parse_const_int_expr();
             expect(']');
@@ -1044,6 +1254,259 @@ int local_name_address_taken_ahead(const char *name)
     return 0;
 }
 
+/* Is `name` ever referenced again before the end of the block that
+ * currently encloses the parser's position? Scans forward from here,
+ * tracking brace depth so a name used only in a later, unrelated sibling
+ * block (after this one closes) correctly does not count - the same name
+ * there is out of scope for this declaration regardless of whether it
+ * happens to be a shadowing declaration. A crude "not immediately preceded
+ * by '.' or '->'" guard avoids miscounting a struct/union member access
+ * that merely shares this local's name as a use of the local itself.
+ *
+ * This is a lexical scan (not symbol-table-based, matching
+ * scan_global_write_info's approach for the analogous whole-file
+ * question), so it necessarily overcounts in some cases - a same-named
+ * member access with the guard defeated by an intervening comment or
+ * macro, for instance. Overcounting only means a genuinely-unused local
+ * gets kept (a missed optimization); it can never cause a used local to be
+ * dropped, which is the only direction that would be unsafe. */
+int local_name_used_ahead(const char *name)
+{
+    long sv_pos;
+    long sv_tok_start;
+    int sv_line;
+    int sv_tok_line;
+    struct Token sv_tok;
+    int depth;
+    int prev_was_member_access;
+    int found;
+
+    sv_pos = posi;
+    sv_tok_start = tok_start_pos;
+    sv_line = line_no;
+    sv_tok_line = tok_line;
+    sv_tok = tok;
+
+    depth = 0;
+    found = 0;
+    prev_was_member_access = 0;
+    while (tok.kind != TOK_EOF) {
+        if (tok.kind == '{') {
+            depth++;
+        } else if (tok.kind == '}') {
+            if (depth == 0)
+                break;
+            depth--;
+        } else if (tok.kind == TOK_ID && !strcmp(tok.text, name)) {
+            if (!prev_was_member_access) {
+                found = 1;
+                break;
+            }
+        }
+        prev_was_member_access = (tok.kind == '.' || tok.kind == TOK_ARROW);
+        next_token();
+    }
+
+    posi = sv_pos;
+    tok_start_pos = sv_tok_start;
+    line_no = sv_line;
+    tok_line = sv_tok_line;
+    tok = sv_tok;
+    return found;
+}
+
+/* Purely lexical skip of one declaration statement with NO initializer,
+ * tracking paren/bracket/brace depth to find the terminating top-level
+ * ';' - no symbol-table side effects, no attempt to understand the
+ * declaration. Used only so the speculative narrow-safety walk (see
+ * narrow_build_speculative_scope) can step past a LATER declaration that
+ * ast_build_stmt cannot itself handle.
+ *
+ * Returns 1 (and leaves the token stream just past the ';') only for a
+ * plain, uninitialized declaration - its only content besides the name is
+ * compile-time-constant array dimensions, which by C89 rules cannot
+ * reference a local variable, so it truly cannot alias or escape any name
+ * this analysis cares about. Returns 0 if a top-level '=' is seen anywhere
+ * in the statement: an initializer CAN reference (and so alias/escape) one
+ * of the names being proven narrow-safe - e.g. `int *ip = ai;` aliases
+ * `ai` - and that reference would never reach narrow_name_escapes if this
+ * function silently skipped past it. On a 0 return the token position is
+ * unspecified; the caller aborts the whole speculative parse either way,
+ * so nothing needs to resync it. */
+static int narrow_skip_declaration_statement(void)
+{
+    int depth = 0;
+    while (tok.kind != TOK_EOF) {
+        if (depth == 0 && tok.kind == ';') {
+            next_token();
+            return 1;
+        }
+        if (depth == 0 && tok.kind == '=')
+            return 0;
+        if (tok.kind == '(' || tok.kind == '[' || tok.kind == '{')
+            depth++;
+        else if (tok.kind == ')' || tok.kind == ']' || tok.kind == '}') {
+            if (depth > 0) depth--;
+        }
+        next_token();
+    }
+    return 0;
+}
+
+/* Shared by try_narrow_local_int_array and try_narrow_register_scalar:
+ * speculatively parses the rest of the enclosing block, from the current
+ * position, into an AST. A further local declaration in between (common -
+ * neither the array nor the scalar being proven need be the last local in
+ * the block) is lexically skipped rather than requiring ast_build_stmt to
+ * handle it (declarations are parsed by this file, not the AST builder).
+ * A typedef, or any other construct ast_build_stmt itself declines, still
+ * aborts the whole speculative parse (returns NULL) rather than guessing. */
+static struct AstNode *narrow_build_speculative_scope(struct AstArena *ar)
+{
+    struct AstNode *seq;
+
+    seq = ast_new(ar, AST_COMPOUND);
+    for (;;) {
+        struct AstNode *stmt;
+        if (tok.kind == '}' || tok.kind == TOK_EOF)
+            return seq;
+        if (starts_type() && tok.kind != TOK_TYPEDEF) {
+            if (!narrow_skip_declaration_statement())
+                return NULL;
+            continue;
+        }
+        stmt = ast_build_stmt(ar);
+        if (stmt == NULL)
+            return NULL;
+        ast_list_push(ar, seq, stmt);
+    }
+}
+
+/* Speculatively parses the rest of the enclosing block (from the current
+ * position, which must be right after an eligible array declarator with no
+ * initializer) into an AST, then asks dcc_array_narrow.c whether every
+ * value ever stored into `name` is provably in [0,255]. Always rewinds the
+ * lexer position and every per-function counter that must stay in sync
+ * between this (scan) pass and the later, independent codegen pass
+ * (gen_local_decl_after_type must reach the identical conclusion using the
+ * identical scratch parse, since both determine the same array's frame
+ * size/offset independently - see the frame-sizing comments in
+ * parse_function_or_global).
+ *
+ * Bails (returns 0, the safe default) if the speculative parse cannot
+ * reach the block's closing brace - e.g. some construct ast_build_stmt
+ * cannot handle at all - rather than guess. */
+int try_narrow_local_int_array(const char *name, int type, int arrlen, int total_elems)
+{
+    long sv_pos, sv_tok_start;
+    int sv_line, sv_tok_line;
+    struct Token sv_tok;
+    int sv_nulabels, sv_for_seq, sv_forren_n, sv_for_decl_seq, sv_for_decl_rename_index;
+    int sv_for_decl_recording, sv_scope_depth, sv_compound_literal_seq, sv_licm_seq;
+    static struct AstArena narrow_scratch_arena;
+    static int narrow_scratch_inited;
+    struct AstNode *seq;
+    int result;
+
+    if ((type & 15) != TYPE_INT || type_ptr_depth(type) != 0 || type_is_struct_object(type) ||
+        (arrlen <= 0 && total_elems <= 0) || tok.kind == '=' || g_last_array_dim_count > 1)
+        return 0;
+
+    if (!narrow_scratch_inited) {
+        ast_arena_init(&narrow_scratch_arena);
+        narrow_scratch_inited = 1;
+    }
+    ast_arena_reset(&narrow_scratch_arena);
+
+    sv_pos = posi; sv_tok_start = tok_start_pos;
+    sv_line = line_no; sv_tok_line = tok_line;
+    sv_tok = tok;
+    sv_nulabels = nulabels;
+    sv_for_seq = g_for_seq; sv_forren_n = g_forren_n;
+    sv_for_decl_seq = g_for_decl_seq; sv_for_decl_rename_index = g_for_decl_rename_index;
+    sv_for_decl_recording = g_for_decl_recording; sv_scope_depth = g_scope_depth;
+    sv_compound_literal_seq = g_compound_literal_seq; sv_licm_seq = g_licm_seq;
+
+    /* Same rationale as record_narrow_return_expr_if_simple: this walks
+     * forward through code whose later declarations (if any follow) have
+     * not been (re-)entered into the symbol table for this pass, so a
+     * reference to one can misresolve and trip a false-positive diagnostic;
+     * asm_suppress_depth marks the parse as inert so dcc_error_at drops it. */
+    asm_suppress_depth++;
+    seq = narrow_build_speculative_scope(&narrow_scratch_arena);
+    asm_suppress_depth--;
+    result = (seq != NULL) ? narrow_array_is_byte_safe(seq, name) : 0;
+
+    posi = sv_pos; tok_start_pos = sv_tok_start;
+    line_no = sv_line; tok_line = sv_tok_line;
+    tok = sv_tok;
+    nulabels = sv_nulabels;
+    g_for_seq = sv_for_seq; g_forren_n = sv_forren_n;
+    g_for_decl_seq = sv_for_decl_seq; g_for_decl_rename_index = sv_for_decl_rename_index;
+    g_for_decl_recording = sv_for_decl_recording; g_scope_depth = sv_scope_depth;
+    g_compound_literal_seq = sv_compound_literal_seq; g_licm_seq = sv_licm_seq;
+
+    return result;
+}
+
+/* Scalar counterpart of try_narrow_local_int_array: proves a plain
+ * register-qualified int local's own value (not an array's elements) is
+ * always in [0,255], so its storage can narrow to unsigned char - e.g.
+ * e.c's `register int n`, which this same engine already has to bound
+ * anyway as a dependency of proving `a[]` narrow-safe (n is a %-divisor).
+ * is_register is captured by the caller (from decl_is_register) rather
+ * than read here, since nothing this function calls is expected to touch
+ * that global, but relying on a value already in hand is more robust than
+ * re-reading a global after a speculative parse. */
+int try_narrow_register_scalar(const char *name, int type, int is_register,
+                               int arrlen, int total_elems)
+{
+    long sv_pos, sv_tok_start;
+    int sv_line, sv_tok_line;
+    struct Token sv_tok;
+    int sv_nulabels, sv_for_seq, sv_forren_n, sv_for_decl_seq, sv_for_decl_rename_index;
+    int sv_for_decl_recording, sv_scope_depth, sv_compound_literal_seq, sv_licm_seq;
+    static struct AstArena narrow_scalar_scratch_arena;
+    static int narrow_scalar_scratch_inited;
+    struct AstNode *seq;
+    int result;
+
+    if (!is_register || (type & 15) != TYPE_INT || type_ptr_depth(type) != 0 ||
+        type_is_struct_object(type) || arrlen > 0 || total_elems > 0 || tok.kind == '=')
+        return 0;
+
+    if (!narrow_scalar_scratch_inited) {
+        ast_arena_init(&narrow_scalar_scratch_arena);
+        narrow_scalar_scratch_inited = 1;
+    }
+    ast_arena_reset(&narrow_scalar_scratch_arena);
+
+    sv_pos = posi; sv_tok_start = tok_start_pos;
+    sv_line = line_no; sv_tok_line = tok_line;
+    sv_tok = tok;
+    sv_nulabels = nulabels;
+    sv_for_seq = g_for_seq; sv_forren_n = g_forren_n;
+    sv_for_decl_seq = g_for_decl_seq; sv_for_decl_rename_index = g_for_decl_rename_index;
+    sv_for_decl_recording = g_for_decl_recording; sv_scope_depth = g_scope_depth;
+    sv_compound_literal_seq = g_compound_literal_seq; sv_licm_seq = g_licm_seq;
+
+    asm_suppress_depth++;
+    seq = narrow_build_speculative_scope(&narrow_scalar_scratch_arena);
+    asm_suppress_depth--;
+    result = (seq != NULL) ? narrow_scalar_is_byte_safe(seq, name) : 0;
+
+    posi = sv_pos; tok_start_pos = sv_tok_start;
+    line_no = sv_line; tok_line = sv_tok_line;
+    tok = sv_tok;
+    nulabels = sv_nulabels;
+    g_for_seq = sv_for_seq; g_forren_n = sv_forren_n;
+    g_for_decl_seq = sv_for_decl_seq; g_for_decl_rename_index = sv_for_decl_rename_index;
+    g_for_decl_recording = sv_for_decl_recording; g_scope_depth = sv_scope_depth;
+    g_compound_literal_seq = sv_compound_literal_seq; g_licm_seq = sv_licm_seq;
+
+    return result;
+}
+
 void scan_local_decl_after_type(int base)
 {
     int type, bytes, arrlen;
@@ -1139,6 +1602,21 @@ void scan_local_decl_after_type(int base)
             total_elems = g_typedef_array_len;
         }
 
+        if (try_narrow_local_int_array(name, type, arrlen, total_elems)) {
+            type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
+            /* first_stride_bytes (see parse_array_declarator_dims) was
+             * computed from the pre-narrowing int element size and is still
+             * sitting in current_field_array_elem_size; a single-dimension
+             * array (guaranteed by the g_last_array_dim_count > 1 eligibility
+             * check above) has no real per-row stride distinct from the
+             * element size, so clearing it makes the Sym.elem_size ternary
+             * below fall through to type_size(type), matching the narrowed
+             * type instead of silently keeping the stale, too-wide stride. */
+            current_field_array_elem_size = 0;
+        } else if (try_narrow_register_scalar(name, type, decl_is_register, arrlen, total_elems)) {
+            type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
+        }
+
         bytes = type_size(type);
         if (total_elems > 0) bytes *= total_elems;
 
@@ -1158,8 +1636,11 @@ void scan_local_decl_after_type(int base)
             s = try_const_fold_local(name, source_name, type,
                                      arrlen != 0 || g_last_array_dim_count != 0);
 
+        {
+        int freshly_allocated = 0;
         if (!s) {
             s = add_local_alloc(name, type, bytes);
+            freshly_allocated = 1;
             if (arrlen > 0 || g_last_array_dim_count > 0) {
                 s->is_array = 1;
                 s->array_len = arrlen;
@@ -1177,7 +1658,21 @@ void scan_local_decl_after_type(int base)
         g_ptr_array_dim_count = 0;
         g_ptr_array_elem_size = 0;
 
-        if (s && !s->is_const_value && accept('=')) scan_initializer_or_decl_tail();
+        if (s && !s->is_const_value && accept('=')) {
+            scan_initializer_or_decl_tail();
+        } else if (freshly_allocated && !local_name_used_ahead(source_name)) {
+            /* No initializer, and never referenced again in this scope:
+             * add_local_alloc just appended this Sym as the last local and
+             * reserved its frame space, so popping both back off is safe -
+             * nothing later in this same declarator loop has allocated
+             * anything above it yet. freshly_allocated (rather than just
+             * !s->is_const_value) guards against the redefinition-error
+             * recovery case, where s is an unrelated pre-existing symbol and
+             * bytes/nlocals do not describe it. */
+            nlocals--;
+            local_size -= bytes;
+        }
+        }
 
         if (!accept(',')) break;
     }
@@ -1566,6 +2061,13 @@ int parse_global_init_atom(long *val, char *label, int labelsz)
             struct Sym *ls;
             const char *lname;
             ls = find_sym(tok.text);
+            /* A global initializer that names a function (e.g. a function-
+             * pointer table) is a real reference: this bypasses the normal
+             * runtime expression codegen entirely, so it must mark the
+             * function needed itself rather than relying on the ast_gen_expr
+             * SC_FUNC hook. */
+            if (ls != NULL && ls->storage == SC_FUNC && ls->is_static)
+                ls->deferred_body_needed = 1;
             lname = ls ? sym_asm_name(ls) : tok.text;
             if (label && labelsz > 0) {
                 strncpy(label, lname, labelsz - 1);
@@ -2797,6 +3299,7 @@ void parse_function_or_global(int base_type)
                 g_current_compiling_func[sizeof(g_current_compiling_func) - 1] = 0;
 
                 record_inline_function_if_simple(s);
+                record_narrow_return_expr_if_simple(s);
                 if (function_body_mentions_multiuse_inline_call())
                     reserve_inline_temp_locals();
 
@@ -2884,11 +3387,11 @@ void parse_function_or_global(int base_type)
                 if (static_inline_body_can_be_buffered(s)) {
                     FILE *saved_outf;
 
-                    s->inline_body_file = tmpfile();
-                    if (s->inline_body_file == NULL)
-                        fatal("cannot create inline body temp file");
+                    s->deferred_body_file = tmpfile();
+                    if (s->deferred_body_file == NULL)
+                        fatal("cannot create deferred body temp file");
                     saved_outf = outf;
-                    outf = s->inline_body_file;
+                    outf = s->deferred_body_file;
                     g_inline_body_buffering++;
                     emit_function_prologue(name, current_local_bytes, current_function_safe_to_omit_ix(type, current_local_bytes));
                     gen_compound();
@@ -2903,6 +3406,21 @@ void parse_function_or_global(int base_type)
                                                                saved_nlocals, saved_local_size)) {
                     /* No-IX-frame body already generated and written to outf
                      * inside try_speculative_noix_function_body. */
+                } else if (plain_static_body_can_be_buffered(s, name)) {
+                    FILE *saved_outf;
+
+                    s->deferred_body_file = tmpfile();
+                    if (s->deferred_body_file == NULL)
+                        fatal("cannot create deferred body temp file");
+                    saved_outf = outf;
+                    outf = s->deferred_body_file;
+                    g_inline_body_buffering++;
+                    emit_function_prologue(name, current_local_bytes, current_function_safe_to_omit_ix(type, current_local_bytes));
+                    gen_compound();
+                    check_undefined_user_labels();
+                    emit_function_epilogue(0);
+                    g_inline_body_buffering--;
+                    outf = saved_outf;
                 } else {
                     emit_function_prologue(name, current_local_bytes, current_function_safe_to_omit_ix(type, current_local_bytes));
                     gen_compound();

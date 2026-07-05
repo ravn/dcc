@@ -2,6 +2,7 @@
 
 int counter = 0;
 int slots[5];
+int gcounter = 0;
 
 struct Pair {
     int left;
@@ -71,6 +72,46 @@ static inline void store_pair(int *dst, int a, int b)
     dst[1] = dst[1] + b;
 }
 
+/* Early-return if-chain whose final return expression has a side effect
+ * (postfix increment on a global) - the increment must run exactly once
+ * per call, in the returned expression's evaluation order. */
+static inline int next_and_mark(void)
+{
+    if (gcounter > 100) return -1;
+    return gcounter++;
+}
+
+/* If-branch body with a leading side-effect statement before its return -
+ * folded into a comma expression rather than a bare return-or-ternary. */
+static inline int bump_if(int k)
+{
+    if (k > 0) { gcounter++; return 1; }
+    return 0;
+}
+
+int stack2[8];
+int sp2 = 0;
+
+static void note_overflow(void)
+{
+    gcounter = gcounter + 1000;
+}
+
+/* A side-effect-only guard with no else and no return of its own (e.g.
+ * an out-of-line bounds check that calls a helper before falling through
+ * to the real work) - distinct from the early-return if-chains above. */
+static inline void guard_push(int v)
+{
+    if (sp2 >= 4) note_overflow();
+    stack2[sp2++] = v;
+}
+
+static inline int guard_pop(void)
+{
+    if (sp2 <= 0) note_overflow();
+    return stack2[--sp2];
+}
+
 int main(void)
 {
     struct Pair pair;
@@ -88,6 +129,9 @@ int main(void)
     int (*fp)(int);
     int via_ptr;
     int local_ok;
+    int seq_ok;
+    int bump_ok;
+    int guard_sum;
 
     pair.left = 44;
     pair.right = 77;
@@ -111,6 +155,16 @@ int main(void)
     fp = plus5;
     via_ptr = fp(6);
     local_ok = local_helper(8);
-    printf("inline temps: %d %d %d %d %d %d %d %d %d %d %d\n", result, bigger, clamped, field, wide_ok, float_ok, stored, stored2, via_ptr, local_ok, counter);
+    seq_ok = next_and_mark();
+    seq_ok += next_and_mark() * 10;
+    bump_ok = bump_if(5);
+    bump_ok += bump_if(-1) * 10;
+    guard_push(7);
+    guard_push(8);
+    guard_push(9);
+    guard_push(10);
+    guard_push(11);
+    guard_sum = guard_pop() + guard_pop() + guard_pop() + guard_pop() + guard_pop();
+    printf("inline temps: %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", result, bigger, clamped, field, wide_ok, float_ok, stored, stored2, via_ptr, local_ok, counter, seq_ok, bump_ok, gcounter, guard_sum, sp2);
     return 0;
 }
