@@ -124,6 +124,18 @@ done
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 script_asset_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 
+# If `ntvcm` isn't already on PATH, add the sibling ntvcm/ directory from the
+# surrounding z80 workspace (dcc lives at <workspace>/dcc, ntvcm at
+# <workspace>/ntvcm).  Derived from the repo location so it works on any host
+# (e.g. /Users/ravn/z80 or /home/ravn/z80) without hardcoding.
+if ! command -v ntvcm >/dev/null 2>&1; then
+    workspace_root=$(CDPATH= cd -- "$script_asset_root/.." && pwd)
+    if [ -x "$workspace_root/ntvcm/ntvcm" ]; then
+        PATH="$workspace_root/ntvcm:$PATH"
+        export PATH
+    fi
+fi
+
 trim() {
     printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
