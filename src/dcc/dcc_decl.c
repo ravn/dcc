@@ -5,21 +5,19 @@
  * arrays, structs/unions and bitfields, brace-enclosed initializer lists, and
  * const-scalar folding of local initializers into immediates.
  *
- * MODULE: compiled as its own translation unit; shared declarations are in dcc.h.
+ * MODULE: compiled as its own translation unit; E-register allocation state is
+ * declared in dcc_regalloc_internal.h.
  * Source provenance: monolith src/ddc.c lines 13128-13991.
  */
 
 #include "dcc.h"
+#include "dcc_regalloc_internal.h"
 #include "dcc_ast.h"
 int parse_float_init_literal(unsigned long *bits)
 {
     int sign;
     char lit[MAX_TOK_TEXT + 2];
-    long save_pos;
-    long save_tok_start;
-    int save_line;
-    int save_tok_line;
-    struct Token save_tok;
+    LexState _ls;
 
     /*
      * This helper is only for the compact constant-initializer fast path.
@@ -28,47 +26,39 @@ int parse_float_init_literal(unsigned long *bits)
      * then it is not a complete initializer.  Rewind and let gen_expr()
      * compile the full expression.
      */
-    save_pos = posi;
-    save_tok_start = tok_start_pos;
-    save_line = line_no;
-    save_tok_line = tok_line;
-    save_tok = tok;
+    _ls = lex_save();
 
     sign = 1;
-    if (tok.kind == '-') {
+    if (g_lex.tok.kind == '-') {
         sign = -1;
         next_token();
-    } else if (tok.kind == '+') {
+    } else if (g_lex.tok.kind == '+') {
         next_token();
     }
 
-    if (tok.kind == TOK_FLOATLIT) {
+    if (g_lex.tok.kind == TOK_FLOATLIT) {
         if (sign < 0) {
             lit[0] = '-';
-            strncpy(lit + 1, tok.text, MAX_TOK_TEXT);
+            strncpy(lit + 1, g_lex.tok.text, MAX_TOK_TEXT);
             lit[MAX_TOK_TEXT] = 0;
             bits[0] = parse_float_literal_bits(lit);
         } else {
-            bits[0] = parse_float_literal_bits(tok.text);
+            bits[0] = parse_float_literal_bits(g_lex.tok.text);
         }
         next_token();
 
-        if (tok.kind == ';' || tok.kind == ',' || tok.kind == '}')
+        if (g_lex.tok.kind == ';' || g_lex.tok.kind == ',' || g_lex.tok.kind == '}')
             return 1;
 
-        posi = save_pos;
-        tok_start_pos = save_tok_start;
-        line_no = save_line;
-        tok_line = save_tok_line;
-        tok = save_tok;
+        lex_restore(&_ls);
         return 0;
     }
 
-    if (tok.kind == TOK_NUM || tok.kind == TOK_CHARLIT) {
+    if (g_lex.tok.kind == TOK_NUM || g_lex.tok.kind == TOK_CHARLIT) {
         double d;
         union { float f; unsigned char b[4]; } u;
         unsigned long v;
-        d = (double)(sign * tok.val);
+        d = (double)(sign * g_lex.tok.val);
         u.f = (float)d;
         v = ((unsigned long)u.b[0]) |
             ((unsigned long)u.b[1] << 8) |
@@ -77,22 +67,14 @@ int parse_float_init_literal(unsigned long *bits)
         bits[0] = v;
         next_token();
 
-        if (tok.kind == ';' || tok.kind == ',' || tok.kind == '}')
+        if (g_lex.tok.kind == ';' || g_lex.tok.kind == ',' || g_lex.tok.kind == '}')
             return 1;
 
-        posi = save_pos;
-        tok_start_pos = save_tok_start;
-        line_no = save_line;
-        tok_line = save_tok_line;
-        tok = save_tok;
+        lex_restore(&_ls);
         return 0;
     }
 
-    posi = save_pos;
-    tok_start_pos = save_tok_start;
-    line_no = save_line;
-    tok_line = save_tok_line;
-    tok = save_tok;
+    lex_restore(&_ls);
     return 0;
 }
 
@@ -108,23 +90,15 @@ int type_is_const_scalar_candidate(int type)
 
 int try_parse_local_const_initializer(int type, unsigned long *valuep)
 {
-    long save_pos;
-    long save_tok_start;
-    int save_line;
-    int save_tok_line;
+    LexState _ls;
     int save_errors;
     int save_long_suffix;
     int save_unsigned_suffix;
-    struct Token save_tok;
 
-    save_pos = posi;
-    save_tok_start = tok_start_pos;
-    save_line = line_no;
-    save_tok_line = tok_line;
+    _ls = lex_save();
     save_errors = errors;
     save_long_suffix = g_tok_long_suffix;
     save_unsigned_suffix = g_tok_unsigned_suffix;
-    save_tok = tok;
 
     if (type_is_float(type)) {
         unsigned long bits;
@@ -135,7 +109,7 @@ int try_parse_local_const_initializer(int type, unsigned long *valuep)
     } else {
         struct ConstVal cv;
         if (try_parse_const_expr_value(&cv) &&
-            (tok.kind == ';' || tok.kind == ',' || tok.kind == '}') &&
+            (g_lex.tok.kind == ';' || g_lex.tok.kind == ',' || g_lex.tok.kind == '}') &&
             errors == save_errors) {
             cf_cast_to_type(&cv, type);
             valuep[0] = cv.u;
@@ -143,14 +117,10 @@ int try_parse_local_const_initializer(int type, unsigned long *valuep)
         }
     }
 
-    posi = save_pos;
-    tok_start_pos = save_tok_start;
-    line_no = save_line;
-    tok_line = save_tok_line;
+    lex_restore(&_ls);
     errors = save_errors;
     g_tok_long_suffix = save_long_suffix;
     g_tok_unsigned_suffix = save_unsigned_suffix;
-    tok = save_tok;
     return 0;
 }
 
@@ -168,30 +138,22 @@ int try_parse_local_const_initializer(int type, unsigned long *valuep)
 struct Sym *try_const_fold_local(const char *store_name, const char *src_name,
                                  int type, int has_array)
 {
-    long save_pos;
-    long save_tok_start;
-    int save_line;
-    int save_tok_line;
+    LexState _ls;
     int save_errors;
     int save_long_suffix;
     int save_unsigned_suffix;
-    struct Token save_tok;
     unsigned long const_value;
     struct Sym *s;
 
-    if (!decl_is_const || has_array ||
-        !type_is_const_scalar_candidate(type) || tok.kind != '=' ||
+    if (!g_decl.is_const || g_decl.is_volatile || has_array ||
+        !type_is_const_scalar_candidate(type) || g_lex.tok.kind != '=' ||
         local_name_address_taken_ahead(src_name))
         return NULL;
 
-    save_pos = posi;
-    save_tok_start = tok_start_pos;
-    save_line = line_no;
-    save_tok_line = tok_line;
+    _ls = lex_save();
     save_errors = errors;
     save_long_suffix = g_tok_long_suffix;
     save_unsigned_suffix = g_tok_unsigned_suffix;
-    save_tok = tok;
 
     next_token();   /* consume '=' */
     if (try_parse_local_const_initializer(type, &const_value)) {
@@ -202,14 +164,10 @@ struct Sym *try_const_fold_local(const char *store_name, const char *src_name,
     }
 
     /* Not a compile-time constant: rewind to the '=' for the caller. */
-    posi = save_pos;
-    tok_start_pos = save_tok_start;
-    line_no = save_line;
-    tok_line = save_tok_line;
+    lex_restore(&_ls);
     errors = save_errors;
     g_tok_long_suffix = save_long_suffix;
     g_tok_unsigned_suffix = save_unsigned_suffix;
-    tok = save_tok;
     return NULL;
 }
 
@@ -219,7 +177,7 @@ void emit_load_const_sym_value(struct Sym *s)
 
     if (type_is_float(s->type)) {
         emit_load_float_bits(s->const_value);
-        g_expr_type = TYPE_FLOAT;
+        g_expr.type = TYPE_FLOAT;
         return;
     }
 
@@ -231,44 +189,32 @@ int parse_global_init_atom(long *val, char *label, int labelsz);
 
 int try_parse_auto_const_init_value(int type, long *valuep)
 {
-    long save_pos;
-    long save_tok_start;
-    int save_line;
-    int save_tok_line;
+    LexState _ls;
     int save_errors;
     int save_long_suffix;
     int save_unsigned_suffix;
-    struct Token save_tok;
     struct ConstVal cv;
 
-    if (tok.kind == TOK_ID || tok.kind == TOK_STR || tok.kind == TOK_WSTR)
+    if (g_lex.tok.kind == TOK_ID || g_lex.tok.kind == TOK_STR || g_lex.tok.kind == TOK_WSTR)
         return 0;
 
-    save_pos = posi;
-    save_tok_start = tok_start_pos;
-    save_line = line_no;
-    save_tok_line = tok_line;
+    _ls = lex_save();
     save_errors = errors;
     save_long_suffix = g_tok_long_suffix;
     save_unsigned_suffix = g_tok_unsigned_suffix;
-    save_tok = tok;
 
     if (try_parse_const_expr_value(&cv) &&
-        (tok.kind == ',' || tok.kind == '}') &&
+        (g_lex.tok.kind == ',' || g_lex.tok.kind == '}') &&
         errors == save_errors) {
         cf_cast_to_type(&cv, type);
         valuep[0] = (long)cv.u;
         return 1;
     }
 
-    posi = save_pos;
-    tok_start_pos = save_tok_start;
-    line_no = save_line;
-    tok_line = save_tok_line;
+    lex_restore(&_ls);
     errors = save_errors;
     g_tok_long_suffix = save_long_suffix;
     g_tok_unsigned_suffix = save_unsigned_suffix;
-    tok = save_tok;
     return 0;
 }
 
@@ -289,11 +235,11 @@ void emit_store_const_to_local_array_elem(struct Sym *s, int elem_type, int inde
     if (type_size(elem_type) == 4) {
         unsigned long uv;
         uv = (unsigned long)v;
-        fprintf(outf, "\tld hl,%lu\n", uv & 0xffffUL);
-        fprintf(outf, "\tld de,%lu\n", (uv >> 16) & 0xffffUL);
+        fprintf(g_emit_sink.stream, "\tld hl,%lu\n", uv & 0xffffUL);
+        fprintf(g_emit_sink.stream, "\tld de,%lu\n", (uv >> 16) & 0xffffUL);
         emit_store_de_to_addr_hl(elem_type);
     } else {
-        fprintf(outf, "\tld hl,%ld\n", v & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld hl,%ld\n", v & 0xffffL);
         emit("\tex de,hl\n\tpop hl\n");
         emit_store_de_to_addr_hl(elem_type);
     }
@@ -301,57 +247,128 @@ void emit_store_const_to_local_array_elem(struct Sym *s, int elem_type, int inde
 
 void emit_store_const_to_local_offset(struct Sym *s, int off, int type, long v)
 {
+    unsigned long uv;
+
     if (type_is_bool(type))
         v = v ? 1 : 0;
+
+    if (local_offset_can_ix_direct(s, off, type_size(type))) {
+        /* Constant initializer at a frame-relative offset that fits
+         * (ix+d) directly (the plain scalar case, off == 0, but also an
+         * in-range array element or struct member): write the immediate
+         * bytes straight to their frame slots - no address computation
+         * and no register round-trip needed at all, unlike the generic
+         * path below. */
+        int d = s->offset + off;
+        uv = (unsigned long)v;
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),%lu\n", d, uv & 0xffUL);
+        if (type_size(type) >= 2)
+            fprintf(g_emit_sink.stream, "\tld (ix%+d),%lu\n", d + 1, (uv >> 8) & 0xffUL);
+        if (type_size(type) == 4) {
+            fprintf(g_emit_sink.stream, "\tld (ix%+d),%lu\n", d + 2, (uv >> 16) & 0xffUL);
+            fprintf(g_emit_sink.stream, "\tld (ix%+d),%lu\n", d + 3, (uv >> 24) & 0xffUL);
+        }
+        return;
+    }
 
     emit_load_sym_addr(s);
     emit_add_const_to_hl(off);
     emit("\tpush hl\n");
 
     if (type_size(type) == 4) {
-        unsigned long uv;
         uv = (unsigned long)v;
-        fprintf(outf, "\tld hl,%lu\n", uv & 0xffffUL);
-        fprintf(outf, "\tld de,%lu\n", (uv >> 16) & 0xffffUL);
+        fprintf(g_emit_sink.stream, "\tld hl,%lu\n", uv & 0xffffUL);
+        fprintf(g_emit_sink.stream, "\tld de,%lu\n", (uv >> 16) & 0xffffUL);
         emit_store_de_to_addr_hl(type);
     } else {
-        fprintf(outf, "\tld hl,%ld\n", v & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld hl,%ld\n", v & 0xffffL);
         emit("\tex de,hl\n\tpop hl\n");
         emit_store_de_to_addr_hl(type);
     }
 }
 
+/* Store HL (or DE:HL for a 4-byte type) directly at frame-relative
+ * s->offset + off, once local_offset_can_ix_direct has confirmed it fits
+ * (ix+d). Mirrors emit_store_hl_to_sym_direct's plain-ix-direct byte
+ * layout, generalized to a possibly-nonzero offset (an array element or
+ * struct member) rather than just the whole of s's own extent. */
+static void emit_store_hl_direct_at(struct Sym *s, int off, int type)
+{
+    int d = s->offset + off;
+    if (type_size(type) == 1) {
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),l\n", d);
+    } else if (type_size(type) == 4) {
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),l\n", d);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),h\n", d + 1);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),e\n", d + 2);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),d\n", d + 3);
+    } else {
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),l\n", d);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),h\n", d + 1);
+    }
+}
+
 void emit_store_expr_to_local_offset(struct Sym *s, int off, int type)
 {
-    emit_load_sym_addr(s);
-    emit_add_const_to_hl(off);
-    emit("\tpush hl\n");
+    /* Fast path: a frame-relative offset (the plain scalar case, off == 0,
+     * but also an in-range array element or struct member) that fits
+     * (ix+d) directly. The generic path below computes the destination
+     * address into HL, pushes it, evaluates the initializer, then stores
+     * back through the pushed address - wasteful push/pop-heavy address
+     * arithmetic for what a direct store can do once the value is in
+     * HL/DE:HL. This is exactly the codegen a separate `T x; x = expr;`
+     * assignment already gets via gen_assign_ast's sym_can_ix_direct fast
+     * paths; declaration-with-initializer (and array/struct member
+     * initializers) never shared it. */
+    int fast = local_offset_can_ix_direct(s, off, type_size(type));
+
+    if (!fast) {
+        emit_load_sym_addr(s);
+        emit_add_const_to_hl(off);
+        emit("\tpush hl\n");
+    }
 
     ast_emit_init_expr();
 
     if (type_is_bool(type)) {
-        if (!type_is_bool(g_expr_type))
-            emit_bool_normalize_hl(g_expr_type);
+        if (!type_is_bool(g_expr.type))
+            emit_bool_normalize_hl(g_expr.type);
+        if (fast) {
+            emit_store_hl_direct_at(s, off, type);
+            return;
+        }
         emit("\tex de,hl\n\tpop hl\n");
         emit_store_de_to_addr_hl(type);
         return;
     }
 
     if (type_is_long(type)) {
-        if (type_is_float(g_expr_type))
+        if (type_is_float(g_expr.type))
             emit_convert_float_to_intlike(type);
-        else if (!type_is_long(g_expr_type))
-            emit_extend_to_long_typed(g_expr_type);
+        else if (!type_is_long(g_expr.type))
+            emit_extend_to_long_typed(g_expr.type);
+        if (fast) {
+            emit_store_hl_direct_at(s, off, type);
+            return;
+        }
         emit_store_de_to_addr_hl(type);
     } else if (type_is_float(type)) {
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
+        if (fast) {
+            emit_store_hl_direct_at(s, off, type);
+            return;
+        }
         emit_store_de_to_addr_hl(type);
     } else {
-        if (type_is_float(g_expr_type))
+        if (type_is_float(g_expr.type))
             emit_convert_float_to_intlike(type);
-        else if (type_size(type) > 1 && !type_is_long(g_expr_type))
-            emit_promote_byte_to_int(g_expr_type);
+        else if (type_size(type) > 1 && !type_is_long(g_expr.type))
+            emit_promote_byte_to_int(g_expr.type);
+        if (fast) {
+            emit_store_hl_direct_at(s, off, type);
+            return;
+        }
         emit("\tex de,hl\n\tpop hl\n");
         emit_store_de_to_addr_hl(type);
     }
@@ -373,12 +390,10 @@ void emit_zero_local_bytes(struct Sym *s, int off, int count)
         emit_store_const_to_local_offset(s, off + i, TYPE_CHAR | TYPE_UNSIGNED, 0);
 }
 
-void emit_init_auto_char_array_at_offset_from_string(struct Sym *s, int baseoff, int count, const char *str)
+void emit_init_auto_char_array_at_offset_from_string(struct Sym *s, int baseoff, int count, const char *str, int n)
 {
     int i;
-    int n;
 
-    n = (int)strlen(str);
     if (count <= 0)
         return;
 
@@ -399,6 +414,91 @@ void emit_init_auto_char_array_at_offset_from_string(struct Sym *s, int baseoff,
 
 void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type);
 void skip_initializer_or_decl_tail(void);
+static void emit_init_auto_struct_array_field(struct Sym *s, int baseoff, struct FieldDef *fd);
+
+int emit_init_auto_struct_chained_designator(struct Sym *s, int baseoff, struct FieldDef *fd)
+{
+    int off;
+    int type;
+    int elem_size;
+    int is_array;
+    int count;
+
+    off = baseoff + fd->offset;
+    type = fd->is_array ? fd->elem_type : fd->type;
+    elem_size = fd->elem_size ? fd->elem_size : type_size(type);
+    if (elem_size <= 0) elem_size = 2;
+    is_array = fd->is_array;
+    count = fd->array_len;
+
+    if (g_lex.tok.kind != '[' && g_lex.tok.kind != '.')
+        return 0;
+
+    for (;;) {
+        if (g_lex.tok.kind == '[') {
+            int idx;
+            if (!is_array) {
+                error_here("subscripted initializer designator is not an array");
+                skip_initializer_or_decl_tail();
+                return 1;
+            }
+            next_token();
+            idx = parse_typed_designator_index_expr();
+            expect(']');
+            if (idx < 0) {
+                error_here("negative array initializer designator");
+                idx = 0;
+            } else if (count > 0 && idx >= count) {
+                error_here("array initializer designator out of range");
+                idx = 0;
+            }
+            off += idx * elem_size;
+            is_array = 0;
+        } else if (g_lex.tok.kind == '.') {
+            struct FieldDef *sub;
+            int sid;
+            if (!((type & TYPE_STRUCT) && type_ptr_depth(type) == 0)) {
+                error_here("field initializer designator is not a struct");
+                skip_initializer_or_decl_tail();
+                return 1;
+            }
+            next_token();
+            if (g_lex.tok.kind != TOK_ID) {
+                error_here("expected a field designator, such as '.field = value'");
+                skip_initializer_or_decl_tail();
+                return 1;
+            }
+            sid = type_struct_id(type);
+            sub = find_field_def(sid, g_lex.tok.text);
+            if (sub == NULL) {
+                error_here("unknown field initializer designator");
+                skip_initializer_or_decl_tail();
+                return 1;
+            }
+            off += sub->offset;
+            type = sub->is_array ? sub->elem_type : sub->type;
+            elem_size = sub->elem_size ? sub->elem_size : type_size(type);
+            if (elem_size <= 0) elem_size = 2;
+            is_array = sub->is_array;
+            count = sub->array_len;
+            fd = sub;
+            next_token();
+        } else {
+            break;
+        }
+    }
+
+    expect('=');
+    if (is_array)
+        emit_init_auto_struct_array_field(s, off, fd);
+    else if ((type & TYPE_STRUCT) && type_ptr_depth(type) == 0)
+        emit_init_auto_struct_type(s, off, type);
+    else if (fd->bit_width > 0)
+        error_here("bitfield chained initializer designator unsupported");
+    else
+        emit_init_auto_struct_scalar(s, off, type);
+    return 1;
+}
 
 void emit_init_auto_struct_scalar(struct Sym *s, int off, int type)
 {
@@ -423,6 +523,146 @@ void emit_init_auto_struct_scalar(struct Sym *s, int off, int type)
         emit_store_expr_to_local_offset(s, off, type);
 }
 
+static int field_array_elems_from_level(struct FieldDef *fd, int level)
+{
+    int i;
+    int n;
+
+    if (fd->dim_count <= 0)
+        return fd->array_len;
+
+    if (level < 0)
+        level = 0;
+    if (level >= fd->dim_count)
+        return 1;
+
+    n = 1;
+    for (i = level; i < fd->dim_count; ++i) {
+        if (fd->dims[i] <= 0)
+            return fd->array_len;
+        n *= fd->dims[i];
+    }
+    return n;
+}
+
+static void emit_init_auto_struct_array_leaf(struct Sym *s, int off, int elem_type)
+{
+    if ((elem_type & TYPE_STRUCT) && type_ptr_depth(elem_type) == 0)
+        emit_init_auto_struct_type(s, off, elem_type);
+    else
+        emit_init_auto_struct_scalar(s, off, elem_type);
+}
+
+static void emit_init_auto_struct_array_field_level(struct Sym *s, int baseoff,
+                                                   struct FieldDef *fd,
+                                                   int *np, int level)
+{
+    int start;
+    int limit;
+    int maxn;
+    int leaf_size;
+    int total;
+    int had_brace;
+
+    leaf_size = type_size(fd->elem_type);
+    if (leaf_size <= 0) leaf_size = 2;
+
+    /* Total number of scalar leaves in the whole array member.  Every store /
+     * zero-fill offset is bounded by this so an over-long (already erroneous)
+     * initializer can never write past the object. */
+    total = field_array_elems_from_level(fd, 0);
+
+    /*
+     * A brace at this position opens a sub-aggregate for this level.  When it
+     * is absent the initializer is brace-elided (C99 6.7.9p20): consume only
+     * as many elements as this level holds, then hand the separating comma and
+     * any remaining elements back to the caller so sibling subobjects (or the
+     * enclosing struct's later members) get them.  Inner levels are only
+     * entered when the current token is '{', so had_brace is effectively
+     * always true there; the elided path only matters at the member's top
+     * level (e.g. `struct Dist x = { 1, 2, 3, 4 };`).
+     */
+    had_brace = accept('{');
+
+    start = np[0];
+    limit = start + field_array_elems_from_level(fd, level);
+    maxn = np[0];
+
+    while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}') {
+        if (g_lex.tok.kind == '[') {
+            int idx;
+            int span;
+
+            next_token();
+            idx = parse_typed_designator_index_expr();
+            expect(']');
+            expect('=');
+            span = field_array_elems_from_level(fd, level + 1);
+            if (span <= 0) span = 1;
+            if (idx < 0)
+                error_here("negative array initializer designator");
+            else
+                np[0] = start + idx * span;
+        }
+        if (g_lex.tok.kind == '{' && fd->dim_count > 0 && level + 1 < fd->dim_count)
+            emit_init_auto_struct_array_field_level(s, baseoff, fd, np, level + 1);
+        else {
+            if (total > 0 && np[0] >= total) {
+                error_here("too many initializer elements");
+                skip_initializer_or_decl_tail();
+                break;
+            }
+            emit_init_auto_struct_array_leaf(s, baseoff + np[0] * leaf_size, fd->elem_type);
+            np[0] = np[0] + 1;
+        }
+        if (np[0] > maxn) maxn = np[0];
+
+        /* Brace-elided level: stop once full, leaving the comma for the
+         * caller.  The break happens before consuming the separator so the
+         * next sibling starts cleanly. */
+        if (!had_brace && np[0] >= limit)
+            break;
+
+        if (!accept(','))
+            break;
+        if (g_lex.tok.kind == '}')
+            break;
+    }
+    if (had_brace)
+        expect('}');
+
+    if (maxn > np[0])
+        np[0] = maxn;
+    while (np[0] < limit && np[0] < total) {
+        emit_zero_local_bytes(s, baseoff + np[0] * leaf_size, leaf_size);
+        np[0] = np[0] + 1;
+    }
+}
+
+static void emit_init_auto_struct_array_field(struct Sym *s, int baseoff, struct FieldDef *fd)
+{
+    int n;
+    int total;
+    int leaf_size;
+
+    if (fd->dim_count <= 1) {
+        emit_init_auto_struct_array(s, baseoff, fd->elem_type, fd->array_len, fd->elem_size);
+        return;
+    }
+
+    leaf_size = type_size(fd->elem_type);
+    if (leaf_size <= 0) leaf_size = 2;
+
+    n = 0;
+    emit_init_auto_struct_array_field_level(s, baseoff, fd, &n, 0);
+
+    total = field_array_elems_from_level(fd, 0);
+    while (total > 0 && n < total) {
+        emit_zero_local_bytes(s, baseoff + n * leaf_size, leaf_size);
+        n++;
+    }
+}
+
 void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int count, int elem_size)
 {
     int n;
@@ -433,27 +673,28 @@ void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int 
     if (elem_size <= 0) elem_size = 2;
 
     if ((elem_type & 15) == TYPE_CHAR && type_ptr_depth(elem_type) == 0 &&
-        tok.kind == TOK_STR) {
+        g_lex.tok.kind == TOK_STR) {
         char *lit;
         int is_wide;
-        lit = read_adjacent_string_literals_ex(&is_wide);
+        int litlen;
+        lit = read_adjacent_string_literals_ex(&is_wide, &litlen);
         if (is_wide)
             error_here("wide string cannot initialize char array field");
         else
-            emit_init_auto_char_array_at_offset_from_string(s, baseoff, count, lit);
+            emit_init_auto_char_array_at_offset_from_string(s, baseoff, count, lit, litlen);
         free(lit);
         return;
     }
 
-    if (tok.kind == '{')
+    if (g_lex.tok.kind == '{')
         next_token();
 
     n = 0;
     maxn = 0;
-    while (tok.kind != TOK_EOF && tok.kind != '}') {
-        if (tok.kind == '[') {
+    while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}') {
+        if (g_lex.tok.kind == '[') {
             next_token();
-            n = parse_const_int_expr();
+            n = parse_typed_designator_index_expr();
             expect(']');
             expect('=');
         }
@@ -471,7 +712,7 @@ void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int 
         n++;
         if (n > maxn) maxn = n;
         if (!accept(',')) break;
-        if (tok.kind == '}') break;
+        if (g_lex.tok.kind == '}') break;
     }
     expect('}');
 
@@ -492,7 +733,7 @@ long parse_struct_init_const_value(void)
     k = parse_global_init_atom(&v, label, sizeof(label));
     if (k != 1) {
         error_here("bitfield initializer must be constant integer");
-        if (tok.kind != ',' && tok.kind != '}')
+        if (g_lex.tok.kind != ',' && g_lex.tok.kind != '}')
             next_token();
         return 0;
     }
@@ -510,6 +751,15 @@ unsigned int bitfield_init_part(struct FieldDef *fd, long v)
     return (unsigned int)(((unsigned long)v & mask) << fd->bit_shift);
 }
 
+/* Bit mask a bit-field occupies inside its 16-bit storage unit. */
+unsigned int bitfield_field_mask(struct FieldDef *fd)
+{
+    if (fd->bit_width <= 0)
+        return 0;
+    return (unsigned int)((((1UL << fd->bit_width) - 1UL) << fd->bit_shift) &
+                          0xffffUL);
+}
+
 int next_parent_field_index(int sid, int start)
 {
     int k;
@@ -517,6 +767,129 @@ int next_parent_field_index(int sid, int start)
         if (field_defs[k].parent_struct_id == sid && !field_defs[k].is_promoted)
             return k;
     return -1;
+}
+
+/*
+ * Shared bit-field storage-unit packer for struct designated initializers,
+ * used by BOTH the local (emit) and global (record) init paths so the two
+ * cannot drift out of sync (they did once - a fix had to be applied twice).
+ *
+ * Starting at field index `i` (fd = &field_defs[i], a bit-field), this
+ * consumes from the token stream the initializers of every bit-field sharing
+ * fd's 16-bit storage unit - including same-unit `.field =` designators - and
+ * returns the packed unit value.  It merges with any value previously stored
+ * for this unit via the caller-owned tracking arrays
+ * (unit_offs[], unit_vals[], *nunits, capacity `cap`), so an out-of-order
+ * designator that revisits a unit is last-designator-wins per C99.
+ *
+ * On return *out_unit_off is the unit's byte offset, *out_k the final field
+ * index the packing reached, and *out_stop is 1 when the initializer list
+ * ended (no trailing ',').  The CALLER performs the actual unit store (emit a
+ * runtime store, or record init bytes) and any `used` bookkeeping, and then
+ * the shared `if (k > i) i = k - 1; if (stop) break; ...` tail.
+ *
+ * allow_promoted_owner: the local path also accepts a promoted bit-field when
+ * the unit's owner fd is itself promoted (anonymous struct/union member); the
+ * global path does not.
+ */
+unsigned int pack_struct_bitfield_unit(int sid, int i, struct FieldDef *fd,
+                                       int allow_promoted_owner,
+                                       int *unit_offs, unsigned int *unit_vals,
+                                       int *nunits, int cap,
+                                       int *out_unit_off, int *out_k,
+                                       int *out_stop)
+{
+    int unit_off = fd->offset;
+    int k = i;
+    int next;
+    int u;
+    int found;
+    unsigned int unit = 0;
+    unsigned int unit_mask = 0;
+    int stop = 0;
+
+    while (k >= 0 && k < nfield_defs && g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}') {
+        struct FieldDef *bfd = &field_defs[k];
+        if (bfd->parent_struct_id == sid &&
+            (!bfd->is_promoted || (allow_promoted_owner && fd->is_promoted))) {
+            if (bfd->bit_width <= 0 || bfd->offset != unit_off)
+                break;
+            unit &= ~bitfield_field_mask(bfd);
+            unit |= bitfield_init_part(bfd, parse_struct_init_const_value());
+            unit_mask |= bitfield_field_mask(bfd);
+            if (!accept(',')) {
+                stop = 1;
+                break;
+            }
+            if (g_lex.tok.kind == '}') {
+                stop = 1;
+                break;
+            }
+        }
+        /*
+         * A designated element (`.field = ...`) may follow.  When it names
+         * another bit-field in the SAME storage unit, keep accumulating it
+         * into `unit` so all designators for the unit are packed with a single
+         * store (the unit store overwrites, so they cannot be emitted one at a
+         * time).  A designator that targets a different unit (or a non-bit-
+         * field) is left for the outer field loop; the comma has already been
+         * consumed, which is exactly where the outer loop expects to resume.
+         */
+        if (g_lex.tok.kind == '.') {
+            LexState _ls = lex_save();
+            struct FieldDef *nf = NULL;
+
+            next_token();
+            if (g_lex.tok.kind == TOK_ID)
+                nf = find_field_def(sid, g_lex.tok.text);
+            if (nf != NULL && nf->bit_width > 0 && nf->offset == unit_off) {
+                next_token();
+                if (g_lex.tok.kind == '=')
+                    next_token();
+                else if (g_lex.tok.kind != '[' && g_lex.tok.kind != '.')
+                    expect('=');
+                k = (int)(nf - field_defs);
+                continue;
+            }
+            lex_restore(&_ls);
+            break;
+        }
+        next = next_parent_field_index(sid, k + 1);
+        if (next < 0) {
+            if (g_lex.tok.kind != '}') {
+                error_here("too many initializer elements");
+                while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}') {
+                    skip_initializer_or_decl_tail();
+                    if (g_lex.tok.kind == ',') next_token();
+                    else break;
+                }
+            }
+            stop = 1;
+            break;
+        }
+        k = next;
+    }
+
+    found = -1;
+    for (u = 0; u < *nunits; ++u) {
+        if (unit_offs[u] == unit_off) {
+            found = u;
+            break;
+        }
+    }
+    if (found >= 0)
+        unit = (unit_vals[found] & ~unit_mask) | unit;
+    else if (*nunits < cap) {
+        found = (*nunits)++;
+        unit_offs[found] = unit_off;
+    }
+    if (found >= 0)
+        unit_vals[found] = unit;
+
+    *out_unit_off = unit_off;
+    *out_k = k;
+    *out_stop = stop;
+    return unit;
 }
 
 void emit_store_const_bitfield_unit_to_local(struct Sym *s, int off, unsigned int unit)
@@ -533,6 +906,16 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
     int is_union;
     int had_brace;
     int end_used;
+    /* Bit-field storage units already stored at this struct level.  Out-of-
+     * order designators can revisit a unit after leaving it (e.g.
+     * `{ .a=1, .x=2, .b=3 }` with a and b sharing a unit); each unit store
+     * overwrites the whole 16-bit word, so a revisit must merge with the
+     * previously stored value (C99 last-designator-wins per field). */
+    int bf_unit_offs[32];
+    unsigned int bf_unit_vals[32];
+    int bf_nunits;
+
+    bf_nunits = 0;
 
     sid = type_struct_id(type);
     total = type_size(type);
@@ -540,24 +923,62 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
     is_union = (sid > 0 && sid <= nstruct_defs && struct_defs[sid - 1].is_union);
 
     had_brace = 0;
-    if (tok.kind == '{') {
+    if (g_lex.tok.kind == '{') {
         next_token();
         had_brace = 1;
     }
 
     if (is_union) {
         struct FieldDef *first;
+        LexState _ls;
+        int child_sid;
+        struct FieldDef *candidate;
         first = NULL;
+
+        /* A promoted designator can select an anonymous union member other
+         * than the first one.  Resolve that owner before recursively parsing
+         * the selected member's initializer. */
+        if (g_lex.tok.kind == '.') {
+            _ls = lex_save();
+            next_token();
+            if (g_lex.tok.kind == TOK_ID) {
+                for (i = 0; i < nfield_defs; ++i) {
+                    candidate = &field_defs[i];
+                    if (candidate->parent_struct_id != sid || candidate->is_promoted)
+                        continue;
+                    if (!strcmp(candidate->name, g_lex.tok.text)) {
+                        first = candidate;
+                        break;
+                    }
+                    if ((candidate->type & TYPE_STRUCT) &&
+                        type_ptr_depth(candidate->type) == 0) {
+                        child_sid = type_struct_id(candidate->type);
+                        if (find_field_def(child_sid, g_lex.tok.text) != NULL) {
+                            first = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+            lex_restore(&_ls);
+        }
         for (i = 0; i < nfield_defs; ++i) {
-            if (field_defs[i].parent_struct_id == sid && !field_defs[i].is_promoted) {
+            if (first == NULL && field_defs[i].parent_struct_id == sid &&
+                !field_defs[i].is_promoted) {
                 first = &field_defs[i];
                 break;
             }
         }
 
-        if (first && tok.kind != TOK_EOF && tok.kind != '}') {
+        if (first && g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}') {
+            if (g_lex.tok.kind == '.' && first->name[0] != 0) {
+                next_token();
+                if (g_lex.tok.kind == TOK_ID)
+                    next_token();
+                expect('=');
+            }
             if (first->is_array)
-                emit_init_auto_struct_array(s, baseoff, first->elem_type, first->array_len, first->elem_size);
+                emit_init_auto_struct_array_field(s, baseoff, first);
             else if ((first->type & TYPE_STRUCT) && type_ptr_depth(first->type) == 0)
                 emit_init_auto_struct_type(s, baseoff, first->type);
             else
@@ -568,9 +989,9 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
              * members; a braceless element in an array (U a[] = {1,2,3}) ends
              * at its single initializer and the array loop owns the comma. */
             if (had_brace && accept(',')) {
-                if (tok.kind != '}') {
+                if (g_lex.tok.kind != '}') {
                     error_here("too many union initializer elements");
-                    while (tok.kind != TOK_EOF && tok.kind != '}')
+                    while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}')
                         next_token();
                 }
             }
@@ -583,26 +1004,30 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
         return;
     }
 
-    for (i = 0; i < nfield_defs && tok.kind != TOK_EOF && tok.kind != '}'; ++i) {
+    for (i = 0; i < nfield_defs && g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}'; ++i) {
         struct FieldDef *fd;
-        if (tok.kind == '.') {
+        if (g_lex.tok.kind == '.') {
             next_token();
-            if (tok.kind != TOK_ID) {
+            if (g_lex.tok.kind != TOK_ID) {
                 error_here("expected a field designator, such as '.field = value'");
-                while (tok.kind != TOK_EOF && tok.kind != '}')
+                while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}')
                     next_token();
                 break;
             }
-            fd = find_field_def(sid, tok.text);
+            fd = find_field_def(sid, g_lex.tok.text);
             if (fd == NULL) {
                 error_here("unknown field initializer designator");
-                while (tok.kind != TOK_EOF && tok.kind != '}')
+                while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}')
                     next_token();
                 break;
             }
             i = (int)(fd - field_defs);
             next_token();
-            expect('=');
+            if (g_lex.tok.kind == '=') {
+                next_token();
+            } else if (g_lex.tok.kind != '[' && g_lex.tok.kind != '.') {
+                expect('=');
+            }
         } else {
             fd = &field_defs[i];
             if (fd->parent_struct_id != sid || fd->is_promoted)
@@ -612,48 +1037,29 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
         if (fd->offset > used)
             emit_zero_local_bytes(s, baseoff + used, fd->offset - used);
 
+        if (g_lex.tok.kind == '[' || g_lex.tok.kind == '.') {
+            if (used <= fd->offset)
+                emit_zero_local_bytes(s, baseoff + fd->offset, fd->size);
+            if (emit_init_auto_struct_chained_designator(s, baseoff, fd)) {
+                end_used = fd->offset + fd->size;
+                if (end_used > used) used = end_used;
+                if (!accept(',')) break;
+                if (g_lex.tok.kind == '}') break;
+                if (g_lex.tok.kind == '.') i = -1;
+                continue;
+            }
+        }
+
         if (fd->bit_width > 0) {
             int unit_off;
             int k;
-            int next;
-            unsigned int unit;
             int stop;
+            unsigned int unit;
 
-            unit_off = fd->offset;
-            unit = 0;
-            stop = 0;
-            k = i;
-            while (k >= 0 && k < nfield_defs && tok.kind != TOK_EOF && tok.kind != '}') {
-                struct FieldDef *bfd;
-                bfd = &field_defs[k];
-                if (bfd->parent_struct_id == sid && !bfd->is_promoted) {
-                    if (bfd->bit_width <= 0 || bfd->offset != unit_off)
-                        break;
-                    unit |= bitfield_init_part(bfd, parse_struct_init_const_value());
-                    if (!accept(',')) {
-                        stop = 1;
-                        break;
-                    }
-                    if (tok.kind == '}') {
-                        stop = 1;
-                        break;
-                    }
-                }
-                next = next_parent_field_index(sid, k + 1);
-                if (next < 0) {
-                    if (tok.kind != '}') {
-                        error_here("too many initializer elements");
-                        while (tok.kind != TOK_EOF && tok.kind != '}') {
-                            skip_initializer_or_decl_tail();
-                            if (tok.kind == ',') next_token();
-                            else break;
-                        }
-                    }
-                    stop = 1;
-                    break;
-                }
-                k = next;
-            }
+            unit = pack_struct_bitfield_unit(sid, i, fd, 1,
+                bf_unit_offs, bf_unit_vals, &bf_nunits,
+                (int)(sizeof(bf_unit_offs) / sizeof(bf_unit_offs[0])),
+                &unit_off, &k, &stop);
             emit_store_const_bitfield_unit_to_local(s, baseoff + unit_off, unit);
             end_used = unit_off + 2;
             if (end_used > used) used = end_used;
@@ -661,11 +1067,17 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
                 i = k - 1;
             if (stop)
                 break;
+            /* A designator for a different unit (or a non-bit-field) stopped
+             * the packing loop; restart the field scan so the outer loop's
+             * designator handling processes it even when this unit's owner
+             * was the last declared field. */
+            if (g_lex.tok.kind == '.')
+                i = -1;
             continue;
         }
 
         if (fd->is_array)
-            emit_init_auto_struct_array(s, baseoff + fd->offset, fd->elem_type, fd->array_len, fd->elem_size);
+            emit_init_auto_struct_array_field(s, baseoff + fd->offset, fd);
         else if ((fd->type & TYPE_STRUCT) && type_ptr_depth(fd->type) == 0)
             emit_init_auto_struct_type(s, baseoff + fd->offset, fd->type);
         else
@@ -674,10 +1086,11 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
         end_used = fd->offset + fd->size;
         if (end_used > used) used = end_used;
         if (!accept(',')) break;
-        if (tok.kind == '}') break;
-        if (tok.kind == '.') i = -1;
+        if (g_lex.tok.kind == '}') break;
+        if (g_lex.tok.kind == '.') i = -1;
     }
-    expect('}');
+    if (had_brace)
+        expect('}');
 
     if (total > used)
         emit_zero_local_bytes(s, baseoff + used, total - used);
@@ -746,7 +1159,7 @@ void emit_init_auto_array_scalar(struct Sym *s, int elem_type, int *np)
     n = np[0];
     if (s->array_len > 0 && n >= s->array_len) {
         error_here("too many initializer elements");
-        if (tok.kind != ',' && tok.kind != '}')
+        if (g_lex.tok.kind != ',' && g_lex.tok.kind != '}')
             next_token();
         return;
     }
@@ -784,13 +1197,13 @@ void emit_init_auto_array_level(struct Sym *s, int elem_type, int *np, int level
     limit = start + sym_array_elems_from_level(s, level);
     maxn = np[0];
 
-    while (tok.kind != TOK_EOF && tok.kind != '}') {
-        if (tok.kind == '[') {
+    while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}') {
+        if (g_lex.tok.kind == '[') {
             int idx;
             int span;
 
             next_token();
-            idx = parse_const_int_expr();
+            idx = parse_typed_designator_index_expr();
             expect(']');
             expect('=');
             span = sym_array_elems_from_level(s, level + 1);
@@ -800,7 +1213,7 @@ void emit_init_auto_array_level(struct Sym *s, int elem_type, int *np, int level
             else
                 np[0] = start + idx * span;
         }
-        if (tok.kind == '{' && s->dim_count > 0 && level + 1 < s->dim_count)
+        if (g_lex.tok.kind == '{' && s->dim_count > 0 && level + 1 < s->dim_count)
             emit_init_auto_array_level(s, elem_type, np, level + 1);
         else
             emit_init_auto_array_scalar(s, elem_type, np);
@@ -808,7 +1221,7 @@ void emit_init_auto_array_level(struct Sym *s, int elem_type, int *np, int level
 
         if (!accept(','))
             break;
-        if (tok.kind == '}')
+        if (g_lex.tok.kind == '}')
             break;
     }
     expect('}');
@@ -836,27 +1249,109 @@ void emit_init_auto_array_from_list(struct Sym *s, int elem_type)
     }
 }
 
+/*
+ * Allocate a C99 variable-length array at run time.  parse_array_declarator_dims
+ * captured the (non-constant) first-dimension expression; re-seek the lexer to
+ * it, evaluate it into HL, scale by the element size, carve the block off the
+ * stack below SP, and store the resulting base pointer into the VLA's frame
+ * slot.  The block is reclaimed at block-scope exit by restoring SP from the
+ * scope's hidden `#vlasp` save slot (see emit_vla_save_sp/emit_vla_restore_sp),
+ * and by the function epilogue's `ld sp,ix` on any remaining return path.
+ */
+static void emit_vla_alloc(struct Sym *s)
+{
+    long r_posi;
+    long r_tok_start;
+    int r_line;
+    int r_tok_line;
+    struct Token r_tok;
+
+    r_posi = g_lex.posi;
+    r_tok_start = g_lex.tok_start_pos;
+    r_line = g_lex.line_no;
+    r_tok_line = g_lex.tok_line;
+    r_tok = g_lex.tok;
+
+    g_lex.posi = g_vla_dim_posi;
+    g_lex.tok_start_pos = g_vla_dim_tok_start;
+    g_lex.line_no = g_vla_dim_line;
+    g_lex.tok_line = g_vla_dim_tok_line;
+    g_lex.tok = g_vla_dim_tok;
+
+    ast_emit_init_expr();               /* HL = element count */
+
+    g_lex.posi = r_posi;
+    g_lex.tok_start_pos = r_tok_start;
+    g_lex.line_no = r_line;
+    g_lex.tok_line = r_tok_line;
+    g_lex.tok = r_tok;
+
+    if (s->elem_size > 1)
+        emit_mul_hl_const((long)s->elem_size);   /* HL = size in bytes */
+
+    if (s->vla_size_offset != 0) {
+        emit("\tpush hl\n");
+        emit("\tpush ix\n\tpop hl\n");
+        fprintf(g_emit_sink.stream, "\tld de,%d\n\tadd hl,de\n", s->vla_size_offset);
+        emit("\tpop de\n");
+        emit("\tld (hl),e\n\tinc hl\n\tld (hl),d\n");
+        emit("\tex de,hl\n");
+    }
+
+    /* SP -= size; the new SP is the block base, stored into the slot. */
+    emit("\tex de,hl\n");
+    emit("\tld hl,0\n");
+    emit("\tadd hl,sp\n");
+    emit("\tor a\n");
+    emit("\tsbc hl,de\n");
+    emit("\tld sp,hl\n");
+    if (opt_stack_check)
+        emit_runtime_call("__stchk");
+    emit("\tld hl,0\n");
+    emit("\tadd hl,sp\n");
+    emit("\tpush hl\n");
+    emit_load_frame_addr_hl(s);         /* HL = &slot (may clobber DE) */
+    emit("\tpop de\n");                 /* DE = block base */
+    emit("\tld (hl),e\n\tinc hl\n\tld (hl),d\n");
+}
+
 void gen_local_decl_after_type(int base)
 {
     int type, bytes, arrlen;
+    int base_is_volatile;
+    int base_pointee_is_volatile;
     int total_elems;
+    int direct_funcptr;
     char name[64];
     char source_name[64];
     struct Sym *s;
     int freshly_allocated;
+    int narrowed_as_counter;
+
+    base_is_volatile = g_decl.is_volatile;
+    base_pointee_is_volatile = g_decl.pointee_is_volatile;
 
     for (;;) {
         type = base;
+        g_decl.is_volatile = base_is_volatile;
+        g_decl.pointee_is_volatile = base_pointee_is_volatile;
+        direct_funcptr = 0;
 
-        while (accept('*')) { skip_type_qualifiers(); type = type_add_ptr(type); }
+        while (accept('*')) {
+            g_decl.pointee_is_volatile = g_decl.is_volatile;
+            g_decl.is_volatile = skip_type_qualifiers_volatile();
+            type = type_add_ptr(type);
+        }
 
-        if (!parse_funcptr_declarator(&type, name, sizeof(name))) {
-            if (tok.kind != TOK_ID) {
+        if (parse_funcptr_declarator(&type, name, sizeof(name))) {
+            direct_funcptr = 1;
+        } else {
+            if (g_lex.tok.kind != TOK_ID) {
                 error_here("identifier expected");
                 break;
             }
 
-            strncpy(name, tok.text, sizeof(name) - 1);
+            strncpy(name, g_lex.tok.text, sizeof(name) - 1);
             name[sizeof(name) - 1] = 0;
             next_token();
         }
@@ -864,14 +1359,16 @@ void gen_local_decl_after_type(int base)
         strncpy(source_name, name, sizeof(source_name) - 1);
         source_name[sizeof(source_name) - 1] = 0;
 
-        if (tok.kind == '(') {
+        if (g_lex.tok.kind == '(') {
+            if (g_func_pass.for_decl_seq >= 0 && !direct_funcptr)
+                g_for_decl_saw_nonobject = 1;
             skip_prototype_function_suffix();
             if (!accept(','))
                 break;
             continue;
         }
 
-        if (g_for_decl_seq >= 0) {
+        if (g_func_pass.for_decl_seq >= 0) {
             const char *rn;
             rn = enter_for_decl_rename(name);
             strncpy(name, rn, sizeof(name) - 1);
@@ -896,7 +1393,7 @@ void gen_local_decl_after_type(int base)
              * allocation:
              *     char data[] = { 'a', 'b', 0 };
              */
-            if (arrlen == 0 && g_last_array_dim_count > 0 && tok.kind == '=') {
+            if (arrlen == 0 && g_last_array_dim_count > 0 && g_lex.tok.kind == '=') {
                 int atoms;
                 int inner;
                 int di;
@@ -952,7 +1449,9 @@ void gen_local_decl_after_type(int base)
          * already reached for this same declarator during the earlier
          * frame-sizing pass - both independently re-run the same
          * speculative parse over the same source text, so they agree. */
-        if (try_narrow_local_int_array(name, type, arrlen, total_elems)) {
+        narrowed_as_counter = 0;
+        if (!g_decl.is_volatile &&
+            try_narrow_local_int_array(name, type, arrlen, total_elems)) {
             type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
             /* See the identical comment in scan_local_decl_after_type
              * (dcc_func.c): first_stride_bytes was computed from the
@@ -960,8 +1459,13 @@ void gen_local_decl_after_type(int base)
              * here too or Sym.elem_size below keeps the stale, too-wide
              * stride even though Sym.type is now correctly narrowed. */
             current_field_array_elem_size = 0;
-        } else if (try_narrow_register_scalar(name, type, decl_is_register, arrlen, total_elems)) {
+        } else if (!g_decl.is_volatile &&
+                   try_narrow_register_scalar(name, type, g_decl.is_register, arrlen, total_elems)) {
             type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
+        } else if (!g_decl.is_volatile &&
+                   try_narrow_for_counter(name, type, arrlen, total_elems)) {
+            type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
+            narrowed_as_counter = 1;
         }
 
         s = find_local_decl(name);
@@ -971,27 +1475,92 @@ void gen_local_decl_after_type(int base)
         freshly_allocated = 0;
         if (!s) {
             bytes = type_size(type);
-            if (total_elems > 0)
+            if (g_vla_pending)
+                bytes = 2;              /* VLA: reserve only a pointer slot */
+            else if (total_elems > 0)
                 bytes = object_array_size(type, total_elems);
 
             s = add_local_alloc(name, type, bytes);
+            copy_funcptr_prototype_to_sym(s, direct_funcptr);
+            s->is_volatile = g_decl.is_volatile;
+            s->pointee_is_volatile = g_decl.pointee_is_volatile;
+            s->is_register = g_decl.is_register;
             freshly_allocated = 1;
+            /* Round 2 of codegen-time register residency (see dcc_func.c's
+             * find_bc_regalloc_candidate/try_speculative_bc_regalloc_
+             * function_body for round 1's pointer-in-BC case): a local
+             * narrowed by try_narrow_for_counter is, by that proof, used
+             * solely as one simple counting for-loop's own induction
+             * variable - dccpeep's existing pass_byte_for_counter_to_reg_e
+             * already promotes exactly this shape reactively, so codegen
+             * claiming it directly is the same class of change as round 1.
+             * Only claimed inside a speculative attempt (g_e_regalloc_claim_
+             * active), and only the first such local per attempt (a second
+             * counter in the same function falls back to its ordinary frame
+             * slot, matching round 1's "one candidate" scope). */
+            if (narrowed_as_counter && g_e_regalloc_claim_active && !g_e_regalloc_claimed) {
+                s->reg_alloc = REG_E;
+                g_e_regalloc_claimed = 1;
+                g_e_regalloc_sym = s;
+            }
             if (arrlen > 0 || g_last_array_dim_count > 0) {
                 s->is_array = 1;
                 s->array_len = arrlen;
                 s->elem_size = current_field_array_elem_size ? current_field_array_elem_size : type_size(type);
                 if (s->elem_size <= 0) s->elem_size = 2;
                 copy_last_array_dims_to_sym(s);
+                if (g_vla_pending) {
+                    struct Sym *size_slot;
+                    /* VLA: the frame slot holds a runtime pointer to the
+                     * block.  Keep the elem_size set above - the element size
+                     * for a[n], or the (constant) row stride for a[n][C] - so
+                     * both indexing and the allocation size are correct for
+                     * the variable outer dimension. */
+                    s->is_vla = 1;
+                    s->array_len = 0;
+                    if (s->elem_size <= 0) s->elem_size = 1;
+                    size_slot = add_local_alloc("#vlasz", TYPE_INT, 2);
+                    s->vla_size_offset = size_slot->offset;
+                    /* Save SP once per scope, before its first VLA, so the
+                     * scope's VLAs can be reclaimed at block/loop exit. */
+                    {
+                        int vsp_off = vla_scope_ensure_save_slot();
+                        if (vsp_off != 0)
+                            emit_vla_save_sp(vsp_off);
+                    }
+                } else {
+                    /* Mirrors the identical hook in scan_local_decl_after_type
+                     * (dcc_func.c): a VLA's slot holds a runtime pointer, not
+                     * a fixed address, so address-caching only applies to
+                     * ordinary fixed arrays. Must run here too, not just in
+                     * the scan pass - gen_local_decl_after_type is a separate
+                     * declaration handler used only by the real codegen pass
+                     * (see gen_compound), with its own freshly-allocated Sym
+                     * that the scan pass's has_addr_cache/addr_cache_offset
+                     * never reaches. */
+                    maybe_reserve_addr_cache_for_array(s, name);
+                }
             } else if (g_ptr_array_dim_count > 0) {
                 int pi;
                 s->elem_size = g_ptr_array_elem_size;
                 s->dim_count = g_ptr_array_dim_count;
-                for (pi = 0; pi < 8; ++pi)
+                for (pi = 0; pi < MAX_ARRAY_DIMS; ++pi)
                     s->dims[pi] = (pi < g_ptr_array_dim_count) ? g_ptr_array_dims[pi] : 0;
             }
         }
+        if (freshly_allocated)
+            emit_debug_variable(s);
         g_ptr_array_dim_count = 0;
         g_ptr_array_elem_size = 0;
+
+        if (g_vla_pending) {
+            /* A variable inner dimension (runtime row stride) already errored
+             * during the declarator parse; only a variable outer dimension
+             * with constant inner dimensions reaches here. */
+            if (freshly_allocated)
+                emit_vla_alloc(s);
+            g_vla_pending = 0;
+        }
 
         if (s->is_const_value) {
             if (accept('=')) {
@@ -1001,52 +1570,76 @@ void gen_local_decl_after_type(int base)
                 }
             }
         } else if (accept('=')) {
-            if ((type & TYPE_STRUCT) && type_ptr_depth(type) == 0 && tok.kind != '{') {
-                error_here("struct initializer list expected");
-                skip_initializer_or_decl_tail();
-            } else if (s->is_array && (type & 15) == TYPE_CHAR && type_ptr_depth(type) == 0 && tok.kind == TOK_STR) {
+            if ((type & TYPE_STRUCT) && type_ptr_depth(type) == 0 && g_lex.tok.kind != '{') {
+                ast_emit_struct_init_expr_assign(s);
+            } else if (s->is_array && (type & 15) == TYPE_CHAR && type_ptr_depth(type) == 0 && g_lex.tok.kind == TOK_STR) {
                 char *lit;
                 int is_wide;
-                lit = read_adjacent_string_literals_ex(&is_wide);
+                int litlen;
+                lit = read_adjacent_string_literals_ex(&is_wide, &litlen);
                 if (is_wide)
                     error_here("wide string cannot initialize char array");
-                emit_init_auto_char_array_from_string(s, lit);
+                emit_init_auto_char_array_from_string(s, lit, litlen);
                 free(lit);
-            } else if (s->is_array && tok.kind == '{' && (type & TYPE_STRUCT) && type_ptr_depth(type) == 0) {
+            } else if (s->is_array && g_lex.tok.kind == '{' && (type & TYPE_STRUCT) && type_ptr_depth(type) == 0) {
                 emit_init_auto_struct_array_from_list(s);
-            } else if (!s->is_array && tok.kind == '{' && (type & TYPE_STRUCT) && type_ptr_depth(type) == 0) {
+            } else if (!s->is_array && g_lex.tok.kind == '{' && (type & TYPE_STRUCT) && type_ptr_depth(type) == 0) {
                 emit_init_auto_struct_from_list(s);
-            } else if (s->is_array && tok.kind == '{' && !(type & TYPE_STRUCT)) {
+            } else if (s->is_array && g_lex.tok.kind == '{' && (!(type & TYPE_STRUCT) || type_ptr_depth(type) > 0)) {
                 emit_init_auto_array_from_list(s, type);
-            } else if (!s->is_array && tok.kind == '{') {
+            } else if (!s->is_array && g_lex.tok.kind == '{') {
+                /* Same ix-direct fast path as the plain (no-braces) scalar
+                 * case below - this is just `T x = {expr};`, a legacy/GNU
+                 * brace-wrapped scalar initializer, not an array/struct. */
+                int fast = sym_can_ix_direct(s);
                 next_token();
-                emit_load_sym_addr(s);
-                emit("\tpush hl\n");
+                if (!fast) {
+                    emit_load_sym_addr(s);
+                    emit("\tpush hl\n");
+                }
                 ast_emit_init_expr();
                 if (type_is_long(type)) {
-                    if (type_is_float(g_expr_type))
+                    if (type_is_float(g_expr.type))
                         emit_convert_float_to_intlike(type);
-                    else if (!type_is_long(g_expr_type))
-                        emit_extend_to_long_typed(g_expr_type);
-                    emit_store_de_to_addr_hl(type);
+                    else if (!type_is_long(g_expr.type))
+                        emit_extend_to_long_typed(g_expr.type);
+                    if (fast)
+                        emit_store_hl_to_sym_direct(s);
+                    else
+                        emit_store_de_to_addr_hl(type);
                 } else {
-                    if (type_is_float(g_expr_type))
+                    if (type_is_float(g_expr.type))
                         emit_convert_float_to_intlike(type);
-                    else if (type_size(type) > 1 && !type_is_long(g_expr_type))
-                        emit_promote_byte_to_int(g_expr_type);
-                    emit("\tex de,hl\n\tpop hl\n");
-                    emit_store_de_to_addr_hl(type);
+                    else if (type_size(type) > 1 && !type_is_long(g_expr.type))
+                        emit_promote_byte_to_int(g_expr.type);
+                    if (fast) {
+                        emit_store_hl_to_sym_direct(s);
+                    } else {
+                        emit("\tex de,hl\n\tpop hl\n");
+                        emit_store_de_to_addr_hl(type);
+                    }
                 }
                 accept(',');
                 expect('}');
             } else if (!s->is_array && (type & 15) == TYPE_FLOAT && type_ptr_depth(type) == 0) {
                 unsigned long bits;
+                int fast = sym_can_ix_direct(s);
                 if (parse_float_init_literal(&bits)) {
-                    emit_load_sym_addr(s);
-                    emit("\tpush hl\n");
-                    fprintf(outf, "\tld hl,%lu\n", bits & 0xffffUL);
-                    fprintf(outf, "\tld de,%lu\n", (bits >> 16) & 0xffffUL);
-                    emit_store_de_to_addr_hl(type);
+                    if (fast) {
+                        /* Compile-time-constant float bits: write the 4
+                         * immediate bytes straight to the frame slot, no
+                         * register round-trip needed at all. */
+                        fprintf(g_emit_sink.stream, "\tld (ix%+d),%lu\n", s->offset, bits & 0xffUL);
+                        fprintf(g_emit_sink.stream, "\tld (ix%+d),%lu\n", s->offset + 1, (bits >> 8) & 0xffUL);
+                        fprintf(g_emit_sink.stream, "\tld (ix%+d),%lu\n", s->offset + 2, (bits >> 16) & 0xffUL);
+                        fprintf(g_emit_sink.stream, "\tld (ix%+d),%lu\n", s->offset + 3, (bits >> 24) & 0xffUL);
+                    } else {
+                        emit_load_sym_addr(s);
+                        emit("\tpush hl\n");
+                        fprintf(g_emit_sink.stream, "\tld hl,%lu\n", bits & 0xffffUL);
+                        fprintf(g_emit_sink.stream, "\tld de,%lu\n", (bits >> 16) & 0xffffUL);
+                        emit_store_de_to_addr_hl(type);
+                    }
                 } else {
                     /* Extension beyond strict C89: allow automatic float
                      * declarations to use expression initializers, e.g.
@@ -1055,35 +1648,63 @@ void gen_local_decl_after_type(int base)
                      * assignment.  The constant fast path above stays for
                      * smaller code.
                      */
-                    emit_load_sym_addr(s);
-                    emit("\tpush hl\n");
+                    if (!fast) {
+                        emit_load_sym_addr(s);
+                        emit("\tpush hl\n");
+                    }
                     ast_emit_init_expr();
-                    if (!type_is_float(g_expr_type))
-                        emit_convert_int_to_float(g_expr_type);
-                    emit_store_de_to_addr_hl(type);
+                    if (!type_is_float(g_expr.type))
+                        emit_convert_int_to_float(g_expr.type);
+                    if (fast)
+                        emit_store_hl_to_sym_direct(s);
+                    else
+                        emit_store_de_to_addr_hl(type);
                 }
             } else {
-                emit_load_sym_addr(s);
-                emit("\tpush hl\n");
+                /* Fast path: this plain scalar local (no struct/array/brace
+                 * initializer involved here) skips the address computation
+                 * entirely when its frame offset fits (ix+d) directly,
+                 * reusing emit_store_hl_to_sym_direct - the same helper a
+                 * separate `T x; x = expr;` assignment already gets via
+                 * gen_assign_ast's own sym_can_ix_direct fast paths. This was
+                 * the single biggest source of dcc's own generated code
+                 * being far slower than after dccpeep's cleanup: EVERY
+                 * `T x = expr;` declaration paid a push-ix/pop-hl/dec-hl
+                 * address computation plus a push/pop round trip for what a
+                 * one- or two-instruction direct store can do once the
+                 * value is in HL/DE:HL. */
+                int fast = sym_can_ix_direct(s);
+                if (!fast) {
+                    emit_load_sym_addr(s);
+                    emit("\tpush hl\n");
+                }
                 ast_emit_init_expr();
                 if (type_is_long(type)) {
                     /* For long locals, emit_store_de_to_addr_hl pops the
                      * address itself via "pop de", so don't consume it here. */
-                    if (type_is_float(g_expr_type))
+                    if (type_is_float(g_expr.type))
                         emit_convert_float_to_intlike(type);
-                    else if (!type_is_long(g_expr_type))
-                        emit_extend_to_long_typed(g_expr_type);
-                    emit_store_de_to_addr_hl(type);
+                    else if (!type_is_long(g_expr.type))
+                        emit_extend_to_long_typed(g_expr.type);
+                    if (fast) {
+                        emit_store_hl_to_sym_direct(s);
+                    } else {
+                        emit_store_de_to_addr_hl(type);
+                    }
                 } else {
-                    if (type_is_float(g_expr_type))
+                    if (type_is_float(g_expr.type))
                         emit_convert_float_to_intlike(type);
-                    else if (type_size(type) > 1 && !type_is_long(g_expr_type))
-                        emit_promote_byte_to_int(g_expr_type);
-                    emit("\tex de,hl\n\tpop hl\n");
-                    emit_store_de_to_addr_hl(type);
+                    else if (type_size(type) > 1 && !type_is_long(g_expr.type))
+                        emit_promote_byte_to_int(g_expr.type);
+                    if (fast) {
+                        emit_store_hl_to_sym_direct(s);
+                    } else {
+                        emit("\tex de,hl\n\tpop hl\n");
+                        emit_store_de_to_addr_hl(type);
+                    }
                 }
             }
-        } else if (freshly_allocated && !local_name_used_ahead(source_name)) {
+        } else if (freshly_allocated && !s->is_vla && !local_name_used_ahead(source_name)) {
             /* No initializer, and never referenced again in this scope:
              * add_local_alloc just appended this Sym as the last local and
              * reserved its frame space, so popping both back off is safe -
@@ -1091,12 +1712,16 @@ void gen_local_decl_after_type(int base)
              * anything above it yet. freshly_allocated (rather than just
              * !s->is_const_value) guards against the redefinition-error
              * recovery case, where s is an unrelated pre-existing symbol and
-             * bytes/nlocals do not describe it. Must match
-             * scan_local_decl_after_type's identical decision exactly, since
-             * that earlier frame-sizing pass already committed to the frame
-             * size this function's prologue was emitted with. */
-            nlocals--;
-            local_size -= bytes;
+             * bytes/nlocals do not describe it. A VLA is never pruned: it has
+             * a side-effecting stack allocation plus hidden #vlasz/#vlasp
+             * slots whose offsets are already baked into emitted save/restore
+             * code, and its `bytes` (2, the pointer slot) does not describe
+             * the whole reservation. scan_local_decl_after_type skips the
+             * prune for the same case via its still-set g_vla_pending guard,
+             * so both passes must agree here (g_vla_pending is already cleared
+             * above in this pass, hence the s->is_vla test instead). */
+            g_frame.nlocals--;
+            g_frame.local_size -= bytes;
         }
 
         if (!accept(',')) break;

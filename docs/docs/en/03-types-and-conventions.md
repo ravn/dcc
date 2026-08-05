@@ -46,7 +46,8 @@ From [errno.h](standard-lib/02-errno.md):
 
 ## Fixed-width integer names (`stdint.h`)
 
-[`stdint.h`](standard-lib/13-stdint.md) provides fixed-width typedefs that match the target model:
+[`stdint.h`](standard-lib/13-stdint.md) provides C99 integer typedefs and limit
+macros that match the target model:
 
 | Name | Definition |
 | --- | --- |
@@ -56,7 +57,14 @@ From [errno.h](standard-lib/02-errno.md):
 | `uint16_t` | unsigned 16-bit `int` |
 | `int32_t` | signed 32-bit `long` |
 | `uint32_t` | unsigned 32-bit `long` |
+| `int_leastN_t` / `uint_leastN_t` | smallest available 8-, 16-, or 32-bit type |
+| `int_fastN_t` / `uint_fastN_t` | fastest available 8-, 16-, or 32-bit type on Z80 |
+| `intmax_t` / `uintmax_t` | signed / unsigned 32-bit `long` |
+| `intptr_t` / `uintptr_t` | signed / unsigned 16-bit `int` |
 | `wchar_t` | unsigned 16-bit `int` |
+
+The runtime has no 64-bit integer support, so `stdint.h` intentionally stops at
+the 32-bit `long` family.
 
 ## Integer limits (`limits.h`)
 
@@ -134,3 +142,114 @@ int main(void)
   storage for their uninitialized globals so multiple modules do not overlap the
   final application's synthetic BSS range. The zeroing guarantee above describes
   the normal final app translation unit linked with `DCCRTL.MAC` / `RTLMIN.MAC`.
+
+## Supported pragmas
+
+DCC accepts `#pragma` directives for source compatibility. Unknown pragmas are
+ignored, so headers shared with other compilers can usually keep vendor-specific
+directives in place. The pragmas below have DCC-specific behavior:
+
+| Pragma | Effect |
+| --- | --- |
+| `#pragma once` | Marks the current source or header file as include-once. Later includes of the same canonical host path are skipped. The directive is honored only when it appears in an active preprocessor branch. |
+| `#pragma stack_check(on)` | Enables stack-overflow guard emission from this point forward in the translation unit. |
+| `#pragma stack_check(off)` | Disables stack-overflow guard emission from this point forward in the translation unit. |
+| `#pragma push_macro("NAME")` | Saves the current definition state of macro `NAME` on DCC's macro stack. |
+| `#pragma pop_macro("NAME")` | Restores the most recently pushed definition state for macro `NAME`; if the macro was not defined at push time, it is undefined. |
+
+`#pragma once` is handled during include splicing, before normal tokenization, so
+it works through relative-path aliases such as `"foo.h"` and `"./foo.h"` when
+they resolve to the same host file. It also follows DCC's active conditional
+state: a pragma inside `#if 0` is ignored, while a pragma made active by `#else`,
+`#elif`, `#ifdef`, `#ifndef`, or earlier active `#define` / `#undef` directives
+is honored.
+
+[`-fstack-check`](02-build-and-link.md#options-that-affect-the-runtime) sets
+the initial stack-check state for the translation unit. `#pragma stack_check(on)`
+and `#pragma stack_check(off)` then control guard emission in source order. The
+pragma affects function prologues and VLA allocations emitted after the directive;
+it does not retroactively change code already emitted.
+
+```c
+void normal_default(void) { }   /* uses the command-line/default state */
+
+#pragma stack_check(on)
+void guarded_region(void) { }   /* emits call __stchk */
+
+#pragma stack_check(off)
+void unguarded_region(void) { } /* no stack-check prologue */
+```
+
+## Variable-length arrays
+
+DCC supports a practical subset of C99 variable-length arrays (VLAs):
+a **local array whose size is a run-time value**, allocated on the stack when
+its declaration is reached and released when its block is left. This is meant
+for runtime-sized scratch storage on the 16-bit Z80/CP/M target, not full
+variably-modified type support. The [C conformance](01-c-conformance.md) page
+lists the summary status; this section is the practical guide.
+
+### Supported
+
+A local array whose **outermost** dimension is a run-time expression, with any
+constant inner dimensions:
+
+```c
+void f(int n)
+{
+    int  a[n];          /* 1-D VLA                        */
+    char buf[n + 1];    /* any run-time size expression   */
+    int  grid[n][3];    /* variable outer, constant inner */
+    /* a, buf, grid decay to pointers exactly like fixed arrays */
+}
+```
+
+- The size expression is evaluated **once**, when the declaration is reached.
+- In multidimensional arrays such as `grid[n][3]`, the inner dimensions must be
+  compile-time constants because they define the row stride used for indexing.
+- **Block-scope reclamation.** The array lives until its enclosing block exits,
+  so a VLA inside a loop does not grow the stack — each iteration reuses the
+  same storage:
+
+  ```c
+  for (i = 0; i < iters; i++) {
+      int scratch[n];     /* allocated and freed every iteration */
+      /* ... use scratch ... */
+  }                       /* stack pointer restored here each pass */
+  ```
+
+- Reclamation happens on **every** normal exit from the block: fall-through,
+  `break`, `continue`, `return`, and a `goto` that leaves the scope. A `goto`
+  out of one or more VLA scopes is fully supported in **both** directions
+  (forward and backward) and restores the stack to exactly the target label's
+  scope, even when it leaves several nested VLA scopes at once.
+- Recursion works: each call frame gets its own VLA and releases it on return.
+- With `-fstack-check`, the run-time allocation is bounds-checked, so an
+  oversized VLA aborts gracefully instead of colliding with the heap. VLAs draw
+  from the same `-stack` reserve as ordinary locals; size it for the deepest
+  expected allocation (see [Building and linking](02-build-and-link.md)).
+
+### Not supported (diagnosed, never miscompiled)
+
+- A **variable inner** dimension, e.g. `int a[n][m]`, because the row stride
+  would be a run-time value. Only the outermost dimension may vary. Use an
+  explicit index computation or `malloc` for a fully dynamic 2-D array.
+- Jumping **into** a VLA's scope with `goto`, `case`, or `default` (which would
+  bypass the allocation) is rejected, matching a conforming compiler. (Jumping
+  *out of* a VLA scope is fine and reclaims the stack — see above.)
+- Variably-modified **types** beyond the array object itself — VLA `typedef`s,
+  pointers-to-VLA (`int (*p)[n]`), and run-time-bound VLA function parameters —
+  are not modelled.
+
+### `sizeof` on VLAs
+
+`sizeof` applied to a whole VLA produces the array's run-time byte size, matching
+standard C expectations for the supported VLA subset. Constant-size subobjects
+remain compile-time sizes:
+
+```c
+int a[n][3];
+memset(a, 0, sizeof a);        /* run-time value: n * 3 * sizeof(int) */
+sizeof a[0];                  /* compile-time row size: 3 * sizeof(int) */
+```
+

@@ -14,11 +14,23 @@ ff
 123
 abc
 7fff
+0
+10
+12
+777
+[    12]
+1 2 3
+6 4 9
 A
 a
 0
 hello
 world
+[hell]
+[]
+[hi]
+[       hel]
+[hel       ]
 100%
 [     0]
 [    42]
@@ -39,4 +51,21 @@ size_t zx: 8235
 [   ab]
 [ab   ]
 [x  :  7: 12345]
+[2]
+[1.50]
+[    1.50]
+[1.50    ]
+[00001.50]
+[-0001.50]
+[    1.500000]
+longstr len: 299
+longstr first3: aaa
+longstr last3: xyz
+longstr full:
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaxyz
+sprintf longstr n=299 slen=299
+buf255 len: 255
+buf256 len: 256
+[aaaaa]
+sprintf short n=2
 tprintf ok

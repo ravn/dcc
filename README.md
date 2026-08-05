@@ -7,7 +7,7 @@ C compiler targeting CP/M 2.2 on a Z80
 The [dcc documentation](https://davidly.github.io/dcc/) covers all features, usage, and API reference.
 
 ## What dcc is
-dcc has a C89 core plus target-appropriate C99/C11 front-end support. For every source file it accepts, dcc generates a .MAC assembly file that can be assembled by M80 and linked by L80 to produce CP/M .COM files.
+DCC C Compiler is an open source C compiler for CP/M 2.2 on the Z80. It supports C89 plus CP/M-relevant C99/C11 features. For every source file it accepts, dcc generates a .MAC assembly file that can be assembled by M80 and linked by L80 to produce CP/M .COM files.
 
 A separate app dccpeep.c is a peephole optimizer that rewrites portions of .MAC files so apps run faster. It's not necessary to use dccpeep; apps will work just fine without it. But if you need your app to be both smaller and faster it's worth running.
 
@@ -17,12 +17,27 @@ dccrtlstrip.c is an app that examines the code of your .c file and strips portio
 
 The 3 compiler apps dcc, dccpeep, and dccrtlstrip all build and run on Windows, Linux, and MacOS. They are too big to run on CP/M. Use m.bat, m.sh, mmacos.sh to build these apps using msvc (Windows), gcc (Linux), or clang (MacOS) respectively. You may need to chmod 777 *.sh on Linux and MacOS prior to running dcc's scripts.
 
+Dcc has been built and had regression tests run on AMD64 (Linux and Windows), Arm64(Linux, Windows, MacOS), Arm32 (Linux), and RISC-V 64 (Linux).
+
+The binaries dcc produces have been tested in ntvcm (across many platforms), tnylpo (on Linux + AMD64), altair 8800 simulator (on Windows), cpm.exe (on Windows), cpmemu (on Linux), and on a physical Z80 with the Z80-MBC2 SBC. 
+
+The Z80-MBC2 SBC has a TPA of just 55,558 bytes, significantly less than most emulators. Most of the test apps work, but some require more TPA than that. For example, running the Pascal interpreter pint.com with ttt.pas runs out of memory. But smaller test apps like e.pas work fine in pint.com.
+
+When apps built by dcc exit back to the OS on CP/M they do so using the warm boot vector. The CCP is overwritten with the app's stack and heap, so it must be automatically reloaded by CP/M on warm boot. No attempt is made to detect RAM required by an app and preserve the CCP. Reloading the CCP generally takes a couple seconds on physical hardware.
+
 ## Documentation
 
 Two reference documents in the [docs](docs) directory cover the runtime in depth:
 
   - [docs/dcc-c89-reference-guide.md](docs/dcc-c89-reference-guide.md): a practical guide to the C89 language features dcc accepts and the C runtime library implemented in DCCRTL.MAC. It documents type sizes and conventions, the recognized keywords and operators, every standard-header function that is actually linkable (stdio, stdlib, string, ctype, math, setjmp, stdarg, and the CP/M extensions), the supported printf/scanf conversions, and the limitations to keep in mind (no double, 16-bit int, integer-only `%`, etc.). Start here to learn what you can call and how.
   - [docs/dccrtlstrip-inclusion-table.md](docs/dccrtlstrip-inclusion-table.md): an internals reference explaining how dccrtlstrip decides which blocks of DCCRTL.MAC are linked into a program. It maps each C-level construct to the runtime block it pulls in and gives the transitive dependency closures and the marginal .COM size cost of each function. Use it when optimizing binary size or to understand exactly what a given call drags into the link.
+
+## Development machine for modifying dcc
+DCC is intended to be updated by app-writers to better optimize their apps. Typically a dev would point an AI at the code for their app and the code for dcc then ask the AI to profile the app and change dcc to generate better code for the app's scenario.
+
+The inner loop of iterating on improving performance is governed by the speed of your dev machine. Running the full regression suite to ensure nothing was broken can take seconds or minuted depending on your hardware and OS choice. Not surprisingly, more cores really help. And using Linux instead of Windows (which has slower process creation times, anti-virus scanning, indexing, and more) works much better.
+
+<img alt="table" src="images/tests.jpg" />
 
 ## Agent skills
 
@@ -104,9 +119,15 @@ I use my [ntvcm](https://github.com/davidly/ntvcm) CP/M 2.2 emulator to run m80.
 
 m80.com and l80.com are part of the M80 Assembler product from Microsoft. I didn't write them. They are included in this repo to ease development, but they can be found in dozens of locations on the internet.
 
-## C89+ language 
-
-The compiler accepts some syntax from later C standards including declaring variables where you like and initializing them with complex expressions. Only 4-byte floats are supported; 8-byte doubles are not. I'm certain more arcane C89 expressions/features aren't implemented (yet), but the test cases have pretty good coverage. Only a small subset of the C runtime is implemented in DCCRTL.MAC, but the samples implement a bunch more that you can copy/paste where needed. The register, volatile, and const keywords are ignored aside from constant folding for const variables.
+By default, dccmake/ma.sh/ma.ps1 assemble with `m80c`, a from-scratch, conservative
+clone of M80 (see `src/m80c/m80c.c`) that runs natively on the host instead of
+under CP/M emulation - no ntvcm involved for that step. L80 is still real M80
+Assembler-product software and still runs under ntvcm, since only the assembler
+was reimplemented. Pass `dcc-use-emulated-m80=true` to dccmake, `-femulated-m80`
+directly to dccmake, `--emulated-m80`/`-EmulatedM80` to ma.sh/ma.ps1, or
+`-UseEmulatedM80` to runall.ps1/runall-extended.ps1, to assemble with the real
+M80.COM under ntvcm instead (e.g. to cross-check output, or if m80c hasn't been
+built locally).
 
 ## Memory layout
 
@@ -127,6 +148,7 @@ Generally, dcc compares very well with all other compilers that target CP/M, esp
   - pihex.c: Computes PI in base 16. This is C-only and some of the compilers can't build or run it due to a variety of bugs. It measures unsigned long mod and floating point performance. I spent 90 minutes trying to get the two forms of ZCC to build and run it, ran into many compiler and C runtime bugs, and gave up. HiSoft v4.11 has a C runtime bug where if you cast 3.963512 to an int it gives you 4. After I worked around that and other bugs, code from that compiler ran really well -- faster than dcc.
   - mm.c: Another BYTE magazine classic from October 1982. Measures floating point initialization, addition, and multiplication performance.
   - tstring.c: Measures performance of strlen, strchr, strrchr, strstr, memcmp, memcpy, memset, memchr, rand, and integer modulus. Most compilers don't implement all of these and need them supplied.
+  - tbig.c: Test sequential and random file i/o on the biggest file size CP/M 2.2 supports: 8MB. 
 
 Benchmark times are in milliseconds on a 4Mhz Z80. CP/M file sizes are rounded up to the next multiple of 128 bytes due to how the file system works.
 
@@ -165,7 +187,7 @@ dcc compiles on Windows, Linux, and macOS. The build scripts are in the root dir
 chmod +x mmacos.sh
 ./mmacos.sh
 ```
-This produces `dcc`, `dccpeep`, and `dccrtlstrip` in the dcc directory.
+This produces `dcc`, `dccpeep`, `dccrtlstrip`, `dccmake`, and `m80c` in the dcc directory.
 Requires the clang compiler from the Xcode Command Line Tools (install with `xcode-select --install`).
 
 **Linux:**
@@ -212,7 +234,9 @@ Once both projects are built, set up your environment as shown in the next secti
 The build scripts (`ma.sh`, `ma.bat`, `runall.sh`, `runall.bat`) resolve each
 tool the same way: they use an environment variable if you set one, otherwise
 they look for the tool on your `PATH`. The relevant tools are `dcc`, `dccpeep`,
-`dccrtlstrip`, `ntvcm`, and the `m80`/`l80` assembler/linker.
+`dccrtlstrip`, `m80c`, `ntvcm`, and the `l80` linker (and `m80`, only if you
+pass `-UseEmulatedM80`/`dcc-use-emulated-m80=true` to assemble with the real
+M80.COM instead of native `m80c`).
 
 The simplest setup, especially when building C apps in a project *outside* the
 dcc repo, is to add the directories containing the built `dcc` and `ntvcm`
@@ -225,7 +249,7 @@ Add this to your shell profile (e.g., `~/.zshrc`, `~/.bash_profile`, or
 
 ```bash
 # Add the directories that contain the built dcc and ntvcm binaries to PATH.
-# dcc's directory also provides dccpeep, dccrtlstrip, m80.com, l80.com, and DCCRTL.MAC.
+# dcc's directory also provides dccpeep, dccrtlstrip, m80c, m80.com, l80.com, and DCCRTL.MAC.
 export PATH="$PATH:/path/to/dcc:/path/to/ntvcm"
 ```
 

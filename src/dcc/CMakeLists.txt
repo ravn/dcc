@@ -13,8 +13,9 @@
 cmake_minimum_required(VERSION 3.10)
 project(dcc C)
 
-set(CMAKE_C_STANDARD 90)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -28,6 +29,8 @@ set(DCC_SOURCES
     dcc_asmname.c
     dcc_diag_emit.c
     dcc_preproc.c
+    dcc_pp_expr.c      # preprocessor #if/#elif expression evaluator
+    dcc_global_scan.c  # whole-file global write/address pre-scan
     dcc_types.c
     dcc_constexpr.c
     dcc_symbols.c
@@ -40,6 +43,11 @@ set(DCC_SOURCES
     dcc_decl.c
     dcc_stmt.c
     dcc_func.c
+    dcc_global_init.c   # file-scope object initializer parsing (split from dcc_func.c)
+    dcc_regalloc.c      # speculative no-IX / BC-regalloc codegen (split from dcc_func.c)
+    dcc_loop_regalloc.c # loop-scoped BC register allocation
+    dcc_array_narrow.c  # conservative byte-narrowing proof
+    dcc_licm.c          # loop-invariant code motion / CSE
     dcc_data.c
     dcc_ast.c           # function-local AST (arena + nodes)
     dcc_ast_build.c     # function-local AST builder
@@ -50,7 +58,8 @@ set(DCC_SOURCES
     dcc_ast_gen_stmt.c      # AST statement/switch/for emitters
 )
 
-add_executable(dcc ${DCC_SOURCES} dcc.h dcc_ast_gen_internal.h)
+add_executable(dcc ${DCC_SOURCES} dcc.h dcc_ast_gen_internal.h
+                   dcc_preproc_internal.h dcc_regalloc_internal.h)
 target_include_directories(dcc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")

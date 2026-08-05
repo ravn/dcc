@@ -56,6 +56,8 @@ dcc -> dccpeep -> M80 -> dccrtlstrip -> M80 -> L80 pipeline, runs the produced
 param(
     [string]$Emulator = "ntvcm",
     [switch]$NoStackCheck,
+    [switch]$UseEmulatedM80,
+    [switch]$UseEmulatedL80,
     [string]$BuildDir = "build/extended-tests",
     [string]$SuiteDir = "tests/extended-tests/tests/single-exec",
     [ValidateSet("fast", "nopeep", "full")]
@@ -323,6 +325,8 @@ function Invoke-ExtendedTest {
         [string]$BuildDir,
         [string]$RepoRoot,
         [string]$Emulator,
+        [switch]$UseEmulatedM80,
+        [switch]$UseEmulatedL80,
         [string[]]$EmulatorRunArgs,
         [int]$RunTimeout
     )
@@ -362,6 +366,12 @@ function Invoke-ExtendedTest {
         }
         if ($null -ne $Case.DccLongio) {
             $buildArgs += "dcc-flongio=$([string](ConvertTo-BooleanSetting $Case.DccLongio))"
+        }
+        if ($UseEmulatedM80) {
+            $buildArgs += "dcc-use-emulated-m80=true"
+        }
+        if ($UseEmulatedL80) {
+            $buildArgs += "dcc-use-emulated-l80=true"
         }
         if ($Case.DccArgs) {
             $buildArgs += @($Case.DccArgs -split '\s+' | Where-Object { $_ })
@@ -458,10 +468,46 @@ function Ensure-ExtendedTestSubmodule {
     $suitePath = if ([System.IO.Path]::IsPathRooted($SuiteDir)) { $SuiteDir } else { Join-Path $RepoRoot $SuiteDir }
     if (Test-Path -LiteralPath $suitePath -PathType Container) { return }
 
-    Write-Host "Extended test submodule not initialized; running git submodule update --init -- $SubmodulePath" -ForegroundColor Cyan
-    $initResult = Invoke-ProcessWithTimeout -FilePath "git" -Arguments @("submodule", "update", "--init", "--", $SubmodulePath) -WorkingDirectory $RepoRoot -TimeoutSeconds 0
-    if ($initResult.ExitCode -ne 0) {
-        Write-Error "Failed to initialize extended test submodule at $SubmodulePath.`n$($initResult.Output)"
+    # The normal case: $RepoRoot is a real git working tree, so `git submodule
+    # update --init` both populates the folder and wires up proper submodule
+    # metadata (gitlink, .git/modules/...) for later `git submodule` commands.
+    $isGitRepo = Test-Path -LiteralPath (Join-Path $RepoRoot ".git")
+    if ($isGitRepo) {
+        Write-Host "Extended test submodule not initialized; running git submodule update --init -- $SubmodulePath" -ForegroundColor Cyan
+        $initResult = Invoke-ProcessWithTimeout -FilePath "git" -Arguments @("submodule", "update", "--init", "--", $SubmodulePath) -WorkingDirectory $RepoRoot -TimeoutSeconds 0
+        if ($initResult.ExitCode -eq 0) { return }
+        Write-Host "git submodule update failed; falling back to a direct clone of the submodule's own URL.`n$($initResult.Output)" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "$RepoRoot is not a git repository (no .git found) - e.g. a plain copy of the repo used for testing elsewhere. Cloning the extended-tests submodule directly instead of using git submodule, which needs a git working tree." -ForegroundColor Cyan
+    }
+
+    # Fallback for a non-git copy of the repo (or a submodule update that failed
+    # for some other reason): `git clone` needs no existing git context for its
+    # destination, only network access to the submodule's own URL, so it works
+    # unconditionally here as long as .gitmodules is present - a plain text
+    # file, not git metadata, so it survives a non-git copy of the repo.
+    $gitModulesPath = Join-Path $RepoRoot ".gitmodules"
+    if (-not (Test-Path -LiteralPath $gitModulesPath -PathType Leaf)) {
+        Write-Error "Failed to initialize extended test submodule at $SubmodulePath : no .gitmodules found at $gitModulesPath to read its URL from."
+        exit 1
+    }
+    $urlResult = Invoke-ProcessWithTimeout -FilePath "git" -Arguments @("config", "--file", $gitModulesPath, "--get", "submodule.$SubmodulePath.url") -WorkingDirectory $RepoRoot -TimeoutSeconds 0
+    $submoduleUrl = $urlResult.Output.Trim()
+    if ($urlResult.ExitCode -ne 0 -or -not $submoduleUrl) {
+        Write-Error "Failed to initialize extended test submodule at $SubmodulePath : could not read its URL from $gitModulesPath.`n$($urlResult.Output)"
+        exit 1
+    }
+
+    # Clone to the submodule's own root (tests/extended-tests), NOT $suitePath -
+    # $SuiteDir/$suitePath can point deeper inside the submodule's own tree
+    # (e.g. tests/extended-tests/tests/single-exec), and cloning there would
+    # put the repo's content one or more levels too deep.
+    $submoduleRootPath = if ([System.IO.Path]::IsPathRooted($SubmodulePath)) { $SubmodulePath } else { Join-Path $RepoRoot $SubmodulePath }
+    Write-Host "Cloning $submoduleUrl into $submoduleRootPath ..." -ForegroundColor Cyan
+    $cloneResult = Invoke-ProcessWithTimeout -FilePath "git" -Arguments @("clone", "--depth", "1", $submoduleUrl, $submoduleRootPath) -WorkingDirectory $RepoRoot -TimeoutSeconds 0
+    if ($cloneResult.ExitCode -ne 0) {
+        Write-Error "Failed to initialize extended test submodule at $SubmodulePath.`n$($cloneResult.Output)"
         exit 1
     }
 }
@@ -603,7 +649,7 @@ if ($Parallel) {
         ${function:Invoke-ExtendedTest} = $using:invokeDef
         $caseBuildDir = Join-Path $using:BuildDir $case.Name
         Invoke-ExtendedTest -Case $case -Modes $using:modes -BuildDir $caseBuildDir -RepoRoot $using:repoRoot `
-            -Emulator $using:Emulator -EmulatorRunArgs $using:runArgs -RunTimeout $using:RunTimeout
+            -Emulator $using:Emulator -UseEmulatedM80:$using:UseEmulatedM80 -UseEmulatedL80:$using:UseEmulatedL80 -EmulatorRunArgs $using:runArgs -RunTimeout $using:RunTimeout
     } | ForEach-Object {
         $result = $_
         $results += $result
@@ -616,7 +662,7 @@ else {
     foreach ($case in $allCases) {
         $done++
         $result = Invoke-ExtendedTest -Case $case -Modes $modes -BuildDir $BuildDir -RepoRoot $repoRoot `
-            -Emulator $Emulator -EmulatorRunArgs $emulatorRunArgs -RunTimeout $RunTimeout
+            -Emulator $Emulator -UseEmulatedM80:$UseEmulatedM80 -UseEmulatedL80:$UseEmulatedL80 -EmulatorRunArgs $emulatorRunArgs -RunTimeout $RunTimeout
         $results += $result
         Show-ExtendedResult -Result $result -Index $done -Total $totalToRun
     }
@@ -633,7 +679,7 @@ if ($Parallel) {
 
             $retryBuildDir = Join-Path $BuildDir $case[0].Name
             $retryResult = Invoke-ExtendedTest -Case $case[0] -Modes $modes -BuildDir $retryBuildDir -RepoRoot $repoRoot `
-                -Emulator $Emulator -EmulatorRunArgs $emulatorRunArgs -RunTimeout $RunTimeout
+                -Emulator $Emulator -UseEmulatedM80:$UseEmulatedM80 -UseEmulatedL80:$UseEmulatedL80 -EmulatorRunArgs $emulatorRunArgs -RunTimeout $RunTimeout
 
             $retryStatus = if ($retryResult.Passed) { "PASS" } else { "FAIL" }
             $retryColor = if ($retryResult.Passed) { "Green" } else { "Red" }

@@ -19,7 +19,12 @@ The runner honors tests/_test_overrides.json for per-app args, stdin, ignore,
 and host-only skip settings. Tests that explicitly depend on CP/M/Z80-only
 services (BDOS, direct port I/O, getch/kbhit console polling, #asm blocks, or
 CP/M vector reads) are skipped because host compilers cannot execute those
-semantics.
+semantics. A per-app "host-cflags" string in that same file fully replaces the
+default `-std=gnu99 -w -O2` for one test's host build only - e.g. a test whose
+own point is C89 implicit-int declarator grammar needs `-std=gnu89` to compile
+under a strict-by-default host compiler; a test whose correctness check is
+sensitive to a specific host compiler's optimizer (not to dcc, which is
+unaffected either way) may need `-O0` instead of `-O2`.
 
 .PARAMETER RunTimeout
     Max seconds to let a host test executable run (default: 10).
@@ -36,6 +41,14 @@ semantics.
 
 .PARAMETER App
   Validate only one test app name, without .c.
+
+.PARAMETER Serial
+  Build and run apps sequentially. By default the suite runs in parallel
+  (one runspace per app, each with its own build subdirectory); use
+  -Serial as a fallback (e.g. for debugging or on constrained machines).
+
+.PARAMETER ThrottleLimit
+  Max concurrent apps in parallel mode (default: CPU core count).
 
 .PARAMETER Help
   Show this help text and exit without building or running tests.
@@ -57,6 +70,8 @@ param(
     [string]$CC,
     [string]$App,
     [int]$RunTimeout = 10,
+    [switch]$Serial,
+    [int]$ThrottleLimit = [Environment]::ProcessorCount,
     [switch]$Help
 )
 
@@ -336,20 +351,38 @@ You can also pass a compiler explicitly:
             [object]$Compiler,
             [string]$SourceFile,
             [string]$ExePath,
-            [string]$WorkDir
+            [string]$WorkDir,
+            [string]$RepoRoot,
+            [string]$HostCflags
         )
+
+        # Force-included on every host build: supplies host-libc equivalents
+        # for dcc RTL extensions (e.g. stricmp) that tests use directly by
+        # their dcc name. See the header itself for what belongs here vs. in
+        # tests/_test_overrides.json's host/ignore flags. Absolute path:
+        # MSVC's /FI does not reliably fall back to searching the process's
+        # current directory for a relative force-include the way gcc/clang's
+        # -include (and a plain #include "...") do.
+        $preludePath = Join-Path $RepoRoot "tests/host-validate-prelude.h"
 
         if ($Compiler.Kind -eq "msvc") {
             $objPath = Join-Path $WorkDir ([System.IO.Path]::GetFileNameWithoutExtension($ExePath) + ".obj")
-            $arguments = @("/nologo", "/w", "/O2", "/Zc:__STDC__", "/std:c11", "/Fe:$ExePath", "/Fo:$objPath", $SourceFile)
+            $arguments = @("/nologo", "/w", "/O2", "/Zc:__STDC__", "/std:c11", "/FI", $preludePath, "/Fe:$ExePath", "/Fo:$objPath", $SourceFile)
             $output = & $Compiler.Command @arguments 2>&1
             return [pscustomobject]@{ Success = ($LASTEXITCODE -eq 0 -and (Test-Path $ExePath -PathType Leaf)); Output = ($output -join "`n") }
         }
 
-        $baseCflags = if ($env:CFLAGS) { @($env:CFLAGS -split "\s+" | Where-Object { $_ }) } else { @("-std=gnu99", "-w", "-O2") }
+        # A per-app tests/_test_overrides.json "host-cflags" string takes
+        # priority over $env:CFLAGS: it's a correctness requirement for that
+        # one test (e.g. -std=gnu89 for a K&R implicit-int regression test,
+        # or -O0 where a specific host compiler's optimizer doesn't preserve
+        # a property the test checks), not a general build preference.
+        $baseCflags = if ($HostCflags) { @($HostCflags -split "\s+" | Where-Object { $_ }) }
+                      elseif ($env:CFLAGS) { @($env:CFLAGS -split "\s+" | Where-Object { $_ }) }
+                      else { @("-std=gnu99", "-w", "-O2") }
         if ($baseCflags -notcontains "-fsigned-char") { $baseCflags += "-fsigned-char" }
         if ($IsMacOS -and ($baseCflags -notcontains "-fno-common")) { $baseCflags += "-fno-common" }
-        $arguments = @($baseCflags) + @($Compiler.CFlags) + @($SourceFile, "-o", $ExePath, "-lm")
+        $arguments = @($baseCflags) + @($Compiler.CFlags) + @("-include", $preludePath, $SourceFile, "-o", $ExePath, "-lm")
         $output = & $Compiler.Command @arguments 2>&1
         return [pscustomobject]@{ Success = ($LASTEXITCODE -eq 0 -and (Test-Path $ExePath -PathType Leaf)); Output = ($output -join "`n") }
     }
@@ -399,7 +432,12 @@ You can also pass a compiler explicitly:
             [string]$AppName,
             [object]$Compiler,
             [object[]]$Fixtures,
-            [System.Collections.IDictionary]$Placeholders
+            [System.Collections.IDictionary]$Placeholders,
+            [string]$BuildRoot,
+            [string]$BaselineDir,
+            [int]$RunTimeout,
+            [System.Collections.IDictionary]$Overrides,
+            [string]$RepoRoot
         )
 
         $lines = [System.Collections.Generic.List[string]]::new()
@@ -413,7 +451,7 @@ You can also pass a compiler explicitly:
             return [pscustomobject]@{ App = $AppName; Status = "Skipped"; Passed = $true; Elapsed = $sw.Elapsed; Lines = $lines.ToArray() }
         }
 
-        $appBuildDir = Join-Path $buildRoot $AppName
+        $appBuildDir = Join-Path $BuildRoot $AppName
         if (-not (Test-Path $appBuildDir -PathType Container)) {
             New-Item -ItemType Directory -Path $appBuildDir -Force | Out-Null
         }
@@ -423,7 +461,8 @@ You can also pass a compiler explicitly:
         $exePath = Join-Path $appBuildDir $exeName
         Remove-Item -LiteralPath $exePath -Force -ErrorAction SilentlyContinue
 
-        $compile = Invoke-HostCompile -Compiler $Compiler -SourceFile $sourceFile -ExePath $exePath -WorkDir $appBuildDir
+        $hostCflags = Get-AppHostCflags -Name $AppName -Overrides $Overrides
+        $compile = Invoke-HostCompile -Compiler $Compiler -SourceFile $sourceFile -ExePath $exePath -WorkDir $appBuildDir -RepoRoot $RepoRoot -HostCflags $hostCflags
         if (-not $compile.Success) {
             $sw.Stop()
             $lines.Add("    COMPILE FAILED")
@@ -432,7 +471,7 @@ You can also pass a compiler explicitly:
         }
         $lines.Add("    Host build complete")
 
-        $run = Invoke-HostApp -ExePath $exePath -WorkDir $appBuildDir -RunArgs (Get-AppArgs $AppName) -RunStdin (Get-AppStdin $AppName) -TimeoutSeconds $RunTimeout
+        $run = Invoke-HostApp -ExePath $exePath -WorkDir $appBuildDir -RunArgs (Get-AppArgs -Name $AppName -Overrides $Overrides) -RunStdin (Get-AppStdin -Name $AppName -Overrides $Overrides) -TimeoutSeconds $RunTimeout
         if ($run.TimedOut) {
             $sw.Stop()
             $lines.Add("    ERROR: host app timed out after $RunTimeout seconds")
@@ -492,34 +531,47 @@ You can also pass a compiler explicitly:
             if ($item.ignore) { $appOverrides[$item.name]['ignore'] = $item.ignore }
             if ($item.host) { $appOverrides[$item.name]['host'] = $item.host }
             if ($item.'requires-32bit-linux-host-compiler') { $appOverrides[$item.name]['requires32'] = $true }
+            if ($item.'requires-non-msvc-host-compiler') { $appOverrides[$item.name]['requiresNonMsvc'] = $true }
+            if ($item.'host-cflags') { $appOverrides[$item.name]['hostCflags'] = $item.'host-cflags' }
         }
     }
 
     function Get-AppArgs {
-        param([string]$Name)
-        if ($appOverrides.ContainsKey($Name) -and $appOverrides[$Name]['args']) { return $appOverrides[$Name]['args'] }
+        param([string]$Name, [System.Collections.IDictionary]$Overrides)
+        if ($Overrides.ContainsKey($Name) -and $Overrides[$Name]['args']) { return $Overrides[$Name]['args'] }
         return ""
     }
 
     function Get-AppStdin {
-        param([string]$Name)
-        if ($appOverrides.ContainsKey($Name) -and $appOverrides[$Name]['stdin']) { return $appOverrides[$Name]['stdin'] }
+        param([string]$Name, [System.Collections.IDictionary]$Overrides)
+        if ($Overrides.ContainsKey($Name) -and $Overrides[$Name]['stdin']) { return $Overrides[$Name]['stdin'] }
         return ""
     }
 
     function Get-IgnoreApp {
-        param([string]$Name)
-        return ($appOverrides.ContainsKey($Name) -and $appOverrides[$Name]['ignore'])
+        param([string]$Name, [System.Collections.IDictionary]$Overrides)
+        return ($Overrides.ContainsKey($Name) -and $Overrides[$Name]['ignore'])
     }
 
     function Get-IgnoreHostApp {
-        param([string]$Name)
-        return ($appOverrides.ContainsKey($Name) -and $appOverrides[$Name]['host'])
+        param([string]$Name, [System.Collections.IDictionary]$Overrides)
+        return ($Overrides.ContainsKey($Name) -and $Overrides[$Name]['host'])
     }
 
     function Get-Requires32BitApp {
-        param([string]$Name)
-        return ($appOverrides.ContainsKey($Name) -and $appOverrides[$Name]['requires32'])
+        param([string]$Name, [System.Collections.IDictionary]$Overrides)
+        return ($Overrides.ContainsKey($Name) -and $Overrides[$Name]['requires32'])
+    }
+
+    function Get-RequiresNonMsvcApp {
+        param([string]$Name, [System.Collections.IDictionary]$Overrides)
+        return ($Overrides.ContainsKey($Name) -and $Overrides[$Name]['requiresNonMsvc'])
+    }
+
+    function Get-AppHostCflags {
+        param([string]$Name, [System.Collections.IDictionary]$Overrides)
+        if ($Overrides.ContainsKey($Name) -and $Overrides[$Name]['hostCflags']) { return $Overrides[$Name]['hostCflags'] }
+        return ""
     }
 
     $Placeholders = [ordered]@{
@@ -562,17 +614,20 @@ You can also pass a compiler explicitly:
     Write-Host "STARTING HOST BASELINE VALIDATION" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
 
-    $suiteStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    # Filter first (ignore/host-skip are cheap, synchronous decisions) so both
+    # the serial and parallel paths below only ever touch apps that actually
+    # need a compile+run.
+    $appsToRun = [System.Collections.Generic.List[string]]::new()
     foreach ($appName in $testFiles) {
-        if (Get-IgnoreApp $appName) {
+        if (Get-IgnoreApp -Name $appName -Overrides $appOverrides) {
             $skippedByConfig++
             continue
         }
-        if (Get-IgnoreHostApp $appName) {
+        if (Get-IgnoreHostApp -Name $appName -Overrides $appOverrides) {
             # Tests flagged requires-32bit-linux-host-compiler are skipped on a
             # normal 64-bit host, but a 32-bit Linux compiler (-m32 makes long
             # 4 bytes) reproduces dcc's long width, so run them in that case.
-            if ($m32Active -and (Get-Requires32BitApp $appName)) {
+            if ($m32Active -and (Get-Requires32BitApp -Name $appName -Overrides $appOverrides)) {
                 # fall through and validate under -m32
             }
             else {
@@ -580,9 +635,63 @@ You can also pass a compiler explicitly:
                 continue
             }
         }
-        $result = Invoke-AppValidation -AppName $appName -Compiler $compiler -Fixtures $fixtureList -Placeholders $Placeholders
-        $results += $result
-        Show-AppResult $result
+        if ($compiler.Kind -eq "msvc" -and (Get-RequiresNonMsvcApp -Name $appName -Overrides $appOverrides)) {
+            # MSVC-specific C99 gaps (no VLAs, no array-parameter qualifiers,
+            # static _Bool initializers not normalized to 0/1) that gcc/clang
+            # handle fine - skip only on MSVC, still validate elsewhere.
+            $skippedByHostConfig++
+            continue
+        }
+        $appsToRun.Add($appName)
+    }
+
+    $suiteStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    if ($Serial) {
+        foreach ($appName in $appsToRun) {
+            $result = Invoke-AppValidation -AppName $appName -Compiler $compiler -Fixtures $fixtureList `
+                -Placeholders $Placeholders -BuildRoot $buildRoot -BaselineDir $BaselineDir `
+                -RunTimeout $RunTimeout -Overrides $appOverrides -RepoRoot $repoRoot
+            $results += $result
+            Show-AppResult $result
+        }
+    }
+    else {
+        Write-Host "(parallel, throttle = $ThrottleLimit)" -ForegroundColor Cyan
+
+        # Each worker runs in its own runspace; Invoke-AppValidation gives every
+        # app its own build subdirectory (build/host-validate/<app>), so
+        # concurrent compiles/runs never clobber each other's output files.
+        $repoRootForWorkers = $repoRoot
+        $iavDef  = ${function:Invoke-AppValidation}.ToString()
+        $ihcDef  = ${function:Invoke-HostCompile}.ToString()
+        $ihaDef  = ${function:Invoke-HostApp}.ToString()
+        $tmbDef  = ${function:Test-MatchesBaseline}.ToString()
+        $tucofDef = ${function:Test-UsesCpmOnlyFeature}.ToString()
+        $cffhrDef = ${function:Copy-FixtureForHostRun}.ToString()
+        $gaaDef  = ${function:Get-AppArgs}.ToString()
+        $gasDef  = ${function:Get-AppStdin}.ToString()
+        $gahcDef = ${function:Get-AppHostCflags}.ToString()
+
+        $appsToRun | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+            Set-Location $using:repoRootForWorkers
+            ${function:Invoke-AppValidation}    = $using:iavDef
+            ${function:Invoke-HostCompile}      = $using:ihcDef
+            ${function:Invoke-HostApp}          = $using:ihaDef
+            ${function:Test-MatchesBaseline}    = $using:tmbDef
+            ${function:Test-UsesCpmOnlyFeature} = $using:tucofDef
+            ${function:Copy-FixtureForHostRun}  = $using:cffhrDef
+            ${function:Get-AppArgs}             = $using:gaaDef
+            ${function:Get-AppStdin}            = $using:gasDef
+            ${function:Get-AppHostCflags}       = $using:gahcDef
+
+            Invoke-AppValidation -AppName $_ -Compiler $using:compiler -Fixtures $using:fixtureList `
+                -Placeholders $using:Placeholders -BuildRoot $using:buildRoot -BaselineDir $using:BaselineDir `
+                -RunTimeout $using:RunTimeout -Overrides $using:appOverrides -RepoRoot $using:repoRootForWorkers
+        } | ForEach-Object {
+            $results += $_
+            Show-AppResult $_
+        }
     }
     $suiteStopwatch.Stop()
 

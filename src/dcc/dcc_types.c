@@ -31,20 +31,32 @@ int is_restrict_qualifier_token(void)
     /* `restrict` is a C99/C11 keyword but dcc's lexer has no dedicated token
      * for it, so it arrives as an identifier.  Treat it as a type qualifier
      * everywhere ordinary const/volatile qualifiers are accepted. */
-    return tok.kind == TOK_ID && !strcmp(tok.text, "restrict");
+    return g_lex.tok.kind == TOK_ID && !strcmp(g_lex.tok.text, "restrict");
 }
 
 void skip_parameter_array_qualifiers(void)
 {
-    while (is_type_qualifier_token(tok.kind) || is_restrict_qualifier_token() ||
-           tok.kind == TOK_STATIC)
+    while (is_type_qualifier_token(g_lex.tok.kind) || is_restrict_qualifier_token() ||
+           g_lex.tok.kind == TOK_STATIC)
         next_token();
 }
 
 void skip_type_qualifiers(void)
 {
-    while (is_type_qualifier_token(tok.kind) || is_restrict_qualifier_token())
+    (void)skip_type_qualifiers_volatile();
+}
+
+int skip_type_qualifiers_volatile(void)
+{
+    int saw_volatile;
+
+    saw_volatile = 0;
+    while (is_type_qualifier_token(g_lex.tok.kind) || is_restrict_qualifier_token()) {
+        if (g_lex.tok.kind == TOK_VOLATILE)
+            saw_volatile = 1;
         next_token();
+    }
+    return saw_volatile;
 }
 
 int parse_type(void);
@@ -52,8 +64,6 @@ int is_unsupported_target_type_name(const char *name)
 {
     return name && (!strcmp(name, "double") || !strcmp(name, "int64_t") || !strcmp(name, "uint64_t"));
 }
-int parse_const_int_expr(void);
-
 int type_struct_id(int type)
 {
     return (type / 256) & 255;
@@ -110,6 +120,17 @@ int object_array_size(int type, int count)
         base_size = 2;
 
     return base_size * count;
+}
+
+int target_size_multiply(int left, int right, int *result)
+{
+    if (left < 0 || right < 0 || (right != 0 && left > 65535 / right)) {
+        result[0] = 0;
+        return 0;
+    }
+
+    result[0] = left * right;
+    return 1;
 }
 
 /*
@@ -228,7 +249,7 @@ void copy_last_array_dims_to_sym(struct Sym *s)
     int i;
 
     s->dim_count = g_last_array_dim_count;
-    for (i = 0; i < 8; ++i)
+    for (i = 0; i < MAX_ARRAY_DIMS; ++i)
         s->dims[i] = (i < g_last_array_dim_count) ? g_last_array_dims[i] : 0;
 }
 
@@ -378,6 +399,7 @@ static void promote_anonymous_aggregate_fields(int parent_struct_id, struct Fiel
         field_defs[nfield_defs] = field_defs[i];
         field_defs[nfield_defs].parent_struct_id = parent_struct_id;
         field_defs[nfield_defs].offset += anon_fd->offset;
+        field_defs[nfield_defs].is_volatile |= anon_fd->is_volatile;
         field_defs[nfield_defs].is_anonymous = 0;
         field_defs[nfield_defs].is_promoted = 1;
         nfield_defs++;
@@ -392,6 +414,9 @@ void parse_struct_definition(int struct_id)
     int bytes;
     int bit_next;
     int bit_unit_offset;
+    int decl_type;
+    int field_base_is_volatile;
+    int field_base_pointee_is_volatile;
 
     sd = &struct_defs[struct_id - 1];
 
@@ -403,22 +428,44 @@ void parse_struct_definition(int struct_id)
     bit_next = 0;
     bit_unit_offset = 0;
 
-    while (tok.kind != TOK_EOF && tok.kind != '}') {
-        ftype = parse_type();
+    while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}') {
+        /* C11 6.7.2.1: a static_assert-declaration is a valid struct-declaration.
+         * It contributes no member and is consumed (through its ';') here. */
+        if (g_lex.tok.kind == TOK_STATIC_ASSERT) {
+            parse_static_assert_decl();
+            continue;
+        }
+        decl_type = parse_type();
+        field_base_is_volatile = g_decl.is_volatile;
+        field_base_pointee_is_volatile = g_decl.pointee_is_volatile;
 
         for (;;) {
             int is_funcptr_field;
             int is_anonymous_field;
+            int is_unnamed_bitfield;
             int field_index;
-            while (accept('*')) { skip_type_qualifiers(); ftype = type_add_ptr(ftype); }
+            ftype = decl_type;
+            g_decl.is_volatile = field_base_is_volatile;
+            g_decl.pointee_is_volatile = field_base_pointee_is_volatile;
+            while (accept('*')) {
+                g_decl.pointee_is_volatile = g_decl.is_volatile;
+                g_decl.is_volatile = skip_type_qualifiers_volatile();
+                ftype = type_add_ptr(ftype);
+            }
 
             is_funcptr_field = 0;
             is_anonymous_field = 0;
+            is_unnamed_bitfield = 0;
             if (parse_funcptr_declarator(&ftype, fname, sizeof(fname))) {
                 is_funcptr_field = 1;
             } else {
-                if (tok.kind != TOK_ID) {
-                    if (tok.kind == ';' && (ftype & TYPE_STRUCT) && type_ptr_depth(ftype) == 0) {
+                if (g_lex.tok.kind != TOK_ID) {
+                    if (g_lex.tok.kind == ':' && (ftype & 15) == TYPE_INT &&
+                        type_ptr_depth(ftype) == 0) {
+                        fname[0] = 0;
+                        is_unnamed_bitfield = 1;
+                    } else if (g_lex.tok.kind == ';' && (ftype & TYPE_STRUCT) &&
+                               type_ptr_depth(ftype) == 0) {
                         fname[0] = 0;
                         is_anonymous_field = 1;
                     } else {
@@ -426,15 +473,15 @@ void parse_struct_definition(int struct_id)
                         break;
                     }
                 } else {
-                    dcc_copy_str(fname, sizeof(fname), tok.text);
+                    dcc_copy_str(fname, sizeof(fname), g_lex.tok.text);
                     next_token();
                 }
             }
 
-            if (tok.kind == ':') {
+            if (g_lex.tok.kind == ':') {
                 int bw;
                 next_token();
-                bw = parse_const_int_expr();
+                bw = parse_typed_const_int_expr();
                 if (bw < 0 || bw > 16) {
                     error_here("invalid bitfield width");
                     bw = 1;
@@ -444,11 +491,14 @@ void parse_struct_definition(int struct_id)
                     fatal("too many struct fields");
 
                 /* First-pass C89 bitfields: pack into 16-bit int units.
-                 * Zero-width fields force a new storage unit.  Named
-                 * zero-width fields are accepted but allocate no usable field.
+                 * A zero-width field forces the next field into a new storage
+                 * unit and allocates no field of its own (named or not).  It
+                 * still terminates a declarator, so consume the trailing ','
+                 * or leave the ';' for the caller.
                  */
                 if (bw == 0) {
                     bit_next = 0;
+                    if (!accept(',')) break;
                     continue;
                 }
                 if (bit_next == 0 || bit_next + bw > 16) {
@@ -461,12 +511,22 @@ void parse_struct_definition(int struct_id)
                     bit_next = 0;
                 }
 
+                /* An unnamed bit-field reserves bits in the current unit but is
+                 * not addressable and does not consume an initializer slot, so
+                 * it gets no field_defs entry. */
+                if (is_unnamed_bitfield) {
+                    bit_next += bw;
+                    if (!accept(',')) break;
+                    continue;
+                }
+
                 memset(&field_defs[nfield_defs], 0, sizeof(field_defs[nfield_defs]));
                 dcc_copy_str(field_defs[nfield_defs].name, sizeof(field_defs[nfield_defs].name), fname);
                 if ((ftype & 15) != TYPE_INT || type_ptr_depth(ftype) != 0)
                     error_here("bitfield type must be int or unsigned int");
                 field_defs[nfield_defs].type = ((ftype & TYPE_UNSIGNED) || g_parse_type_was_enum) ?
                     (TYPE_UNSIGNED | TYPE_INT) : TYPE_INT;
+                field_defs[nfield_defs].is_volatile = g_decl.is_volatile;
                 field_defs[nfield_defs].parent_struct_id = struct_id;
                 field_defs[nfield_defs].offset = bit_unit_offset;
                 field_defs[nfield_defs].elem_type = TYPE_UNSIGNED | TYPE_INT;
@@ -492,6 +552,7 @@ void parse_struct_definition(int struct_id)
             memset(&field_defs[nfield_defs], 0, sizeof(field_defs[nfield_defs]));
             dcc_copy_str(field_defs[nfield_defs].name, sizeof(field_defs[nfield_defs].name), fname);
             field_defs[nfield_defs].type = ftype;
+            field_defs[nfield_defs].is_volatile = g_decl.is_volatile;
             field_defs[nfield_defs].parent_struct_id = struct_id;
             /* union: all fields at offset 0; struct: cumulative */
             field_defs[nfield_defs].offset = sd->is_union ? 0 : sd->size;
@@ -509,14 +570,15 @@ void parse_struct_definition(int struct_id)
 
             while (accept('[')) {
                 int flen;
-                flen = parse_const_int_expr();
+                flen = parse_typed_array_bound_expr();
                 expect(']');
                 field_defs[nfield_defs].is_array = 1;
                 if (field_defs[nfield_defs].array_len == 0)
                     field_defs[nfield_defs].array_len = flen;
                 if (field_defs[nfield_defs].dim_count < 4)
                     field_defs[nfield_defs].dims[field_defs[nfield_defs].dim_count++] = flen;
-                bytes *= flen;
+                if (!target_size_multiply(bytes, flen, &bytes))
+                    error_here("object size exceeds 16-bit address space");
             }
 
             field_defs[nfield_defs].size = bytes;
@@ -529,7 +591,12 @@ void parse_struct_definition(int struct_id)
             if (sd->is_union) {
                 if (bytes > sd->size) sd->size = bytes;
             } else {
-                sd->size += bytes;
+                if (bytes > 65535 - sd->size) {
+                    error_here("object size exceeds 16-bit address space");
+                    sd->size = 0;
+                } else {
+                    sd->size += bytes;
+                }
             }
 
             if (is_anonymous_field)
@@ -555,9 +622,11 @@ int find_typedef(const char *name)
     return -1;
 }
 
-void add_typedef_name_ex(const char *name, int type, int array_len, int is_func)
+void add_typedef_name_ex(const char *name, int type, int array_len, int is_func,
+                         int is_volatile, int pointee_is_volatile)
 {
     int i;
+    int pi;
 
     i = find_typedef(name);
     if (i < 0) {
@@ -568,13 +637,20 @@ void add_typedef_name_ex(const char *name, int type, int array_len, int is_func)
     }
 
     typedefs[i].type = type;
+    typedefs[i].is_volatile = is_volatile;
+    typedefs[i].pointee_is_volatile = pointee_is_volatile;
     typedefs[i].array_len = array_len;
     typedefs[i].is_func = is_func;
+    typedefs[i].has_proto = g_funcptr_has_proto;
+    typedefs[i].proto_nargs = g_funcptr_proto_nargs;
+    typedefs[i].proto_variadic = g_funcptr_proto_variadic;
+    for (pi = 0; pi < MAX_PROTO_PARAMS; ++pi)
+        typedefs[i].proto_types[pi] = g_funcptr_proto_types[pi];
 }
 
 void add_typedef_name(const char *name, int type, int array_len)
 {
-    add_typedef_name_ex(name, type, array_len, 0);
+    add_typedef_name_ex(name, type, array_len, 0, 0, 0);
 }
 
 int parse_base_type(void)
@@ -605,26 +681,36 @@ int parse_base_type(void)
     storage_class_seen = 0;
     g_typedef_array_len = 0;
     g_typedef_is_func = 0;
-    decl_is_register = 0;
-    decl_is_const = 0;
-    decl_is_inline = 0;
+    g_typedef_has_proto = 0;
+    g_typedef_proto_nargs = 0;
+    g_typedef_proto_variadic = 0;
+    memset(g_typedef_proto_types, 0, sizeof(g_typedef_proto_types));
+    g_decl.is_register = 0;
+    g_decl.is_const = 0;
+    g_decl.is_volatile = 0;
+    g_decl.pointee_is_volatile = 0;
+    g_decl.is_inline = 0;
+    g_decl.is_noreturn = 0;
     g_parse_type_was_enum = 0;
 
     /* C89 declaration specifiers are order-independent. */
     for (;;) {
-        if (tok.kind == TOK_REGISTER) {
+        if (g_lex.tok.kind == TOK_REGISTER) {
             if (storage_class_seen)
                 error_here("multiple storage classes in declaration");
             storage_class_seen = 1;
-            decl_is_register = 1;
+            g_decl.is_register = 1;
             next_token();
             continue;
         }
-        if (tok.kind == TOK_CONST) { decl_is_const = 1; next_token(); continue; }
-        if (tok.kind == TOK_INLINE) { decl_is_inline = 1; next_token(); continue; }
-        if (tok.kind == TOK_VOLATILE ||
-            tok.kind == TOK_AUTO) {
-            if (tok.kind == TOK_AUTO) {
+        if (g_lex.tok.kind == TOK_CONST) { g_decl.is_const = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_INLINE) { g_decl.is_inline = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_NORETURN) { g_decl.is_noreturn = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_VOLATILE ||
+            g_lex.tok.kind == TOK_AUTO) {
+            if (g_lex.tok.kind == TOK_VOLATILE) {
+                g_decl.is_volatile = 1;
+            } else if (g_lex.tok.kind == TOK_AUTO) {
                 if (storage_class_seen)
                     error_here("multiple storage classes in declaration");
                 storage_class_seen = 1;
@@ -632,25 +718,25 @@ int parse_base_type(void)
             next_token();
             continue;
         }
-        if (tok.kind == TOK_EXTERN) {
+        if (g_lex.tok.kind == TOK_EXTERN) {
             if (storage_class_seen)
                 error_here("multiple storage classes in declaration");
             storage_class_seen = 1;
-            decl_is_extern = 1;
+            g_decl.is_extern = 1;
             next_token();
             continue;
         }
-        if (tok.kind == TOK_STATIC) {
+        if (g_lex.tok.kind == TOK_STATIC) {
             if (storage_class_seen)
                 error_here("multiple storage classes in declaration");
             storage_class_seen = 1;
-            decl_is_static = 1;
+            g_decl.is_static = 1;
             next_token();
             continue;
         }
-        if (tok.kind == TOK_UNSIGNED) { saw_unsigned = 1; saw_any = 1; next_token(); continue; }
-        if (tok.kind == TOK_SIGNED) { saw_any = 1; next_token(); continue; }
-        if (tok.kind == TOK_LONG) {
+        if (g_lex.tok.kind == TOK_UNSIGNED) { saw_unsigned = 1; saw_any = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_SIGNED) { saw_any = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_LONG) {
             if (saw_long && !saw_long_long) {
                 error_here("long long is not supported by dcc's CP/M/Z80 target; use long");
                 saw_long_long = 1;
@@ -660,24 +746,28 @@ int parse_base_type(void)
             next_token();
             continue;
         }
-        if (tok.kind == TOK_SHORT) { saw_short = 1; saw_any = 1; next_token(); continue; }
-        if (tok.kind == TOK_INT) { saw_any = 1; next_token(); continue; }
-        if (tok.kind == TOK_FLOAT) { saw_float = 1; saw_any = 1; next_token(); continue; }
-        if (tok.kind == TOK_BOOL) { saw_bool = 1; saw_any = 1; next_token(); continue; }
-        if (tok.kind == TOK_CHAR) { saw_char = 1; saw_any = 1; next_token(); continue; }
-        if (tok.kind == TOK_VOID) { saw_void = 1; saw_any = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_SHORT) { saw_short = 1; saw_any = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_INT) { saw_any = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_FLOAT) { saw_float = 1; saw_any = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_BOOL) { saw_bool = 1; saw_any = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_CHAR) { saw_char = 1; saw_any = 1; next_token(); continue; }
+        if (g_lex.tok.kind == TOK_VOID) { saw_void = 1; saw_any = 1; next_token(); continue; }
 
-        if (tok.kind == TOK_STRUCT || tok.kind == TOK_UNION) {
+        if (g_lex.tok.kind == TOK_STRUCT || g_lex.tok.kind == TOK_UNION) {
             int sid;
+            int struct_is_volatile;
+            int struct_pointee_is_volatile;
             char sname[64];
             int is_union_kw;
-            is_union_kw = (tok.kind == TOK_UNION);
+            struct_is_volatile = g_decl.is_volatile;
+            struct_pointee_is_volatile = g_decl.pointee_is_volatile;
+            is_union_kw = (g_lex.tok.kind == TOK_UNION);
             next_token();
-            if (tok.kind == TOK_ID) {
-                dcc_copy_str(sname, sizeof(sname), tok.text);
+            if (g_lex.tok.kind == TOK_ID) {
+                dcc_copy_str(sname, sizeof(sname), g_lex.tok.text);
                 next_token();
                 sid = add_struct_def(sname);
-            } else if (tok.kind == '{') {
+            } else if (g_lex.tok.kind == '{') {
                 sprintf(sname, "__anon_%d", ++g_anon_struct_counter);
                 sid = add_struct_def(sname);
             } else {
@@ -686,30 +776,34 @@ int parse_base_type(void)
                 sid = add_struct_def(sname);
             }
             if (is_union_kw) struct_defs[sid - 1].is_union = 1;
-            if (tok.kind == '{') parse_struct_definition(sid);
+            if (g_lex.tok.kind == '{') {
+                parse_struct_definition(sid);
+                g_decl.is_volatile = struct_is_volatile;
+                g_decl.pointee_is_volatile = struct_pointee_is_volatile;
+            }
             t = make_struct_type(sid);
             saw_any = 1;
             break;
         }
 
-        if (tok.kind == TOK_ENUM) {
+        if (g_lex.tok.kind == TOK_ENUM) {
             int cur_val;
             cur_val = 0;
             next_token();
-            if (tok.kind == TOK_ID) next_token();
-            if (tok.kind == '{') {
+            if (g_lex.tok.kind == TOK_ID) next_token();
+            if (g_lex.tok.kind == '{') {
                 next_token();
-                while (tok.kind != '}' && tok.kind != TOK_EOF) {
+                while (g_lex.tok.kind != '}' && g_lex.tok.kind != TOK_EOF) {
                     char ename[64];
                     int ei;
                     int dup;
-                    if (tok.kind != TOK_ID) {
+                    if (g_lex.tok.kind != TOK_ID) {
                         error_here("enum constant name expected");
-                        while (tok.kind != TOK_EOF && tok.kind != '}')
+                        while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}')
                             next_token();
                         break;
                     }
-                    dcc_copy_str(ename, sizeof(ename), tok.text);
+                    dcc_copy_str(ename, sizeof(ename), g_lex.tok.text);
                     next_token();
 
                     /* C89 enumerator values are integer constant expressions,
@@ -718,10 +812,15 @@ int parse_base_type(void)
                      * negative expressions. */
                     if (accept('=')) {
                         cur_val = parse_enum_const_value();
-                        if (tok.kind != ',' && tok.kind != '}') {
-                            while (tok.kind != TOK_EOF && tok.kind != '}')
+                        if (g_lex.tok.kind != ',' && g_lex.tok.kind != '}') {
+                            while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}')
                                 next_token();
                         }
+                    }
+
+                    if (cur_val < -32768 || cur_val > 32767) {
+                        error_here("enumerator value is not representable as 16-bit int");
+                        cur_val = 0;
                     }
 
                     dup = 0;
@@ -741,7 +840,7 @@ int parse_base_type(void)
                     if (!accept(',')) break;
                     /* Be liberal for common code that leaves a trailing comma
                      * before the closing brace. */
-                    if (tok.kind == '}') break;
+                    if (g_lex.tok.kind == '}') break;
                 }
                 expect('}');
             }
@@ -751,7 +850,7 @@ int parse_base_type(void)
             break;
         }
 
-        if (!saw_any && tok.kind == TOK_ID && !strcmp(tok.text, "double")) {
+        if (!saw_any && g_lex.tok.kind == TOK_ID && !strcmp(g_lex.tok.text, "double")) {
             error_here("double is not supported by dcc's CP/M/Z80 target; use float");
             saw_float = 1;
             saw_any = 1;
@@ -759,8 +858,8 @@ int parse_base_type(void)
             continue;
         }
 
-        if (!saw_any && tok.kind == TOK_ID &&
-            (!strcmp(tok.text, "int64_t") || !strcmp(tok.text, "uint64_t"))) {
+        if (!saw_any && g_lex.tok.kind == TOK_ID &&
+            (!strcmp(g_lex.tok.text, "int64_t") || !strcmp(g_lex.tok.text, "uint64_t"))) {
             error_here("64-bit integer types are not supported by dcc's CP/M/Z80 target; use long");
             saw_long = 1;
             saw_any = 1;
@@ -768,10 +867,17 @@ int parse_base_type(void)
             continue;
         }
 
-        if (!saw_any && tok.kind == TOK_ID && (td = find_typedef(tok.text)) >= 0) {
+        if (!saw_any && g_lex.tok.kind == TOK_ID && (td = find_typedef(g_lex.tok.text)) >= 0) {
             t = typedefs[td].type;
+            g_decl.is_volatile |= typedefs[td].is_volatile;
+            g_decl.pointee_is_volatile = typedefs[td].pointee_is_volatile;
             g_typedef_array_len = typedefs[td].array_len;
             g_typedef_is_func = typedefs[td].is_func;
+                 g_typedef_has_proto = typedefs[td].has_proto;
+                 g_typedef_proto_nargs = typedefs[td].proto_nargs;
+                 g_typedef_proto_variadic = typedefs[td].proto_variadic;
+                 memcpy(g_typedef_proto_types, typedefs[td].proto_types,
+                     sizeof(g_typedef_proto_types));
             saw_any = 1;
             next_token();
             break;
@@ -780,8 +886,12 @@ int parse_base_type(void)
     }
 
     if (!saw_any) {
-        error_here("type expected");
-        t = TYPE_INT;
+        if (storage_class_seen) {
+            t = TYPE_INT;
+        } else {
+            error_here("type expected");
+            t = TYPE_INT;
+        }
     } else if (t == 0) {
         if (saw_bool) t = TYPE_BOOL;
         else if (saw_float) t = TYPE_FLOAT;
@@ -793,7 +903,8 @@ int parse_base_type(void)
         if (saw_unsigned && t != TYPE_FLOAT && t != TYPE_VOID)
             t |= TYPE_UNSIGNED;
     }
-    skip_type_qualifiers();
+    if (skip_type_qualifiers_volatile())
+        g_decl.is_volatile = 1;
     return t;
 }
 
@@ -802,7 +913,8 @@ int parse_type(void)
     int t;
     t = parse_base_type();
     while (accept('*')) {
-        skip_type_qualifiers();
+        g_decl.pointee_is_volatile = g_decl.is_volatile;
+        g_decl.is_volatile = skip_type_qualifiers_volatile();
         t = type_add_ptr(t);
     }
     return t;
@@ -814,10 +926,10 @@ void skip_type_name_param_list(void)
 
     depth = 1;
     next_token();
-    while (tok.kind != TOK_EOF && depth > 0) {
-        if (tok.kind == '(')
+    while (g_lex.tok.kind != TOK_EOF && depth > 0) {
+        if (g_lex.tok.kind == '(')
             depth++;
-        else if (tok.kind == ')')
+        else if (g_lex.tok.kind == ')')
             depth--;
         next_token();
     }
@@ -845,7 +957,7 @@ int parse_type_name_decl(int *typep, int *sizep)
         sz = 2;
     }
 
-    if (tok.kind == '(') {
+    if (g_lex.tok.kind == '(') {
         next_token();
         skip_type_qualifiers();
         saw_paren_ptr = 0;
@@ -853,9 +965,9 @@ int parse_type_name_decl(int *typep, int *sizep)
             skip_type_qualifiers();
             saw_paren_ptr = 1;
         }
-        if (tok.kind == TOK_ID)
+        if (g_lex.tok.kind == TOK_ID)
             next_token();
-        if (tok.kind == ')') {
+        if (g_lex.tok.kind == ')') {
             next_token();
             if (saw_paren_ptr) {
                 t = type_add_ptr(t);
@@ -863,9 +975,9 @@ int parse_type_name_decl(int *typep, int *sizep)
                 size_is_pointer_object = 1;
             }
         } else {
-            while (tok.kind != TOK_EOF && tok.kind != ')')
+            while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != ')')
                 next_token();
-            if (tok.kind == ')')
+            if (g_lex.tok.kind == ')')
                 next_token();
             if (saw_paren_ptr) {
                 t = type_add_ptr(t);
@@ -873,7 +985,7 @@ int parse_type_name_decl(int *typep, int *sizep)
                 size_is_pointer_object = 1;
             }
         }
-    } else if (tok.kind == TOK_ID) {
+    } else if (g_lex.tok.kind == TOK_ID) {
         /* Also accept the same helper for declarations with a concrete name.
          * sizeof(type) normally uses an abstract declarator, but accepting an
          * identifier here lets the cast parser reuse the helper for old DCC
@@ -883,11 +995,11 @@ int parse_type_name_decl(int *typep, int *sizep)
     }
 
     for (;;) {
-        if (tok.kind == '[') {
+        if (g_lex.tok.kind == '[') {
             next_token();
             n = 0;
-            if (tok.kind != ']')
-                n = parse_const_int_expr();
+            if (g_lex.tok.kind != ']')
+                n = parse_typed_array_bound_expr();
             expect(']');
             if (n < 0)
                 n = 0;
@@ -900,7 +1012,7 @@ int parse_type_name_decl(int *typep, int *sizep)
              */
             if (!size_is_pointer_object)
                 sz *= n;
-        } else if (tok.kind == '(') {
+        } else if (g_lex.tok.kind == '(') {
             /* Function type suffix.  Function designators are pointer-sized
              * only when the declarator already introduced a pointer, e.g.
              *     sizeof(int (*)(int))
@@ -923,5 +1035,4 @@ int parse_type_name_decl(int *typep, int *sizep)
 }
 
 int parse_sizeof_expr_operand(void);
-long parse_const_long_expr(void);
 

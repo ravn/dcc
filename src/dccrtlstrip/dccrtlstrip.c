@@ -19,6 +19,8 @@
 #define MAX_SYMS    20000
 #define MAX_ROOTS   20000
 #define MAX_LINE      512
+#define MAX_SCAN_SYMS 60000
+#define SCAN_HASH_SIZE 65521
 
 struct Line {
     char *s;
@@ -28,6 +30,8 @@ struct Block {
     int start;
     int end;
     int keep;
+    int scanned;    /* has add_refs_from_line already run over [start,end)?
+                      * a line's refs never change, so this need happen once. */
     int dep;        /* block to keep when this block is kept, or -1 */
     char name[128];
 };
@@ -46,8 +50,89 @@ static int nblocks;
 static struct SymMap syms[MAX_SYMS];
 static int nsyms;
 
+/* Comprehensive name->block index covering syms[] plus every label and
+ * PUBLIC-mentioned name in every already-classified block, built once by
+ * build_scan_index() so find_sym_block is an O(1) lookup instead of the
+ * O(nlines) rescan find_symbol_block_by_scan used to do on every call. */
+static struct SymMap scan_syms[MAX_SCAN_SYMS];
+static int scan_next[MAX_SCAN_SYMS];
+static int scan_buckets[SCAN_HASH_SIZE];
+static int n_scan_syms;
+
 static char roots[MAX_ROOTS][128];
 static int nroots;
+
+/* Case-sensitive name hash shared by add_root/add_sym's dedup checks below.
+ * Both used to rescan their whole table (roots[]/syms[]) linearly on every
+ * insert, an O(n^2) cost in the number of roots/PUBLIC symbols that showed
+ * up as a str_ieq/strcmp hotspot under profiling - each is called once per
+ * distinct name candidate found while scanning the runtime and every app
+ * .MAC file, so n is easily in the thousands. */
+static unsigned name_hash_cs(const char *name)
+{
+    unsigned h = 0;
+    while (*name)
+        h = h * 131u + (unsigned char)*name++;
+    return h % SCAN_HASH_SIZE;
+}
+
+static int root_buckets[SCAN_HASH_SIZE];
+static int root_next[MAX_ROOTS];
+static int root_index_ready;
+
+static int root_index_find(const char *name)
+{
+    unsigned h;
+    int i;
+    if (!root_index_ready) return -1;
+    h = name_hash_cs(name);
+    for (i = root_buckets[h]; i >= 0; i = root_next[i])
+        if (!strcmp(roots[i], name))
+            return i;
+    return -1;
+}
+
+static void root_index_add(int idx)
+{
+    unsigned h;
+    int i;
+    if (!root_index_ready) {
+        for (i = 0; i < SCAN_HASH_SIZE; ++i) root_buckets[i] = -1;
+        root_index_ready = 1;
+    }
+    h = name_hash_cs(roots[idx]);
+    root_next[idx] = root_buckets[h];
+    root_buckets[h] = idx;
+}
+
+static int sym_buckets[SCAN_HASH_SIZE];
+static int sym_next[MAX_SYMS];
+static int sym_index_ready;
+
+static int sym_index_find(const char *name)
+{
+    unsigned h;
+    int i;
+    if (!sym_index_ready) return -1;
+    h = name_hash_cs(name);
+    for (i = sym_buckets[h]; i >= 0; i = sym_next[i])
+        if (!strcmp(syms[i].name, name))
+            return i;
+    return -1;
+}
+
+static void sym_index_add(int idx)
+{
+    unsigned h;
+    int i;
+    if (!sym_index_ready) {
+        for (i = 0; i < SCAN_HASH_SIZE; ++i) sym_buckets[i] = -1;
+        sym_index_ready = 1;
+    }
+    h = name_hash_cs(syms[idx].name);
+    sym_next[idx] = sym_buckets[h];
+    sym_buckets[h] = idx;
+}
 
 static char *xstrdup2(const char *s)
 {
@@ -151,33 +236,31 @@ static int ci_strncmp(const char *a, const char *b, int n)
 
 static void add_root(const char *name)
 {
-    int i;
     if (!name || !name[0]) return;
     if (is_number_token(name) || is_register_name(name)) return;
 
-    for (i = 0; i < nroots; ++i)
-        if (!strcmp(roots[i], name))
-            return;
+    if (root_index_find(name) >= 0)
+        return;
     if (nroots >= MAX_ROOTS) {
         fprintf(stderr, "too many roots\n");
         exit(1);
     }
     strncpy(roots[nroots], name, sizeof(roots[nroots]) - 1);
     roots[nroots][sizeof(roots[nroots]) - 1] = 0;
+    root_index_add(nroots);
     nroots++;
 }
 
 static void add_sym(const char *name, int block)
 {
-    int i;
+    int idx;
     if (!name || !name[0]) return;
-    for (i = 0; i < nsyms; ++i) {
-        if (!strcmp(syms[i].name, name)) {
-            /* Prefer the earliest block that actually owns the PUBLIC. */
-            if (syms[i].block < 0)
-                syms[i].block = block;
-            return;
-        }
+    idx = sym_index_find(name);
+    if (idx >= 0) {
+        /* Prefer the earliest block that actually owns the PUBLIC. */
+        if (syms[idx].block < 0)
+            syms[idx].block = block;
+        return;
     }
     if (nsyms >= MAX_SYMS) {
         fprintf(stderr, "too many symbols\n");
@@ -186,6 +269,7 @@ static void add_sym(const char *name, int block)
     strncpy(syms[nsyms].name, name, sizeof(syms[nsyms].name) - 1);
     syms[nsyms].name[sizeof(syms[nsyms].name) - 1] = 0;
     syms[nsyms].block = block;
+    sym_index_add(nsyms);
     nsyms++;
 }
 
@@ -202,67 +286,123 @@ static int str_ieq(const char *a, const char *b)
     return *a == 0 && *b == 0;
 }
 
-static int line_public_mentions(const char *line, const char *name)
-{
-    char clean[MAX_LINE];
-    const char *p;
-    char sym[128];
-
-    strip_comment_copy(line, clean, sizeof(clean));
-    p = skipws(clean);
-    if (ci_strncmp(p, "public", 6) != 0 ||
-        !(p[6] == ' ' || p[6] == '\t'))
-        return 0;
-    p += 6;
-
-    for (;;) {
-        p = skipws(p);
-        if (!parse_ident_token(&p, sym))
-            break;
-        if (str_ieq(sym, name))
-            return 1;
-        p = skipws(p);
-        if (*p == ',') {
-            p++;
-            continue;
-        }
-        break;
-    }
-    return 0;
-}
-
 static int line_label_is(const char *line, const char *name)
 {
     char lab[128];
     return parse_label(line, lab) && str_ieq(lab, name);
 }
 
-static int find_symbol_block_by_scan(const char *name)
+static unsigned scan_hash(const char *name)
+{
+    unsigned h = 0;
+    while (*name) {
+        h = h * 131u + (unsigned char)tolower((unsigned char)*name);
+        name++;
+    }
+    return h % SCAN_HASH_SIZE;
+}
+
+static void scan_index_insert(const char *name, int block)
+{
+    unsigned h;
+    int i;
+
+    if (!name || !name[0])
+        return;
+    h = scan_hash(name);
+    for (i = scan_buckets[h]; i >= 0; i = scan_next[i]) {
+        if (str_ieq(scan_syms[i].name, name))
+            return; /* first occurrence wins, matching the original
+                      * block-then-line scan order below */
+    }
+    if (n_scan_syms >= MAX_SCAN_SYMS) {
+        fprintf(stderr, "too many symbols\n");
+        exit(1);
+    }
+    strncpy(scan_syms[n_scan_syms].name, name, sizeof(scan_syms[n_scan_syms].name) - 1);
+    scan_syms[n_scan_syms].name[sizeof(scan_syms[n_scan_syms].name) - 1] = 0;
+    scan_syms[n_scan_syms].block = block;
+    scan_next[n_scan_syms] = scan_buckets[h];
+    scan_buckets[h] = n_scan_syms;
+    n_scan_syms++;
+}
+
+static int scan_index_lookup(const char *name)
+{
+    unsigned h = scan_hash(name);
+    int i;
+
+    for (i = scan_buckets[h]; i >= 0; i = scan_next[i]) {
+        if (str_ieq(scan_syms[i].name, name))
+            return scan_syms[i].block;
+    }
+    return -1;
+}
+
+/* Builds, once, the same name->block mapping find_symbol_block_by_scan used
+ * to recompute from scratch on every call: every label (parse_label) and
+ * every PUBLIC-mentioned name in every already-classified block. This is
+ * deliberately independent of the symbol table built by build_blocks(), so
+ * an app EXTRN can still keep a runtime block even if PUBLIC parsing missed
+ * that symbol or case differs after M80/L80 folding. Blocks/lines are
+ * walked in the same order the old per-query scan used, and
+ * scan_index_insert keeps only the first occurrence of a name, so lookups
+ * are identical to what that scan would have returned - just O(1) instead
+ * of O(nlines) per query.
+ *
+ * Primed with syms[] first (build_blocks() has already fully populated it
+ * by the time this runs), so a name present there always resolves to its
+ * block here too - preserving find_sym_block's original priority of
+ * checking syms[] before falling back to this broader scan, now that
+ * find_sym_block is just this one lookup instead of an O(nsyms) scan
+ * followed by the fallback. */
+static void build_scan_index(void)
 {
     int b, i;
 
-    /* Last-resort block ownership check.  This is deliberately independent
-     * of the symbol table built by build_blocks(), so an app EXTRN can still
-     * keep a runtime block even if PUBLIC parsing missed that symbol or case
-     * differs after M80/L80 folding. */
+    for (i = 0; i < SCAN_HASH_SIZE; ++i)
+        scan_buckets[i] = -1;
+    n_scan_syms = 0;
+
+    for (i = 0; i < nsyms; ++i)
+        scan_index_insert(syms[i].name, syms[i].block);
+
     for (b = 0; b < nblocks; ++b) {
         for (i = blocks[b].start; i < blocks[b].end; ++i) {
-            if (line_public_mentions(lines[i].s, name) ||
-                line_label_is(lines[i].s, name))
-                return b;
+            const char *line = lines[i].s;
+            char clean[MAX_LINE];
+            const char *p;
+            char sym[128];
+            char lab[128];
+
+            if (parse_label(line, lab))
+                scan_index_insert(lab, b);
+
+            strip_comment_copy(line, clean, sizeof(clean));
+            p = skipws(clean);
+            if (ci_strncmp(p, "public", 6) != 0 ||
+                !(p[6] == ' ' || p[6] == '\t'))
+                continue;
+            p += 6;
+            for (;;) {
+                p = skipws(p);
+                if (!parse_ident_token(&p, sym))
+                    break;
+                scan_index_insert(sym, b);
+                p = skipws(p);
+                if (*p == ',') {
+                    p++;
+                    continue;
+                }
+                break;
+            }
         }
     }
-
-    return -1;
 }
 
 static int find_sym_block(const char *name)
 {
-    int i;
-    for (i = 0; i < nsyms; ++i)
-        if (!strcmp(syms[i].name, name) || str_ieq(syms[i].name, name))
-            return syms[i].block;
-    return find_symbol_block_by_scan(name);
+    return scan_index_lookup(name);
 }
 
 static int parse_label(const char *line, char *lab)
@@ -731,13 +871,11 @@ static void add_refs_from_line(const char *line)
 }
 
 
-static int symbol_mentioned_in_line(const char *line, const char *sym)
+static int symbol_mentioned_in_clean_line(const char *clean, const char *sym)
 {
-    char clean[MAX_LINE];
     const char *p;
     int n;
 
-    strip_comment_copy(line, clean, sizeof(clean));
     n = (int)strlen(sym);
     if (n <= 0)
         return 0;
@@ -758,6 +896,7 @@ static int symbol_mentioned_in_line(const char *line, const char *sym)
 static void add_known_runtime_refs_from_line(const char *line)
 {
     int i;
+    char clean[MAX_LINE];
 
     /*
      * Fallback root scan: after the runtime has been parsed, every PUBLIC and
@@ -767,9 +906,17 @@ static void add_known_runtime_refs_from_line(const char *line)
      * keep that symbol's owning block.  This is intentionally conservative and
      * fixes cases such as the float-printf entry _pffio being emitted by dcc but
      * omitted from rtlmin.mac.
+     *
+     * Comment-stripping used to happen inside the per-symbol helper, so a
+     * single app line got re-stripped once per runtime symbol checked against
+     * it (profiled on cobint.c's ~21K-line .MAC: 36.5M redundant
+     * strip_comment_copy calls, ~75% of dccrtlstrip's total runtime). `line`
+     * is a pure function of its own text regardless of which symbol is being
+     * looked for, so strip it once here instead.
      */
+    strip_comment_copy(line, clean, sizeof(clean));
     for (i = 0; i < nsyms; ++i) {
-        if (symbol_mentioned_in_line(line, syms[i].name))
+        if (symbol_mentioned_in_clean_line(clean, syms[i].name))
             add_root(syms[i].name);
     }
 }
@@ -813,15 +960,29 @@ static void mark_reachable(void)
 {
     int changed;
     int i, b, pass_start, pass_end;
+    int roots_done;
 
     add_root("start");
+    roots_done = 0;
 
+    /* Worklist fixed point: a root's block mapping and a line's extracted
+     * refs are both pure functions of static data (the symbol table/blocks
+     * built once in build_blocks, and the line text), so re-resolving a root
+     * or re-scanning a block already processed in an earlier pass can only
+     * ever repeat the same answer. Track how far each has progressed so
+     * every root is resolved once and every kept block's lines are scanned
+     * for refs once, rather than the whole accumulated roots[]/blocks[] on
+     * every pass - this was previously O(passes * (nroots + kept lines)),
+     * dominated by find_sym_block's O(nlines) not-found fallback scan
+     * repeating for the same roots pass after pass (profiled: >80% of
+     * dccrtlstrip's runtime on a large app like cobint/tchess). */
     do {
         changed = 0;
 
-        for (i = 0; i < nroots; ++i)
+        for (i = roots_done; i < nroots; ++i)
             if (keep_block_for_symbol(roots[i]))
                 changed = 1;
+        roots_done = nroots;
 
         for (b = 0; b < nblocks; ++b) {
             if (!blocks[b].keep)
@@ -830,6 +991,9 @@ static void mark_reachable(void)
                 blocks[blocks[b].dep].keep = 1;
                 changed = 1;
             }
+            if (blocks[b].scanned)
+                continue;
+            blocks[b].scanned = 1;
 
             pass_start = blocks[b].start;
             pass_end = blocks[b].end;
@@ -989,6 +1153,7 @@ int main(int argc, char **argv)
 
     read_runtime(rt);
     build_blocks();
+    build_scan_index();
 
     for (i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-r") || !strcmp(argv[i], "-o")) {

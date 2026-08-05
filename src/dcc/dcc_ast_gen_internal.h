@@ -1,7 +1,8 @@
 /*
- * dcc_ast_gen_internal.h - internal prototypes shared across the
- * dcc_ast_gen* translation units.  Generated from the function
- * definitions; do not include outside the AST codegen module.
+ * dcc_ast_gen_internal.h - private contract shared by dcc_ast_gen*.c.
+ *
+ * Contains AST shape classifiers, emit helpers, and switch/codegen state.
+ * Do not include it outside the AST codegen module.
  */
 #ifndef DCC_AST_GEN_INTERNAL_H
 #define DCC_AST_GEN_INTERNAL_H
@@ -15,6 +16,13 @@ struct AstSwCtx { int *vals; int *labs; int n; int def_lab; };
 extern int ast_switch_gate_depth;
 extern struct AstSwCtx ast_sw_ctx[AST_MAX_SW_NEST];
 extern int ast_sw_depth;
+
+/* Maximum length of a pointer-to-array dereference chain
+ * (*(*(...(p + i0)...) + iN)).  A chain of N layers indexes a pointer whose
+ * element has N-1 array dimensions; the compiler caps array rank at
+ * MAX_ARRAY_DIMS, so the longest possible chain is MAX_ARRAY_DIMS + 1 layers. */
+#define DCC_MAX_DEREF_CHAIN MAX_INDEX_DEPTH
+
 
 int ident_supported(const char *name);
 int is_cmp_op(int op);
@@ -48,6 +56,14 @@ int ast_index_deref_pointer_array_collect(const struct AstNode *n,
                                                  const struct AstNode **idxs,
                                                  int *out_count,
                                                  int *out_type);
+int ast_deref_pointer_array_chain_collect(const struct AstNode *n,
+                                                 struct Sym **out_sym,
+                                                 const struct AstNode **out_base,
+                                                 const struct AstNode **idxs,
+                                                 int *out_count,
+                                                 int *out_type);
+int ast_deref_pointer_array_decay(const struct AstNode *n, int *out_type,
+                                  int *out_stride);
 int ast_index_member_array_nd_collect(const struct AstNode *n,
                                              const struct AstNode **out_member,
                                              const struct AstNode **idxs,
@@ -94,6 +110,17 @@ int ast_numeric_value_supported(const struct AstNode *n);
 int ast_cond_numeric_supported(const struct AstNode *n);
 int ast_cond_result_is_float(const struct AstNode *n);
 int ast_cond_result_is_long(const struct AstNode *n);
+int ast_cond_is_abs_idiom(const struct AstNode *n, const struct AstNode **out_x);
+void ast_gen_abs_idiom_value(const struct AstNode *x);
+int ast_is_byte_eq_cond(const struct AstNode *n, struct Sym **out_a,
+                               struct Sym **out_b, long *out_const);
+void ast_gen_byte_eq_branch(const struct AstNode *n, int label,
+                                   int branch_when_true);
+int ast_is_global_char_index_eq_cond(const struct AstNode *n, struct Sym **out_arr,
+                                             const struct AstNode **out_idx,
+                                             struct Sym **out_other, long *out_const);
+void ast_gen_global_char_index_eq_branch(const struct AstNode *n, int label,
+                                                 int branch_when_true);
 int ast_void_expr_supported(const struct AstNode *n);
 int ast_cond_void_supported(const struct AstNode *n);
 int ast_index_cmp_cond_supported(const struct AstNode *n);
@@ -110,6 +137,8 @@ int ast_struct_return_call_assign_supported(int lhs_type,
                                                   const struct AstNode *rhs);
 int ast_struct_deref_copy_assign_supported(const struct AstNode *n);
 int ast_struct_member_copy_assign_supported(const struct AstNode *n);
+int ast_struct_chain_copy_assign_supported(const struct AstNode *n);
+const struct AstNode *ast_zero_arg_inline_body(const struct AstNode *n);
 int ast_is_byte_addr_lvalue(const struct AstNode *n, int *out_type);
 int ast_is_byte_addr_copy_assign(const struct AstNode *n);
 void gen_byte_addr_copy_assign_ast(const struct AstNode *n);
@@ -118,6 +147,7 @@ int ast_struct_copy_assign_supported(const struct AstNode *n);
 int ast_is_const_zero_condition(const struct AstNode *n);
 int ast_is_const_nonzero_condition(const struct AstNode *n);
 int ast_expr_yields_bool01(const struct AstNode *n);
+void ast_support_cache_begin(void);
 int ast_gen_supported(const struct AstNode *n);
 int ast_call_arg_word_supported(const struct AstNode *arg);
 int ast_call_struct_arg_supported(int want_type, const struct AstNode *arg);
@@ -133,12 +163,14 @@ int ast_call_named_args_supported(const struct AstNode *n);
 const struct AstNode *ast_call_star_indirect_base(const struct AstNode *n);
 int ast_call_star_indirect_supported(const struct AstNode *n);
 int ast_call_indirect_supported(const struct AstNode *n);
+struct Sym *ast_indirect_call_proto_sym(const struct AstNode *n);
 int ast_value_is_float_word(const struct AstNode *arg);
 int ast_value_is_pointer_word(const struct AstNode *n);
 int ast_pointer_assign_rhs_supported(const struct AstNode *n);
 int ast_unary_int_const_fold(const struct AstNode *n, long *out);
 int ast_int_const_cast_fold(const struct AstNode *n, long *out);
 int ast_unary_long_const_fold(const struct AstNode *n, long *out);
+int ast_unary_float_const_fold(const struct AstNode *n, unsigned long *out);
 int ast_const_scalar_fold(const struct AstNode *n, long *out);
 long ast_const_apply_int_cast(long v, int type);
 int ast_const_fold_strict(const struct AstNode *n, long *out);
@@ -178,6 +210,7 @@ void gen_struct_return_call_assign_ast(const struct AstNode *lhs,
                                               const struct AstNode *rhs);
 void gen_struct_addr_expr_ast(const struct AstNode *n, int *out_type);
 void gen_struct_copy_assign_ast(const struct AstNode *n);
+void gen_struct_chain_copy_assign_ast(const struct AstNode *n);
 void gen_struct_deref_copy_assign_ast(const struct AstNode *n);
 void gen_struct_member_copy_assign_ast(const struct AstNode *n);
 void gen_member_addr_ast(const struct AstNode *n, int *out_val_type);
@@ -221,9 +254,11 @@ int ast_index_lvalue_elem_type(const struct AstNode *n, int *out_type);
 int ast_deadincdec_addr_lvalue_type(const struct AstNode *e, int *out_type);
 void gen_deadincdec_addr_lvalue_ast(const struct AstNode *e, int *out_type);
 int ast_dead_expr_supported(const struct AstNode *e);
+void ast_gen_dead_expr(const struct AstNode *n);
 int ast_for_init_expr_supported(const struct AstNode *e);
 int ast_expr_stmt_supported(const struct AstNode *n);
 int ast_stmt_supported(const struct AstNode *n);
+int ast_for_decl_storage_supported(const struct AstNode *n);
 void ast_gen_cmp_branch(const struct AstNode *n, int label,
                                int branch_when_true);
 void ast_gen_const_cmp_branch(const struct AstNode *n, int label,
@@ -260,7 +295,24 @@ void ast_switch_assign_labels(const struct AstNode *n, int *case_vals,
                                      int *default_labp);
 void ast_gen_switch_stmt(const struct AstNode *n);
 void ast_gen_for_stmt(const struct AstNode *n);
+void ast_gen_while_stmt(const struct AstNode *n);
+void ast_gen_dowhile_stmt(const struct AstNode *n);
 void ast_gen_stmt(const struct AstNode *n);
+
+/* dcc_loop_regalloc.c - loop-scoped BC register promotion; see that file's
+ * header comment for the full design. `incr` may be NULL (AST_WHILE/
+ * AST_DOWHILE have no separate increment clause; only AST_FOR does).
+ * *out_is_write reports whether the winning candidate needs try_loop_
+ * regalloc_bc (read-only, Phase 1) or try_loop_regalloc_bc_write
+ * (Phase 2). */
+struct Sym *loop_regalloc_find_bc_candidate(const struct AstNode *cond,
+                                            const struct AstNode *incr,
+                                            const struct AstNode *body,
+                                            int *out_is_write);
+int try_loop_regalloc_bc(const struct AstNode *loop_node, struct Sym *cand,
+                          void (*gen_loop_impl)(const struct AstNode *));
+int try_loop_regalloc_bc_write(const struct AstNode *loop_node, struct Sym *cand,
+                                void (*gen_loop_impl)(const struct AstNode *));
 int ast_try_emit_statement(void);
 
 #endif /* DCC_AST_GEN_INTERNAL_H */

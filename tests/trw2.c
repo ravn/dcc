@@ -18,27 +18,6 @@ static short buf[ 1024 ];
 
 #define TRW_FILE "trw2.dat"
 
-char * memset_x( p, v, c ) char * p; int v; int c;
-{
-    unsigned char * pc;
-    unsigned char val;
-    int i;
-
-    pc = (unsigned char *) p;
-    val = (unsigned char) ( v & 0xff );
-
-    if ( 0 == p )
-    {
-        printf( "request to memset a null pointer\n" );
-        exit( 1 );
-    }
-
-
-    for ( i = 0; i < c; i++ )
-        *pc++ = val;
-    return p;
-}
-
 int main( argc, argv ) int argc; char * argv[];
 {
     int e, i, j, result, fd;
@@ -65,10 +44,8 @@ int main( argc, argv ) int argc; char * argv[];
                 show_error( "unable to write to file" );
         }
 
-#if 0
         fdatasync( fd );
         fsync( fd );
-#endif
         close( fd );
     
         fd = open( TRW_FILE, O_RDONLY );
@@ -77,7 +54,7 @@ int main( argc, argv ) int argc; char * argv[];
     
         for ( i = 0; i < RW_LOOPS; i++ )
         {
-            memset_x( buf, 0x69, BUF_BYTES );
+            memset( buf, 0x69, BUF_BYTES );
             result = read( fd, (char *) buf, BUF_BYTES );
             if ( BUF_BYTES != result )
             {

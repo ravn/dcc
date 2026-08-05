@@ -4,10 +4,33 @@
  * Supports enough Forth for SIEVE.F, e.f, and ttt.f.
  * Integer-only, compact heap-backed state, Ctrl-Z tolerant input.
  */
+
+#ifdef SDCC
+#define ZCC
+/*
+ * z88dk newlib malloc configuration.
+ *
+ * A negative CLIB_MALLOC_HEAP_SIZE tells the CP/M CRT to initialize the
+ * standard malloc heap with all free memory between the end of BSS and the
+ * reserved stack area.  Without this, the default configuration used by some
+ * recent z88dk builds may leave only a small fixed heap.
+ *
+ * CRT_STACK_SIZE is the amount excluded from the top of memory for stack use.
+ * pint's C stack use is modest; the Pascal VM stacks and frames are allocated
+ * separately by init_run_storage().
+ */
+#pragma output CLIB_MALLOC_HEAP_SIZE = -1
+#pragma output CRT_STACK_SIZE = 512
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+
+#ifdef ZCC
+#include <malloc.h>
+#endif
 
 #define MAXSRC 8000L
 #define MAXTOK 64
@@ -115,7 +138,7 @@ struct State {
     char **s_strs;
     unsigned char *s_mem;
     int *s_st;
-    int *s_crs;      /* call return stack: flat int array of saved PCs */
+    struct Ins **s_crs; /* call return stack: saved return addresses */
     int *s_lrs_idx;  /* loop index values */
     int *s_lrs_lim;  /* loop limit values */
     int *s_lrs_prv;  /* loop_top link (previous loop frame index) */
@@ -473,7 +496,7 @@ static void run_at(int pc)
     struct Ins *lcode;
     unsigned char *lmem;
     int *lst;
-    int *lcrs;
+    struct Ins **lcrs;
     int *llrs_idx;
     int *llrs_lim;
     int *llrs_prv;
@@ -493,8 +516,8 @@ static void run_at(int pc)
     lltop   = loop_top;
     lmcap   = mcap;
 
+    in = lcode + pc;
     for (;;) {
-        in = lcode + pc++;
         switch (in->op) {
         case OP_HALT:
             sp = lsp; crp = lcrp; lrp = llrp; loop_top = lltop;
@@ -522,18 +545,18 @@ static void run_at(int pc)
             break;
         case OP_CALL:
             if (lcrp >= MAXRSTACK) die("return stack full");
-            lcrs[lcrp++] = pc;
-            pc = in->a;
-            break;
+            lcrs[lcrp++] = in + 1;
+            in = lcode + in->a;
+            continue;
         case OP_RET:
             if (lcrp <= 0) {
                 sp = lsp; crp = lcrp; lrp = llrp; loop_top = lltop;
                 return;
             }
-            pc = lcrs[--lcrp];
-            break;
-        case OP_JMP: pc = in->a; break;
-        case OP_JZ: { int _v = lst[--lsp]; if (!_v) pc = in->a; } break;
+            in = lcrs[--lcrp];
+            continue;
+        case OP_JMP: in = lcode + in->a; continue;
+        case OP_JZ: { int _v = lst[--lsp]; if (!_v) { in = lcode + in->a; continue; } } break;
         case OP_DO:
             a = lst[--lsp]; b = lst[--lsp];
             if (llrp >= MAXRSTACK) die("loop stack full");
@@ -544,7 +567,7 @@ static void run_at(int pc)
             break;
         case OP_LOOP:
             { int _r = llrp - 1; int _i = llrs_idx[_r] + 1; llrs_idx[_r] = _i;
-              if (_i < llrs_lim[_r]) pc = in->a;
+              if (_i < llrs_lim[_r]) { in = lcode + in->a; continue; }
               else { lltop = llrs_prv[_r]; llrp = _r; } }
             break;
         case OP_I: lst[lsp++] = llrs_idx[lltop]; break;
@@ -566,16 +589,16 @@ static void run_at(int pc)
         case OP_OR:   { int _t = lst[--lsp]; lst[lsp-1] |= _t; } break;
         case OP_INVERT: lst[lsp-1] = !lst[lsp-1]; break;
         case OP_FETCH:
-            { int _a = lst[lsp-1]; if (_a < 0 || _a+1 >= lmcap) die("bad address");
-              lst[lsp-1] = (int)(short)(lmem[_a] | (lmem[_a+1] << 8)); }
+            { int *tosp = &lst[lsp-1]; int _a = *tosp; if (_a < 0 || _a+1 >= lmcap) die("bad address");
+              *tosp = (int)(short)(lmem[_a] | (lmem[_a+1] << 8)); }
             break;
         case OP_STORE:
             a = lst[--lsp]; if (a < 0 || a+1 >= lmcap) die("bad address");
             b = lst[--lsp]; lmem[a] = (unsigned char)b; lmem[a+1] = (unsigned char)(b >> 8);
             break;
         case OP_CFETCH:
-            { int _a = lst[lsp-1]; if (_a < 0 || _a >= lmcap) die("bad address");
-              lst[lsp-1] = lmem[_a]; }
+            { int *tosp = &lst[lsp-1]; int _a = *tosp; if (_a < 0 || _a >= lmcap) die("bad address");
+              *tosp = lmem[_a]; }
             break;
         case OP_CSTORE:
             a = lst[--lsp]; if (a < 0 || a >= lmcap) die("bad address");
@@ -596,6 +619,7 @@ static void run_at(int pc)
         case OP_PSTR: printf("%s", strs[in->a]); break;
         default: die("bad op");
         }
+        in++;
     }
 }
 
@@ -750,7 +774,7 @@ static void init_state(void)
     mem = (unsigned char *)xcalloc(INITMEM, 1);
     mcap = INITMEM;
     st = (int *)xcalloc(MAXSTACK, sizeof(int));
-    crs = (int *)xcalloc(MAXRSTACK, sizeof(int));
+    crs = (struct Ins **)xcalloc(MAXRSTACK, sizeof(struct Ins *));
     lrs_idx = (int *)xcalloc(MAXRSTACK, sizeof(int));
     lrs_lim = (int *)xcalloc(MAXRSTACK, sizeof(int));
     lrs_prv = (int *)xcalloc(MAXRSTACK, sizeof(int));

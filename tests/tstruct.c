@@ -18,6 +18,22 @@ struct Node g_node;
 
 #include <stdio.h>
 
+struct Pair ret_arr_elem(void)
+{
+    return g_arr[1];
+}
+
+struct Pair ret_pair_value(int b)
+{
+    struct Pair p;
+    p.a = 9;
+    p.b = b;
+    p.c = 10;
+    return p;
+}
+
+int pair_array_sum();
+
 void test2()
 {
     /* 
@@ -61,6 +77,8 @@ void test2()
 int main()
 {
     struct Pair local;
+    struct Pair copy1;
+    struct Pair copy2;
     struct Pair *pp;
 
     g_pair.a = 3;
@@ -90,8 +108,24 @@ int main()
     printf("p=%d %d %d\n", pp->a, pp->b, pp->c);
     printf("n=%d %d\n", g_node.value, g_node.pairp->b);
 
+    copy1 = copy2 = local;
+    printf("chain=%d %d %d %d\n", copy1.b, copy2.b, copy1.c, copy2.c);
+
+    copy1 = ret_arr_elem();
+    printf("retarr=%d %d %d\n", copy1.a, copy1.b, copy1.c);
+    ret_pair_value(77);
+    printf("discard struct return ok\n");
+
+    printf("arrayarg=%d\n", pair_array_sum(g_arr));
+
     test2();
 
     printf( "tstruct completed with great success\n" );
     return 0;
+}
+
+int pair_array_sum(pairs)
+struct Pair pairs[];
+{
+    return pairs[0].b + pairs[1].b;
 }

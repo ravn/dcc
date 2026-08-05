@@ -43,6 +43,87 @@ int sum_row(int (*rp)[3], int row)
     return rp[row][0] + rp[row][1] + rp[row][2];
 }
 
+struct PickNode {
+    int value;
+};
+
+static struct PickNode pick_node = { 101 };
+typedef const struct PickNode *(*pick_node_fn)(const struct PickNode *node, int seed);
+
+static const struct PickNode *pick_same_node(const struct PickNode *node, int seed)
+{
+    (void) seed;
+    return node;
+}
+
+static const struct PickNode *pick_global_node(const struct PickNode *node, int seed)
+{
+    (void) node;
+    (void) seed;
+    return &pick_node;
+}
+
+static int local_structptr_fnptr_array(void)
+{
+    pick_node_fn pickers[2] = { pick_same_node, pick_global_node };
+    (void) pickers;
+    return 202;
+}
+
+struct AutoTask {
+    const char *name;
+    int priority;
+    _Bool done;
+};
+
+static int count_open_tasks(const struct AutoTask *tasks, int count)
+{
+    int i;
+    int open;
+
+    open = 0;
+    for (i = 0; i < count; ++i) {
+        if (!tasks[i].done)
+            ++open;
+    }
+    return open;
+}
+
+static const struct AutoTask *highest_open_task(const struct AutoTask *tasks, int count)
+{
+    int i;
+    const struct AutoTask *best;
+
+    best = 0;
+    for (i = 0; i < count; ++i) {
+        if (!tasks[i].done && (best == 0 || tasks[i].priority > best->priority))
+            best = &tasks[i];
+    }
+    return best;
+}
+
+static int auto_mixed_struct_array_init(void)
+{
+    struct AutoTask tasks[] = {
+        { "parse", 2, 1 },
+        { "build", 3, 1 },
+        { "run",   5, 0 },
+        { "log",   1, 0 }
+    };
+    const struct AutoTask *next;
+
+    next = highest_open_task(tasks, 4);
+    if (count_open_tasks(tasks, 4) != 2)
+        return 10 + count_open_tasks(tasks, 4);
+    if (next == 0)
+        return 20;
+    if (next->priority != 5)
+        return 30 + next->priority;
+    if (next->name[0] != 'r' || next->name[1] != 'u' || next->name[2] != 'n' || next->name[3] != 0)
+        return 40;
+    return 1;
+}
+
 static int lpa(void)
 {
     int local[2][3];
@@ -63,9 +144,21 @@ static int lpa(void)
     return 1;
 }
 
+static unsigned char (*glyph_matrix(void))[4]
+{
+    static unsigned char matrix[3][4] = {
+        { 'N', 'E', 'S', 'W' },
+        { 'R', 'I', 'N', 'G' },
+        { 'Z', '8', '0', '!' }
+    };
+
+    return matrix;
+}
+
 int main(void)
 {
     int r;
+    unsigned char (*glyph_rows)[4];
 
     fp = add;
     ops[0] = add;
@@ -91,6 +184,13 @@ int main(void)
 
     r = lpa();
     vri(r, 1, "local-pointer-to-array");
+    vri(local_structptr_fnptr_array(), 202, "local-structptr-fnptr-array");
+    vri(auto_mixed_struct_array_init(), 1, "auto-mixed-struct-array-init");
+
+    glyph_rows = glyph_matrix();
+    vri(glyph_rows[0][0], 'N', "func-return-ptr-array-first");
+    vri(glyph_rows[1][2], 'N', "func-return-ptr-array-stride");
+    vri(glyph_rows[2][3], '!', "func-return-ptr-array-last");
 
     if (g_failed) {
         printf("declaration syntax test failed: %d\n", g_failed);

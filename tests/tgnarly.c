@@ -62,6 +62,7 @@ hi_world() {
             putchar (s [i]);
         }
     }
+    return 0;
 }
 
 
@@ -79,7 +80,7 @@ int main()
     int dsrc[5];
     int ddst[5];
     int di;
-    int count = 10;
+    int16_t count = 10;
     size_t sz = sizeof(count);
 
     hi_world();

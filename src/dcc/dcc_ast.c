@@ -1,12 +1,10 @@
 /*
  * dcc_ast.c - function-local AST: arena allocator and node constructors.
  *
- * See dcc_ast.h for the design rationale.  This module is intentionally
- * self-contained: it depends only on the umbrella header dcc.h for the
- * xmalloc/fatal helpers and the struct Sym definition, and it does not yet
- * participate in code generation.  It is compiled and linked so the data
- * structures and their invariants can be exercised as the AST migration
- * proceeds construct by construct.
+ * See dcc_ast.h for the design rationale. This module owns arena block
+ * allocation, reset/destruction, string/memory copies, node construction, and
+ * small AST query helpers. Parsing and emission live in dcc_ast_build.c and
+ * dcc_ast_gen*.c.
  */
 #include "dcc.h"
 #include "dcc_ast.h"
@@ -101,6 +99,8 @@ void ast_arena_reset(struct AstArena *ar)
 struct AstNode *ast_new(struct AstArena *ar, int kind)
 {
     struct AstNode *n;
+    const char *file;
+    size_t file_len;
     n = (struct AstNode *)ast_arena_alloc(ar, sizeof(struct AstNode));
     n->kind = kind;
     n->type = 0;
@@ -119,7 +119,13 @@ struct AstNode *ast_new(struct AstArena *ar, int kind)
     n->list_cap = 0;
     n->aux = NULL;
     n->peek_type = 0;
-    n->line = tok_line;
+    file = g_lex.tok.file[0] ? g_lex.tok.file : (input_name ? input_name : "<input>");
+    file_len = strlen(file) + 1;
+    n->file = (char *)ast_arena_alloc(ar, file_len);
+    memcpy(n->file, file, file_len);
+    n->line = g_lex.tok_line;
+    n->end_file = NULL;
+    n->end_line = 0;
     return n;
 }
 
@@ -227,5 +233,21 @@ char *ast_arena_strdup(struct AstArena *ar, const char *s)
     n = strlen(s) + 1;
     p = (char *)ast_arena_alloc(ar, n);
     memcpy(p, s, n);
+    return p;
+}
+
+/*
+ * Like ast_arena_strdup, but copies exactly `len` bytes regardless of any
+ * embedded NUL (for a string literal containing a \0 escape) and appends
+ * one extra NUL terminator for safety.
+ */
+char *ast_arena_memdup(struct AstArena *ar, const char *s, int len)
+{
+    char *p;
+    if (s == NULL)
+        return NULL;
+    p = (char *)ast_arena_alloc(ar, (size_t)len + 1);
+    memcpy(p, s, (size_t)len);
+    p[len] = 0;
     return p;
 }

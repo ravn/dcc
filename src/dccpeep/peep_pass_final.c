@@ -1,0 +1,617 @@
+/* peep_pass_final.c - terminal relaxation and cleanup passes.
+ *
+ * These rewrites run after fixed-point and size-mode passes so their address
+ * estimates and dead-load decisions see the final instruction stream.
+ */
+#include "dccpeep_internal.h"
+
+static int instr_size_upper(int line_index)
+{
+    const PeepLineInfo *info = peep_line_info(line_index);
+    const char *s = user_asm_original[line_index] != NULL
+        ? user_asm_original[line_index] : lines[line_index];
+    /* Labels, comments, blank lines and assembler directives emit no code. */
+    if (info && (info->kind == PEEP_LINE_BLANK ||
+                 info->kind == PEEP_LINE_COMMENT ||
+                 info->kind == PEEP_LINE_LABEL))
+        return 0;
+    if (strncmp(s, "cseg", 4) == 0 || strncmp(s, "dseg", 4) == 0 ||
+        strncmp(s, "public", 6) == 0 || strncmp(s, "extrn", 5) == 0 ||
+        strncmp(s, "end", 3) == 0 || strchr(s, '='))   /* "X equ N", "_x equ" */
+        return 0;
+
+    /* db N,N,...  -> one byte per comma-separated item. */
+    if (strncmp(s, "db ", 3) == 0 || strncmp(s, "dw ", 3) == 0) {
+        int items = 1;
+        const char *p;
+        int per = (s[1] == 'w') ? 2 : 1;
+        for (p = s; *p; ++p)
+            if (*p == ',')
+                items++;
+        return items * per;
+    }
+
+    /* jr/djnz are 2 bytes; a jr we have already produced must stay sized 2. */
+    if ((info && info->opcode == PEEP_OPCODE_JR) || strncmp(s, "djnz", 4) == 0)
+        return 2;
+
+    /* Any IX/IY-relative instruction is at most 4 bytes (DD/FD prefix). */
+    if (strstr(s, "ix") || strstr(s, "iy"))
+        return 4;
+
+    /* Everything else dcc emits (jp/call/ld rr,nn/arith/stack/ret/...) is at
+     * most 3 bytes.  Using 3 as the universal upper bound is safe. */
+    return 3;
+}
+
+static int jr_convertible(int i, char *labelout)
+{
+    const char *s = lines[i];
+    char lab[128];
+
+    if (strncmp(s, "jp ", 3) != 0)
+        return 0;
+    /* Reject indirect jp (hl) / jp (ix) etc. and the m condition. */
+    if (strchr(s, '('))
+        return 0;
+    if (parse_jp_z_label(s, lab) || parse_jp_nz_label(s, lab) ||
+        parse_jp_c_label(s, lab) || parse_jp_nc_label(s, lab)) {
+        /* parse_jp_cond_label copies the remainder of the line, which may
+         * include a trailing "; peep: ..." comment or whitespace.  Trim the
+         * label to its first token. */
+        int k = 0;
+        while (lab[k] && lab[k] != ' ' && lab[k] != '\t' && lab[k] != ';')
+            k++;
+        lab[k] = 0;
+        if (lab[0] == 0)
+            return 0;
+        strcpy(labelout, lab);
+        return 1;
+    }
+    /* Unconditional jp LABEL: no comma, target is a bare label. */
+    if (!strchr(s, ',')) {
+        if (jump_target(s, lab) && lab[0] != '(') {
+            strcpy(labelout, lab);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void make_jr(int i)
+{
+    const char *s = lines[i];
+    char lab[128];
+    char out[160];
+    int k;
+
+    if (parse_jp_z_label(s, lab))
+        sprintf(out, "jr z,%s", lab);
+    else if (parse_jp_nz_label(s, lab))
+        sprintf(out, "jr nz,%s", lab);
+    else if (parse_jp_c_label(s, lab))
+        sprintf(out, "jr c,%s", lab);
+    else if (parse_jp_nc_label(s, lab))
+        sprintf(out, "jr nc,%s", lab);
+    else {
+        jump_target(s, lab);
+        sprintf(out, "jr %s", lab);
+        replace1_tagged(i, out, "jp_to_jr");
+        return;
+    }
+    /* Conditional parse may have captured a trailing comment; trim it. */
+    k = 0;
+    while (out[k])
+        k++;
+    while (k > 0 && (out[k - 1] == ' ' || out[k - 1] == '\t'))
+        k--;
+    out[k] = 0;
+    {
+        char *semi = strchr(out, ';');
+        if (semi) {
+            while (semi > out && (semi[-1] == ' ' || semi[-1] == '\t'))
+                semi--;
+            *semi = 0;
+        }
+    }
+    replace1_tagged(i, out, "jp_to_jr");
+}
+
+typedef struct LabelIndexEntry {
+    const char *definition;
+    int line;
+} LabelIndexEntry;
+
+static int compare_label_entries(const void *left, const void *right)
+{
+    const LabelIndexEntry *a = (const LabelIndexEntry *)left;
+    const LabelIndexEntry *b = (const LabelIndexEntry *)right;
+    int order = strcmp(a->definition, b->definition);
+
+    if (order != 0)
+        return order;
+    return (a->line > b->line) - (a->line < b->line);
+}
+
+static int find_label_line(const LabelIndexEntry *labels, int count,
+                           const char *definition)
+{
+    int lo = 0;
+    int hi = count;
+
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (strcmp(labels[mid].definition, definition) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo < count && strcmp(labels[lo].definition, definition) == 0)
+        return labels[lo].line;
+    return -1;
+}
+
+int pass_jp_to_jr(void)
+{
+    static int addr[MAX_LINES];   /* upper-bound byte address of each line */
+    LabelIndexEntry *labels;
+    int label_count = 0;
+    int i;
+    int any = 0;
+    int changed;
+
+    labels = (LabelIndexEntry *)malloc((size_t)nlines * sizeof(*labels));
+    if (labels == NULL && nlines != 0) {
+        fprintf(stderr, "out of memory\n");
+        exit(1);
+    }
+    for (i = 0; i < nlines; ++i) {
+        if (starts_label(lines[i])) {
+            labels[label_count].definition = lines[i];
+            labels[label_count].line = i;
+            ++label_count;
+        }
+    }
+    qsort(labels, (size_t)label_count, sizeof(*labels), compare_label_entries);
+
+    do {
+        int pc = 0;
+        changed = 0;
+
+        /* Assign an upper-bound address to every line. */
+        for (i = 0; i < nlines; i++) {
+            addr[i] = pc;
+            pc += instr_size_upper(i);
+        }
+
+        for (i = 0; i < nlines; i++) {
+            char lab[128];
+            char def[130];
+            int target = -1;
+            int from, to, disp;
+
+            if (!jr_convertible(i, lab))
+                continue;
+
+            /* Find the target label's first definition, matching the old
+             * forward scan when malformed input contains duplicate labels. */
+            sprintf(def, "%s:", lab);
+            target = find_label_line(labels, label_count, def);
+            if (target < 0)
+                continue;
+
+            /* Opaque user assembly may contain directives or macros whose
+             * encoded size this text-level estimator cannot bound. */
+            {
+                int lo = (i < target) ? i : target;
+                int hi = (i < target) ? target : i;
+                int k;
+                int opaque = 0;
+                for (k = lo; k <= hi; ++k)
+                    if (user_asm_original[k] != NULL) {
+                        opaque = 1;
+                        break;
+                    }
+                if (opaque)
+                    continue;
+            }
+
+            /* Displacement is measured from the address *after* the 2-byte jr
+             * to the target address.  Using the current (jp, size<=3) address
+             * for line i is safe: the real jr is shorter, so the real
+             * displacement magnitude is no larger than what we compute when
+             * the branch points forward, and for backward branches the +2
+             * end-of-instruction offset is exact for jr.  We bound both ways
+             * by the conservative window below. */
+            from = addr[i] + 2;     /* end of the would-be jr */
+            to   = addr[target];
+            disp = to - from;
+
+            if (disp >= -128 && disp <= 127) {
+                make_jr(i);
+                changed = 1;
+                any = 1;
+            }
+        }
+    } while (changed);
+
+    free(labels);
+    return any;
+}
+
+static int ld_hl_const_high_bit_set(const char *s, int *bit15)
+{
+    char val[MAX_LINE];
+    const char *p;
+    long n;
+    int neg = 0;
+
+    if (!parse_ld_hl_imm(s, val, sizeof(val)))
+        return 0;
+
+    p = val;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p == '-') { neg = 1; p++; }
+    else if (*p == '+') { p++; }
+    if (*p == 0 || !isdigit((unsigned char)*p))
+        return 0;                 /* not a bare decimal integer */
+    n = 0;
+    while (isdigit((unsigned char)*p)) {
+        n = n * 10 + (*p - '0');
+        p++;
+    }
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p != 0)
+        return 0;                 /* trailing garbage / symbol arithmetic */
+
+    if (neg)
+        n = -n;
+    *bit15 = ((n & 0x8000L) != 0) ? 1 : 0;
+    return 1;
+}
+
+int pass_fold_const_sign_extend(void)
+{
+    int i;
+    int changed = 0;
+    int bit15;
+
+    for (i = 0; i + 5 < nlines; ++i) {
+        if (!ld_hl_const_high_bit_set(lines[i], &bit15))
+            continue;
+        if (!eq(i + 1, "ld a,h") || !eq(i + 2, "rlca") ||
+            !eq(i + 3, "sbc a,a") || !eq(i + 4, "ld d,a") ||
+            !eq(i + 5, "ld e,a"))
+            continue;
+
+        /* Replace the 5-instruction extend with one immediate DE load. */
+        delete_n(i + 1, 5);
+        insert_line_tagged(i + 1, bit15 ? "ld de,65535" : "ld de,0",
+                           "fold_const_sxt");
+        changed = 1;
+    }
+
+    return changed;
+}
+
+int pass_elim_dead_reg16_reload(void)
+{
+    int i;
+    int changed = 0;
+    char r1[4];
+    char r2[4];
+
+    for (i = 0; i + 1 < nlines; ++i) {
+        if (parse_ld_reg16_dest(lines[i], r1) &&
+            parse_ld_reg16_dest(lines[i + 1], r2) &&
+            strcmp(r1, r2) == 0) {
+            delete_n(i, 1);   /* the first load is dead */
+            changed = 1;
+            if (i > 0)
+                --i;          /* re-check against the new predecessor */
+        }
+    }
+
+    return changed;
+}
+
+int pass_elim_dead_register_loads(void)
+{
+    const unsigned protected_registers = PEEP_REG_IX | PEEP_REG_IY | PEEP_REG_SP;
+    int i = 0;
+    int changed = 0;
+
+    while (i < nlines) {
+        const PeepLineInfo *info = peep_line_info(i);
+
+        if (info->kind == PEEP_LINE_INSTRUCTION &&
+            info->opcode == PEEP_OPCODE_LD &&
+            info->left.kind == PEEP_OPERAND_REGISTER &&
+            (info->right.kind == PEEP_OPERAND_REGISTER ||
+             info->right.kind == PEEP_OPERAND_IMMEDIATE) &&
+            info->effects.writes != 0 &&
+            !(info->effects.writes & protected_registers) &&
+            peep_registers_dead_after(i, info->effects.writes)) {
+            delete_n(i, 1);
+            changed = 1;
+            continue;
+        }
+        ++i;
+    }
+    return changed;
+}
+
+/*
+ * Is line `i` a return-value materialization instruction that may legitimately
+ * sit between the dead cleanup pops and the framed epilogue?  Such gap fillers
+ * (`ld hl,N`, `ld l,(ix-2)`, `ld h,(ix-1)`, ...) must be provably harmless to
+ * step over: they touch neither the stack pointer nor BC, perform no control
+ * flow, write nothing to the stack, and have fully known effects.  Blank and
+ * comment lines carry no code and are always skippable.
+ */
+static int epilogue_gap_skippable(int i)
+{
+    const PeepLineInfo *info = peep_line_info(i);
+    unsigned touched;
+
+    if (!info)
+        return 0;
+    if (info->kind == PEEP_LINE_BLANK || info->kind == PEEP_LINE_COMMENT)
+        return 1;
+    if (info->kind != PEEP_LINE_INSTRUCTION)
+        return 0;
+    if (info->effects.unknown || info->effects.control_flow)
+        return 0;
+    if (info->effects.memory_written & PEEP_MEM_STACK)
+        return 0;
+    touched = info->effects.reads | info->effects.writes;
+    if (touched & (PEEP_REG_SP | PEEP_REG_B | PEEP_REG_C))
+        return 0;
+    return 1;
+}
+
+/*
+ * Remove stack-cleanup "pop bc" instructions that are stranded in front of a
+ * framed epilogue.  dcc emits a "pop bc" per pushed argument after every call
+ * to discard the actuals; when the call is the last thing a function does, the
+ * epilogue's "ld sp,ix" resets SP to the frame base and discards whatever the
+ * pops were adjusting - so the pops are pure dead weight (10 T-states and one
+ * byte each).
+ *
+ *     call _foo
+ *     pop bc            <- dead: SP about to be overwritten
+ *     pop bc            <- dead
+ *     ld hl,0           }  optional return-value setup (SP/BC neutral)
+ *     ld sp,ix          <- unconditionally reloads SP from IX
+ *     pop ix
+ *     ret
+ *
+ * Correctness:
+ *   - "ld sp,ix" writes SP without reading it, so the SP value the pops leave
+ *     behind is dead.
+ *   - A "pop bc" that clobbers BC immediately before "ret" proves BC holds no
+ *     live value at return (dcc returns values in HL or DE:HL, never BC); were
+ *     it otherwise the original code would already be wrong.  The gap scan
+ *     additionally rejects any intervening reader of B/C.
+ *   - Only the canonical framed epilogue "ld sp,ix / pop ix / ret" qualifies.
+ *     Leaf functions have no "ld sp,ix", so their trailing pops - which really
+ *     do rebalance the stack for "ret" - are never touched.
+ */
+int pass_elim_dead_epilogue_cleanup_pops(void)
+{
+    int i;
+    int changed = 0;
+
+    for (i = 0; i + 2 < nlines; ++i) {
+        int j;
+
+        if (!eq(i, "ld sp,ix") || !eq(i + 1, "pop ix") || !eq(i + 2, "ret"))
+            continue;
+
+        /*
+         * Walk backwards from the epilogue over skippable gap fillers and
+         * delete every "pop bc" that precedes it, stopping at the first
+         * instruction that is neither a cleanup pop nor a safe gap filler.
+         */
+        j = i - 1;
+        while (j >= 0) {
+            if (eq(j, "pop bc")) {
+                delete_n(j, 1);
+                changed = 1;
+                --i;    /* the epilogue and everything after shifted down */
+                --j;
+                continue;
+            }
+            if (epilogue_gap_skippable(j)) {
+                --j;
+                continue;
+            }
+            break;
+        }
+    }
+
+    return changed;
+}
+
+/* True when the instruction at i is a plain "or a" / "and a" carry clear. */
+static int is_carry_clear_op(int i)
+{
+    return eq(i, "or a") || eq(i, "and a");
+}
+
+/*
+ * True when the instruction at i provably leaves CF = 0.
+ *
+ * The Z80 logical operations (and/or/xor, in every addressing form) always
+ * reset the carry flag, so any of them is a proof source regardless of
+ * operand.  "cp"/"sub"/"add"/"sbc"/"inc"/"dec" are not: their carry is
+ * data dependent.
+ */
+static int line_resets_carry(int i)
+{
+    char text[MAX_LINE];
+
+    strip_peep_comment_lower_copy(text, lines[i]);
+    return !strncmp(text, "and ", 4) || !strncmp(text, "or ", 3) ||
+           !strncmp(text, "xor ", 4);
+}
+
+/*
+ * True when the instruction at i is known not to disturb CF, so a backwards
+ * carry-state walk may step over it.  Only "ld" (excluding "ld a,i"/"ld a,r",
+ * which copy IFF2 into P/V but leave C alone - still accepted), "push",
+ * "ex", "bit"/"set"/"res" and "nop" qualify; everything else either writes
+ * carry or is not modelled.
+ */
+static int line_preserves_carry(int i)
+{
+    const PeepLineInfo *info = peep_line_info(i);
+
+    if (!info || info->kind != PEEP_LINE_INSTRUCTION)
+        return 0;
+    if (info->effects.unknown || info->effects.control_flow)
+        return 0;
+    return (info->effects.flags_written & PEEP_FLAG_C) == 0;
+}
+
+/*
+ * Decide whether CF is provably 0 immediately before line i by walking
+ * backwards through straight-line code.
+ *
+ * The walk stops at anything that makes the incoming state unknowable: a
+ * label (which may be reached from elsewhere), user assembly, a call, or an
+ * instruction whose effect on carry is not modelled.
+ */
+static int carry_known_clear_before(int i)
+{
+    int j = i - 1;
+    int steps = 0;
+
+    while (j >= 0 && steps < 64) {
+        const PeepLineInfo *info = peep_line_info(j);
+
+        if (!info)
+            return 0;
+        if (info->kind == PEEP_LINE_BLANK || info->kind == PEEP_LINE_COMMENT) {
+            --j;
+            continue;
+        }
+        /* A label is a potential join point: predecessors are unknown. */
+        if (info->kind != PEEP_LINE_INSTRUCTION)
+            return 0;
+        if (info->effects.unknown)
+            return 0;
+
+        /*
+         * A conditional "jp c"/"jr c" only falls through when carry was
+         * clear, so the fall-through path - which is the only way to reach
+         * line i, since no label intervenes - has CF = 0.  Unconditional
+         * jumps, calls and returns end the walk.
+         */
+        if (info->effects.control_flow) {
+            char text[MAX_LINE];
+
+            strip_peep_comment_lower_copy(text, lines[j]);
+            if (!strncmp(text, "jp c,", 5) || !strncmp(text, "jr c,", 5))
+                return 1;
+            return 0;
+        }
+
+        if (line_resets_carry(j))
+            return 1;
+        if (!line_preserves_carry(j))
+            return 0;
+        --j;
+        ++steps;
+    }
+    return 0;
+}
+
+/*
+ * Delete "or a" / "and a" instructions that exist only to clear the carry
+ * flag for a following 16-bit "sbc hl,rr", when carry is already provably
+ * clear.
+ *
+ * dcc emits the idiom "or a / sbc hl,de" for every 16-bit compare and
+ * subtraction.  In two very common situations the clear is dead weight:
+ *
+ *   1. A signed compare biases the high byte first, and "xor 80h" already
+ *      reset carry:
+ *
+ *          ld a,h
+ *          xor 80h      <- resets CF
+ *          ld h,a       <- "ld" never touches flags
+ *          or a         <- removed
+ *          sbc hl,de
+ *
+ *   2. The block is reached by falling through a "jr c"/"jp c", which by
+ *      definition only happens when carry was clear:
+ *
+ *          jr c,L
+ *          ld l,(ix+4)
+ *          ld h,(ix+5)
+ *          ld de,7
+ *          or a         <- removed
+ *          sbc hl,de
+ *
+ * Correctness:
+ *   - "or a"/"and a" leave A unchanged, so only their flag write matters.
+ *   - The forward scan requires the next flag-relevant instruction to be
+ *     "sbc hl,rr", which rewrites C, Z, S and P/V.  The Z/S/P/V values the
+ *     removed instruction produced are therefore dead, and only the carry it
+ *     consumed needs to be preserved - which the backwards proof guarantees.
+ *   - Anything between is restricted to instructions that neither read nor
+ *     write flags, so no other consumer can observe the difference.
+ */
+int pass_elim_redundant_carry_clear(void)
+{
+    int i;
+    int changed = 0;
+
+    for (i = 0; i < nlines; ++i) {
+        int j;
+        int found = 0;
+
+        if (!is_carry_clear_op(i))
+            continue;
+
+        /*
+         * Forward scan: step over flag-neutral filler until the consumer.
+         * It must be a 16-bit "sbc hl,rr" - the only instruction for which
+         * the preceding clear is required and whose flag write kills every
+         * flag the clear produced.
+         */
+        for (j = i + 1; j < nlines && j <= i + 8; ++j) {
+            const PeepLineInfo *info = peep_line_info(j);
+
+            if (!info)
+                break;
+            if (info->kind == PEEP_LINE_BLANK || info->kind == PEEP_LINE_COMMENT)
+                continue;
+            if (info->kind != PEEP_LINE_INSTRUCTION || info->effects.unknown)
+                break;
+            if (eq(j, "sbc hl,bc") || eq(j, "sbc hl,de") ||
+                eq(j, "sbc hl,hl") || eq(j, "sbc hl,sp")) {
+                found = 1;
+                break;
+            }
+            /* Any other flag reader or writer ends the scan. */
+            if (info->effects.flags_read || info->effects.flags_written)
+                break;
+        }
+        if (!found)
+            continue;
+
+        if (!carry_known_clear_before(i))
+            continue;
+
+        delete_n(i, 1);
+        changed = 1;
+        --i;
+    }
+
+    return changed;
+}
+

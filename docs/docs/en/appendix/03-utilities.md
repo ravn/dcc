@@ -65,15 +65,17 @@ dcc-ma cobint --mode fast --build-dir mybuild
 
 - `DCC_STACK_SIZE` — C stack reserve in bytes; when unset, `dcc` uses its default
 - `DCC_FORCE_STACK_CHECK` — Force `-fstack-check` on all builds
-- `DCC_FLOATIO` — Set to `1` to pass `-ffloatio` and keep float `printf` runtime support
-- `DCC_LONGIO` — Set to `1` to pass `-flongio` and keep long integer `printf` runtime support
+- `DCC_FLOATIO` — Set to `1` to force `%f` support on every `printf`-family call
+- `DCC_NO_FLOATIO` — Set to `1` to force `%f` support off on every `printf`-family call
+- `DCC_LONGIO` — Set to `1` to force long-format support on every `printf`-family call
+- `DCC_NO_LONGIO` — Set to `1` to force long-format support off on every `printf`-family call
 - `DCC_ARGS` — Extra whitespace-separated `dcc` options such as `-DNAME=1 -UOLD`
 - `NTVCM_ARGS` — Extra whitespace-separated `ntvcm` options such as `-p -s:4000000`
 - `DCC_HOME` — DCC C Compiler package/install root; used to find `include/`, `lib/`, and CP/M tools
 - `DCC_INCLUDE` — extra include directories, separated by the host path separator
 - `DCC_LIB` — extra runtime/tool asset roots, separated by the host path separator
 - `DCC_RUNTIME` — explicit path to `DCCRTL.MAC`
-- `DCC`, `DCCPEEP`, `DCCRTLSTRIP`, `NTVCM`, `M80`, `L80` — Tool paths
+- `DCC`, `DCCPEEP`, `DCCRTLSTRIP`, `NTVCM`, `M80`, `M80C`, `L80`, `L80C` — Tool paths
 
 Run `dcc-ma -Help` on Windows or `dcc-ma --help` on Linux/macOS for the full option map, including which
 `dcc` options are owned by the helper pipeline.
@@ -91,16 +93,22 @@ or environment variables first, then from the local checkout or `PATH`.
 | `dccpeep` | Peephole optimizer | Host command that rewrites generated `.MAC` files when `dcc-peep=true` |
 | `dccrtlstrip` | Runtime stripper | Host command that scans app `.MAC` files and writes a reduced runtime; see [DCCRTL strip appendix](01-dccrtlstrip.md) |
 | `DCCRTL.MAC` | Runtime source | Full CP/M runtime consumed by `dccrtlstrip` |
-| `ntvcm` | CP/M emulator | Runs CP/M tools such as M80 and L80, and runs the final `.COM` programs |
-| `m80.com` | CP/M assembler | Assembles app and runtime `.MAC` files to `.REL` files under `ntvcm` |
-| `l80.com` | CP/M linker | Links `RTLMIN.REL` and app `.REL` files into a `.COM` executable under `ntvcm` |
+| `m80c` | Native assembler | Host command, LINK-80-`.REL`-compatible; default assembler, no `ntvcm` needed |
+| `l80c` | Native linker | Host command, consumes the same `.REL` format; default linker, no `ntvcm` needed |
+| `ntvcm` | CP/M emulator | Only needed for the real M80/L80 fallback path, and to run the final `.COM` programs |
+| `m80.com` | CP/M assembler | Real Microsoft assembler; assembles `.MAC` to `.REL` under `ntvcm` when `dcc-use-emulated-m80=true` |
+| `l80.com` | CP/M linker | Real Microsoft linker; links `.REL` files to `.COM` under `ntvcm` when `dcc-use-emulated-l80=true` |
 
 ## Build Pipeline Helper (`dccmake`)
 
 `dccmake` is the lower-level build helper used by the test runner and by
 repeatable local builds. It compiles one or more C source files, optionally runs
-`dccpeep`, strips the runtime with `dccrtlstrip`, assembles with M80 under
-`ntvcm`, and links the final `.COM` with L80.
+`dccpeep`, strips the runtime with `dccrtlstrip`, then assembles and links with
+native `m80c`/`l80c` by default (or the real M80/L80 under `ntvcm` when
+`dcc-use-emulated-m80`/`dcc-use-emulated-l80` is set - real L80 runs inside
+`ntvcm`'s emulated 64K CP/M address space, so its own symbol/relocation
+workspace can run out of memory on large `nopeep` builds well before the
+target program itself would not fit; `l80c` has no such ceiling).
 
 Use `dccmake` directly when you want one command that owns the whole DCC C
 Compiler pipeline but still lets you choose the exact source files, output name,
@@ -131,7 +139,7 @@ dccmake tests/attnc99.c dcc-output=ATTNC99 dcc-stack-bytes=768 dcc-peep=true
 settings:
 
 ```sh
-dccmake tests/tprintf.c dcc-output=TPRINTF -ffloatio
+dccmake tests/tprintf.c dcc-output=TPRINTF -ffloatio  # blanket force-on override
 dccmake tests/app.c dcc-output=APP -I include -DDEBUG=1 -UOLD
 dccmake tests/app.c dcc-output=APP -stack 1024 -fstack-check
 ```
@@ -151,8 +159,6 @@ configuration into source control without hard-coding checkout-specific paths.
 # dccmake configuration for ATTNC99
 dcc-input=attnc99.c
 dcc-output=ATTNC99
-dcc-floatio=false
-dcc-flongio=false
 dcc-peep=true
 dcc-build-dir=build
 dcc-runtime=${DCC_DIR}/DCCRTL.MAC
@@ -197,8 +203,10 @@ dccmake dcc-peep=false
 | ------- | ------- | ------- |
 | `dcc-input` | (required) | Comma-separated C sources; positional `.c` arguments are also accepted |
 | `dcc-output` | First input base name | CP/M 8-character output base name |
-| `dcc-floatio` | Environment/default | Pass `-ffloatio` to `dcc` and keep float `printf` runtime support |
-| `dcc-flongio` | Environment/default | Pass `-flongio` to `dcc` and keep long integer `printf` runtime support |
+| `dcc-floatio` | `false` | Force `%f` support on every `printf`-family call when true; literal formats are normally detected per call |
+| `dcc-no-floatio` | `false` | Force `%f` support off even for matching literals or the non-literal fallback |
+| `dcc-flongio` | `false` | Force long-format support on every `printf`-family call when true; literal formats are normally detected per call |
+| `dcc-no-longio` | `false` | Force long-format support off even for matching literals or the non-literal fallback |
 | `dcc-stack-bytes` | `512` | Stack reserve passed to `dcc` with `-stack` |
 | `dcc-stack-check` | Environment/default | Pass `-fstack-check` to `dcc` |
 | `dcc-include-directory` | Auto-adds `.` when standard headers are in the current directory | Comma-separated include directories; `dcc-include` is an alias |
@@ -210,9 +218,20 @@ dccmake dcc-peep=false
 | `dcc-tool` | `DCC`, local `dcc`, or `dcc` | DCC compiler command |
 | `dccpeep-tool` | `DCCPEEP`, local `dccpeep`, or `dccpeep` | Peephole optimizer command |
 | `dccrtlstrip-tool` | `DCCRTLSTRIP`, local `dccrtlstrip`, or `dccrtlstrip` | Runtime stripper command |
-| `ntvcm-tool` | `NTVCM` or `ntvcm` | Emulator command used to run M80 and L80 |
-| `m80-command` | `M80` or `m80` | CP/M assembler command passed to `ntvcm` |
-| `l80-command` | `L80` or `l80` | CP/M linker command passed to `ntvcm` |
+| `ntvcm-tool` | `NTVCM` or `ntvcm` | Emulator command used to run M80/L80 (only when either is emulated) |
+| `m80-command` | `M80` or `m80` | CP/M assembler command passed to `ntvcm`; emulated-M80 path only |
+| `m80c-tool` | `M80C`, local `m80c`, or `m80c` | Native host assembler command (default, no `ntvcm`) |
+| `dcc-use-emulated-m80` | `false` | Assemble with real `M80.COM` under `ntvcm` instead of native `m80c` |
+| `l80-command` | `L80` or `l80` | CP/M linker command passed to `ntvcm`; emulated-L80 path only |
+| `l80c-tool` | `L80C`, local `l80c`, or `l80c` | Native host linker command (default, no `ntvcm`) |
+| `dcc-use-emulated-l80` | `false` | Link with real `L80.COM` under `ntvcm` instead of native `l80c` |
+
+With all four float/long settings at their default `false`, `dccmake` passes no
+formatted-I/O override to dcc and adds no forced keep root to `dccrtlstrip`.
+dcc therefore performs its normal per-call format detection. In particular,
+`dcc-floatio=false` and `dcc-flongio=false` are neutral; use
+`dcc-no-floatio=true` or `dcc-no-longio=true` only when support must be forced
+off.
 
 Source input basenames and the output name must be CP/M 8.3-clean. For example,
 `module1.c` is valid, but a generated module output base longer than eight
@@ -223,7 +242,9 @@ characters is not.
 | Option | Equivalent setting |
 | ------ | ------------------ |
 | `-f`, `-ffloatio` | `dcc-floatio=true` |
+| `-fno-floatio` | `dcc-no-floatio=true` |
 | `-fl`, `-flongio` | `dcc-flongio=true` |
+| `-fno-longio` | `dcc-no-longio=true` |
 | `-s <bytes>`, `-stack <bytes>`, `-stack=<bytes>` | `dcc-stack-bytes=<bytes>` |
 | `-fstack-check` | `dcc-stack-check=true` |
 | `-I <dir>`, `-Idir` | Add an include directory |
@@ -432,8 +453,8 @@ one test, keyed by `name`:
 | `stdin` | string | no | `""` | Text piped to the program's standard input during execution (for keyboard/input-driven tests) |
 | `stack_size` | integer | no | `512` | C stack reserve in bytes, passed to `dcc` as `-stack`. Used by recursive apps that need more headroom |
 | `dcc_args` | string | no | `""` | Extra DCC C Compiler build arguments passed through `dccmake` (for example `-DNAME=1 -UOLD`) |
-| `dcc_floatio` | boolean | no | environment/default | When set, controls `dccmake` `dcc-floatio` and dcc `-ffloatio` for this app |
-| `dcc_longio` | boolean | no | environment/default | When set, controls `dccmake` `dcc-flongio` and dcc `-flongio` for this app |
+| `dcc_floatio` | boolean | no | environment/default | True forces `-ffloatio`; false leaves per-call auto-detection active for this app |
+| `dcc_longio` | boolean | no | environment/default | True forces `-flongio`; false leaves per-call auto-detection active for this app |
 | `ignore` | boolean | no | `false` | When `true`, the test is skipped entirely (not built or run) |
 
 Entries with none of the optional properties have no effect, so an app only
