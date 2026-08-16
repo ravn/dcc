@@ -35,12 +35,12 @@ void emit_init_numeric(long v, int bytes)
     uv = (unsigned long)v;
 
     if (bytes == 1) {
-        fprintf(outf, "\tdb %lu\n", uv & 255UL);
+        fprintf(g_emit_sink.stream, "\tdb %lu\n", uv & 255UL);
     } else if (bytes == 4) {
-        fprintf(outf, "\tdw %lu\n", uv & 0xffffUL);
-        fprintf(outf, "\tdw %lu\n", (uv >> 16) & 0xffffUL);
+        fprintf(g_emit_sink.stream, "\tdw %lu\n", uv & 0xffffUL);
+        fprintf(g_emit_sink.stream, "\tdw %lu\n", (uv >> 16) & 0xffffUL);
     } else {
-        fprintf(outf, "\tdw %lu\n", uv & 0xffffUL);
+        fprintf(g_emit_sink.stream, "\tdw %lu\n", uv & 0xffffUL);
     }
 }
 
@@ -107,11 +107,11 @@ void emit_init_label_or_number(const char *p, int bytes)
      */
     mark_init_label_extrn(p);
     if (init_label_is_string_literal_label(p)) {
-        fprintf(outf, "\tdw %s\n", p);
+        fprintf(g_emit_sink.stream, "\tdw %s\n", p);
     } else if (strchr(p, '+') || strchr(p, '-')) {
-        fprintf(outf, "\tdw %s\n", p);
+        fprintf(g_emit_sink.stream, "\tdw %s\n", p);
     } else {
-        fprintf(outf, "\tdw %s\n", asm_name_for(p));
+        fprintf(g_emit_sink.stream, "\tdw %s\n", asm_name_for(p));
     }
 
     if (bytes > 2)
@@ -121,11 +121,11 @@ void emit_init_label_or_number(const char *p, int bytes)
 static void emit_init_zero_bytes(int bytes)
 {
     while (bytes >= 2) {
-        fprintf(outf, "\tdw 0\n");
+        fprintf(g_emit_sink.stream, "\tdw 0\n");
         bytes -= 2;
     }
     if (bytes > 0)
-        fprintf(outf, "\tdb 0\n");
+        fprintf(g_emit_sink.stream, "\tdb 0\n");
 }
 
 void emit_data(void)
@@ -141,13 +141,13 @@ void emit_data(void)
         char buf[8];
         int vlen;
 
-        fprintf(outf, "S%d:\n", i);
+        fprintf(g_emit_sink.stream, "S%d:\n", i);
 
         if (string_wide[i]) {
             emit("\tdw ");
             col = 4; /* tab + "dw " */
 
-            for (j = 0; strings[i][j]; ++j) {
+            for (j = 0; j < string_len[i]; ++j) {
                 sprintf(buf, "%u", (unsigned char)strings[i][j]);
                 vlen = (int)strlen(buf);
                 if (j) {
@@ -176,7 +176,7 @@ void emit_data(void)
             emit("\tdb ");
             col = 4; /* tab + "db " */
 
-            for (j = 0; strings[i][j]; ++j) {
+            for (j = 0; j < string_len[i]; ++j) {
                 sprintf(buf, "%u", (unsigned char)strings[i][j]);
                 vlen = (int)strlen(buf);
                 if (j) {
@@ -216,9 +216,12 @@ void emit_data(void)
         /* skip BSS (uninitialized) globals — emitted separately below */
         if (!(s->has_init && s->init_count > 0) && !(s->has_init && !s->is_array)) continue;
 
-        if (!s->is_static)
-            fprintf(outf, "\tpublic %s\n", asm_name_for(sym_asm_name(s)));
-        fprintf(outf, "%s:\n", asm_name_for(sym_asm_name(s)));
+        if (!s->is_static) {
+            asm_name_check_public_collision(sym_asm_name(s));
+            fprintf(g_emit_sink.stream, "\tpublic %s\n", asm_name_for(sym_asm_name(s)));
+        }
+        emit_debug_global(s);
+        fprintf(g_emit_sink.stream, "%s:\n", asm_name_for(sym_asm_name(s)));
         if (s->has_init && s->init_count > 0) {
             int j;
             int elem_bytes;
@@ -277,10 +280,13 @@ void emit_data(void)
                 if ((s->has_init && s->init_count > 0) || (s->has_init && !s->is_array)) continue;
 
                 bss_size = s->size > 0 ? s->size : 2;
-                if (!s->is_static)
-                    fprintf(outf, "\tpublic %s\n", asm_name_for(sym_asm_name(s)));
-                fprintf(outf, "%s:\n", asm_name_for(sym_asm_name(s)));
-                fprintf(outf, "\tds %d\n", bss_size);
+                if (!s->is_static) {
+                    asm_name_check_public_collision(sym_asm_name(s));
+                    fprintf(g_emit_sink.stream, "\tpublic %s\n", asm_name_for(sym_asm_name(s)));
+                }
+                emit_debug_global(s);
+                fprintf(g_emit_sink.stream, "%s:\n", asm_name_for(sym_asm_name(s)));
+                fprintf(g_emit_sink.stream, "\tds %d\n", bss_size);
             }
             return;
         }
@@ -298,9 +304,9 @@ void emit_data(void)
                 effective_stack_size = min_stack_size;
 
             emit("\n\tpublic\t__stack_size\n");
-            fprintf(outf, "__stack_size\tequ\t%d\n", effective_stack_size);
+            fprintf(g_emit_sink.stream, "__stack_size\tequ\t%d\n", effective_stack_size);
             if (effective_stack_size != opt_stack_size)
-                fprintf(outf, "\t; dcc: raised stack reserve from %d to %d; max local frame is %d bytes\n",
+                fprintf(g_emit_sink.stream, "\t; dcc: raised stack reserve from %d to %d; max local frame is %d bytes\n",
                         opt_stack_size, effective_stack_size, max_function_local_bytes);
         }
         emit("\n\tpublic\t__data_end\n__data_end:\n");
@@ -314,12 +320,13 @@ void emit_data(void)
             if ((s->has_init && s->init_count > 0) || (s->has_init && !s->is_array)) continue;
 
             bss_size = s->size > 0 ? s->size : 2;
-            fprintf(outf, "%s\tequ\t__bssb+%d\n", asm_name_for(sym_asm_name(s)), bss_off);
+            emit_debug_global(s);
+            fprintf(g_emit_sink.stream, "%s\tequ\t__bssb+%d\n", asm_name_for(sym_asm_name(s)), bss_off);
             bss_off += bss_size;
         }
 
-        fprintf(outf, "__bsse\tequ\t__bssb+%d\n", bss_off);
-        fprintf(outf, "__hstart\tequ\t__bsse\n");
+        fprintf(g_emit_sink.stream, "__bsse\tequ\t__bssb+%d\n", bss_off);
+        fprintf(g_emit_sink.stream, "__hstart\tequ\t__bsse\n");
         emit("\tpublic\t__bsse\n");
         emit("\tpublic\t__hstart\n");
     }

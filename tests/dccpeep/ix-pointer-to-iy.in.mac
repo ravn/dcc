@@ -1,0 +1,93 @@
+; static function decline
+_ZD:
+push ix
+ld ix,0
+add ix,sp
+ld hl,100
+ld (ix-2),l
+ld (ix-1),h
+ld hl,0
+ld l,(ix-2)
+ld h,(ix-1)
+ld a,(hl)
+call _external
+ld l,(ix-2)
+ld h,(ix-1)
+ld a,(hl)
+call _external
+ld l,(ix-2)
+ld h,(ix-1)
+ld a,(hl)
+call _external
+ld l,(ix-2)
+ld h,(ix-1)
+ld a,(hl)
+ld a,(ix-2)
+add a,1
+ld (ix-2),a
+jr nc,LDS
+inc (ix-1)
+LDS:
+ld sp,ix
+pop ix
+ret
+; static function accept
+_ZA:
+push ix
+ld ix,0
+add ix,sp
+ld hl,100
+ld (ix-2),l
+ld (ix-1),h
+ld hl,0
+ld l,(ix-2)
+ld h,(ix-1)
+ld a,(hl)
+call __safe
+ld l,(ix-2)
+ld h,(ix-1)
+ld a,(hl)
+call __safe
+ld e,(ix-2)
+ld d,(ix-1)
+ex de,hl
+ld a,(hl)
+ld a,(ix-2)
+add a,2
+ld (ix-2),a
+jr nc,LAS
+inc (ix-1)
+LAS:
+jp LAT
+LAT:
+or a
+ld sp,ix
+pop ix
+ret
+; static function counted
+_ZC:
+push ix
+ld ix,0
+add ix,sp
+ld hl,-3
+add hl,sp
+ld sp,hl
+ld hl,200
+ld (ix-2),l
+ld (ix-1),h
+ld (ix-3),8
+LC:
+ld l,(ix-2)
+ld h,(ix-1)
+ld a,(hl)
+inc hl
+ld b,(hl)
+inc hl
+ld (ix-2),l
+ld (ix-1),h
+dec (ix-3)
+jp nz, LC
+ld sp,ix
+pop ix
+ret
+end

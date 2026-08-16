@@ -6,20 +6,350 @@
  */
 #include <string.h>
 #include "dcc_ast_gen_internal.h"
+#include "dcc_mir.h"
 
 static const struct AstNode *inline_substitution_body(struct Sym *fn);
+static int ast_is_float_madd_rhs(const struct AstNode *rhs);
+static int ast_const_int_operand_value(const struct AstNode *n, long *out);
+static int ast_masked_byte_operand(const struct AstNode *n, const struct AstNode **out);
+static int ast_long_byte_extract(const struct AstNode *n, const struct AstNode **out_base, int *out_byte);
+static void emit_long_byte_from_reg(int byte_index);
+static int emit_low_byte_expr_to_a(const struct AstNode *n);
+static int emit_long_byte_shift_to_reg(const struct AstNode *n);
+static int emit_long_oreq_byte_lane(struct Sym *s, const struct AstNode *rhs);
+static void gen_compound_literal_ast(const struct AstNode *n);
+static void gen_assign_lvalue_expr_ast(const struct AstNode *n);
+static void gen_assign_ident_ast(const struct AstNode *n);
+static void gen_assign_ident_plain_ast(const struct AstNode *n, struct Sym *s);
+static void gen_assign_ident_compound_ast(const struct AstNode *n, struct Sym *s);
+static int ast_member_global_word_field(const struct AstNode *n, struct Sym **out_base,
+                                        struct FieldDef **out_fd, int *out_val_type);
+static void emit_load_global_field_word_direct(struct Sym *base, struct FieldDef *fd);
+static void emit_store_global_field_word_direct(struct Sym *base, struct FieldDef *fd);
+
+void ast_gen_dead_expr(const struct AstNode *n)
+{
+    if (n->kind == AST_COMMA) {
+        ast_gen_dead_expr(n->a);
+        ast_gen_dead_expr(n->b);
+    } else if (n->kind == AST_CAST && (n->type & 15) == TYPE_VOID) {
+        ast_gen_dead_expr(n->a);
+    } else if ((n->kind == AST_UNARY || n->kind == AST_POSTFIX) &&
+               (n->op == TOK_INC || n->op == TOK_DEC)) {
+        struct Sym *s = ast_deadincdec_sym_direct(n);
+        if (s != NULL) {
+            emit_incdec_sym_direct(s, n->op);
+        } else {
+            int type;
+            gen_deadincdec_addr_lvalue_ast(n, &type);
+            if (current_field_bit_width > 0)
+                emit_pre_incdec_lvalue(type, n->op);
+            else
+                emit_incdec_addr(type, n->op);
+        }
+    } else if (ast_is_local_self_add_stmt(n)) {
+        ast_emit_local_self_add_stmt(n);
+    } else if (n->kind == AST_IDENT) {
+        struct Sym *s = find_sym(n->sval);
+        if (s == NULL || s->is_volatile)
+            ast_gen_expr(n);
+    } else {
+        ast_gen_expr(n);
+    }
+}
+
+
+/* Recognize byte-truncation idioms that are common in hand-written portable C:
+ *     (unsigned char)(x & 0xff)
+ *     (char)((long)x & 0xffL)
+ * The target byte conversion already keeps only L, so the explicit mask is
+ * redundant and expensive when the left side forced a long promotion.  Return
+ * the expression whose low byte should be used. */
+static int ast_masked_byte_operand(const struct AstNode *n, const struct AstNode **out)
+{
+    long cv;
+
+    if (n == NULL)
+        return 0;
+    if (n->kind == AST_BINARY && n->op == '&' &&
+        ast_const_int_operand_value(n->b, &cv) && ((unsigned long)cv & 0xffffffffUL) == 255UL) {
+        *out = n->a;
+        return 1;
+    }
+    return 0;
+}
+
+/* Recognize the four byte-extraction forms from a 32-bit value:
+ *     long_expr & 0xff
+ *     (long_expr >> 8)  & 0xff
+ *     (long_expr >> 16) & 0xff
+ *     (long_expr >> 24) & 0xff
+ * The long value lives in DE:HL as bytes D:E:H:L from high to low, so after
+ * evaluating the base we can select the requested byte directly instead of
+ * running the generic long shift and long AND helpers. */
+static int ast_long_byte_extract(const struct AstNode *n, const struct AstNode **out_base, int *out_byte)
+{
+    long mask;
+    long shift;
+    const struct AstNode *lhs;
+
+    if (n == NULL || n->kind != AST_BINARY || n->op != '&')
+        return 0;
+    if (!ast_const_int_operand_value(n->b, &mask) || ((unsigned long)mask & 0xffffffffUL) != 255UL)
+        return 0;
+
+    lhs = n->a;
+    if (lhs != NULL && lhs->kind == AST_BINARY && lhs->op == TOK_SHR &&
+        ast_const_int_operand_value(lhs->b, &shift)) {
+        if (shift != 8 && shift != 16 && shift != 24)
+            return 0;
+        *out_base = lhs->a;
+        *out_byte = (int)(shift / 8);
+        return 1;
+    }
+
+    *out_base = lhs;
+    *out_byte = 0;
+    return 1;
+}
+
+static void emit_long_byte_from_reg(int byte_index)
+{
+    switch (byte_index) {
+    case 0:
+        emit("\tld h,0\n");
+        break;
+    case 1:
+        emit("\tld l,h\n\tld h,0\n");
+        break;
+    case 2:
+        emit("\tld l,e\n\tld h,0\n");
+        break;
+    default:
+        emit("\tld l,d\n\tld h,0\n");
+        break;
+    }
+    emit("\tld de,0\n");
+}
+
+
+static void emit_long_one_byte_from_a(int byte_index)
+{
+    switch (byte_index) {
+    case 0:
+        emit("\tld l,a\n\tld h,0\n\tld de,0\n");
+        break;
+    case 1:
+        emit("\tld h,a\n\tld l,0\n\tld de,0\n");
+        break;
+    case 2:
+        emit("\tld e,a\n\tld d,0\n\tld hl,0\n");
+        break;
+    default:
+        emit("\tld d,a\n\tld e,0\n\tld hl,0\n");
+        break;
+    }
+}
+
+/* Recognize `(byte_expr & 255L) << {0,8,16,24}` and materialize the
+ * resulting long by loading just the byte and placing it in the target byte
+ * lane of DE:HL.  This is the inverse of ast_long_byte_extract() and is the
+ * hot get_stamp() pattern: widening, long AND, long shift, and long OR are
+ * all unnecessary when only one byte contributes to the result. */
+static int emit_long_byte_shift_to_reg(const struct AstNode *n)
+{
+    const struct AstNode *src;
+    long sh;
+    int byte_index;
+
+    if (n == NULL)
+        return 0;
+
+    src = n;
+    sh = 0;
+    if (n->kind == AST_BINARY && n->op == TOK_SHL) {
+        if (!ast_const_int_operand_value(n->b, &sh))
+            return 0;
+        if (sh != 0 && sh != 8 && sh != 16 && sh != 24)
+            return 0;
+        src = n->a;
+    }
+
+    if (!ast_masked_byte_operand(src, &src))
+        return 0;
+
+    if (!emit_low_byte_expr_to_a(src))
+        return 0;
+    byte_index = (int)(sh / 8);
+    emit_long_one_byte_from_a(byte_index);
+    return 1;
+}
+
+/* Emit the low byte of a small expression directly into A without widening to
+ * int/long.  This is intentionally conservative and targets hot portable-C
+ * idioms such as `(char)((rec + i) & 0xff)`: the low byte of an addition only
+ * depends on the low bytes of its operands, so an IX-direct load/add sequence
+ * is enough.  Declines if evaluating the expression would need calls, memory
+ * addressing, or anything that might clobber HL (the lvalue address in the
+ * store fast path). */
+static int emit_low_byte_expr_to_a(const struct AstNode *n)
+{
+    const struct AstNode *src;
+    struct Sym *s;
+
+    if (n == NULL)
+        return 0;
+    if (n->kind == AST_CAST) {
+        /* A cast (narrowing OR widening) between integer types never changes
+         * the low byte's bit pattern, so it's safe to look through it in
+         * either direction - e.g. `(long)b[0]` widens a char, but the low
+         * byte of the result is exactly b[0]'s bits. Casts touching a float
+         * on either side are real numeric conversions, not a bit
+         * reinterpretation, so those must not be unwrapped. */
+        if (n->a == NULL || type_is_float(n->type) || type_is_float(n->a->type))
+            return 0;
+        return emit_low_byte_expr_to_a(n->a);
+    }
+    if (ast_masked_byte_operand(n, &src))
+        return emit_low_byte_expr_to_a(src);
+    {
+        const struct AstNode *byte_base;
+        int byte_index;
+        if (ast_long_byte_extract(n, &byte_base, &byte_index) &&
+            byte_base != NULL && byte_base->kind == AST_IDENT) {
+            s = find_sym(byte_base->sval);
+            if (s != NULL && sym_can_ix_direct(s) && type_is_long(s->type)) {
+                fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset + byte_index);
+                return 1;
+            }
+        }
+    }
+    /* A bare `long_ident >> K` (K a multiple of 8): the caller already
+     * stripped an enclosing `& 0xff` via ast_masked_byte_operand() above, so
+     * ast_long_byte_extract()'s own `& 0xff`-wrapped shape can never match
+     * here even though this is exactly the byte it's looking for - e.g.
+     * fill_record()'s `(rec >> 24) & 0xff` arrives as a bare `rec >> 24` by
+     * the time it reaches this point. */
+    if (n->kind == AST_BINARY && n->op == TOK_SHR && n->a != NULL &&
+        n->a->kind == AST_IDENT) {
+        long shift;
+        if (ast_const_int_operand_value(n->b, &shift) &&
+            (shift == 0 || shift == 8 || shift == 16 || shift == 24)) {
+            s = find_sym(n->a->sval);
+            if (s != NULL && sym_can_ix_direct(s) && type_is_long(s->type)) {
+                fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset + (int)(shift / 8));
+                return 1;
+            }
+        }
+    }
+    if (n->kind == AST_IDENT) {
+        s = find_sym(n->sval);
+        if (s == NULL || !sym_can_ix_direct(s) || type_size(s->type) > 4)
+            return 0;
+        fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset);
+        return 1;
+    }
+    if (n->kind == AST_INT_LIT) {
+        fprintf(g_emit_sink.stream, "\tld a,%ld\n", n->ival & 255L);
+        return 1;
+    }
+    if (n->kind == AST_INDEX && n->a != NULL && n->a->kind == AST_IDENT &&
+        n->b != NULL) {
+        int base;
+        struct Sym *ps = find_sym(n->a->sval);
+        if (ps != NULL && sym_can_ix_direct(ps)) {
+            base = type_decay_ptr(ps->type);
+            if (type_size(base) == 1) {
+                fprintf(g_emit_sink.stream, "\tld l,(ix%+d)\n", ps->offset);
+                fprintf(g_emit_sink.stream, "\tld h,(ix%+d)\n", ps->offset + 1);
+                if (n->b->kind == AST_IDENT) {
+                    struct Sym *idx = find_sym(n->b->sval);
+                    if (idx == NULL || !sym_can_ix_direct(idx) || type_size(idx->type) != 2)
+                        return 0;
+                    fprintf(g_emit_sink.stream, "\tld e,(ix%+d)\n", idx->offset);
+                    fprintf(g_emit_sink.stream, "\tld d,(ix%+d)\n", idx->offset + 1);
+                    emit("\tadd hl,de\n");
+                } else if (n->b->kind == AST_INT_LIT) {
+                    if (n->b->ival != 0) {
+                        fprintf(g_emit_sink.stream, "\tld de,%ld\n", n->b->ival & 0xffffL);
+                        emit("\tadd hl,de\n");
+                    }
+                } else {
+                    return 0;
+                }
+                emit("\tld a,(hl)\n");
+                return 1;
+            }
+        }
+    }
+    if (n->kind == AST_BINARY && (n->op == '+' || n->op == '-')) {
+        if (!emit_low_byte_expr_to_a(n->a))
+            return 0;
+        if (n->b != NULL && n->b->kind == AST_IDENT) {
+            s = find_sym(n->b->sval);
+            if (s == NULL || !sym_can_ix_direct(s) || type_size(s->type) > 4)
+                return 0;
+            fprintf(g_emit_sink.stream, n->op == '+' ? "\tadd a,(ix%+d)\n" : "\tsub (ix%+d)\n", s->offset);
+            return 1;
+        }
+        if (n->b != NULL && n->b->kind == AST_INT_LIT) {
+            fprintf(g_emit_sink.stream, n->op == '+' ? "\tadd a,%ld\n" : "\tsub %ld\n", n->b->ival & 255L);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Recognize `v |= (byte_expr & 0xff) << K` (K in {0,8,16,24}; K may be
+ * absent, meaning 0) when v is an ix-direct long local. The right-hand side
+ * only ever has one nonzero byte lane, so OR-ing it into v can touch just
+ * that one byte of v's stack storage - load the byte, `or (ix+d)`,
+ * `ld (ix+d),a` - instead of the generic path: reload all 4 bytes of v,
+ * evaluate the rhs through the widen/mask/shift chain into DE:HL, run a
+ * full 32-bit OR, and store all 4 bytes back. This is exactly the
+ * `v |= (byte) << K;` shape get_stamp()-style byte-assembly idioms use. */
+static int emit_long_oreq_byte_lane(struct Sym *s, const struct AstNode *rhs)
+{
+    const struct AstNode *src;
+    long sh;
+    int byte_index;
+
+    if (rhs == NULL)
+        return 0;
+
+    src = rhs;
+    sh = 0;
+    if (rhs->kind == AST_BINARY && rhs->op == TOK_SHL) {
+        if (!ast_const_int_operand_value(rhs->b, &sh))
+            return 0;
+        if (sh != 0 && sh != 8 && sh != 16 && sh != 24)
+            return 0;
+        src = rhs->a;
+    }
+
+    if (!ast_masked_byte_operand(src, &src))
+        return 0;
+
+    if (!emit_low_byte_expr_to_a(src))
+        return 0;
+
+    byte_index = (int)(sh / 8);
+    fprintf(g_emit_sink.stream, "\tor (ix%+d)\n", s->offset + byte_index);
+    fprintf(g_emit_sink.stream, "\tld (ix%+d),a\n", s->offset + byte_index);
+    return 1;
+}
 
 void gen_int_lit(const struct AstNode *n)
 {
     if (n->type & TYPE_LONG) {
         /* 32-bit literal: low half in HL, high half in DE. */
-        fprintf(outf, "\tld hl,%ld\n", n->ival & 0xffffL);
-        fprintf(outf, "\tld de,%ld\n", (n->ival >> 16) & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld hl,%ld\n", n->ival & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld de,%ld\n", (n->ival >> 16) & 0xffffL);
     } else {
-        fprintf(outf, "\tld hl,%ld\n", n->ival & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld hl,%ld\n", n->ival & 0xffffL);
     }
-    g_expr_type = n->type;
-    g_long_from16 = 0;
+    g_expr.type = n->type;
+    g_expr.long_from16 = 0;
 }
 
 /* Cast `(type)expr` to a 16-bit integer target (float/long/pointer targets
@@ -29,36 +359,49 @@ void gen_cast_ast(const struct AstNode *n)
 {
     int t = n->type;
     int from16 = 0;
+    const struct AstNode *byte_src;
+
+    if (type_size(t) == 1 && ast_masked_byte_operand(n->a, &byte_src)) {
+        ast_gen_expr(byte_src);
+        if (t & TYPE_UNSIGNED)
+            emit("\tld h,0\n");
+        else
+            emit("\tld a,l\n\trlca\n\tsbc a,a\n\tld h,a\n");
+        g_expr.type = t;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
     ast_gen_expr(n->a);
     if (type_is_float(t)) {
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
-        g_expr_type = t;
-        g_long_from16 = 0;
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
+        g_expr.type = t;
+        g_expr.long_from16 = 0;
         return;
     }
     if (type_is_long(t)) {
-        if (type_is_float(g_expr_type))
+        if (type_is_float(g_expr.type))
             emit_convert_float_to_intlike(t);
-        else if (!type_is_long(g_expr_type)) {
-            emit_extend_to_long_typed(g_expr_type);
-            from16 = g_long_from16;
+        else if (!type_is_long(g_expr.type)) {
+            emit_extend_to_long_typed(g_expr.type);
+            from16 = g_expr.long_from16;
         }
-        g_expr_type = t;
-        g_long_from16 = from16;
+        g_expr.type = t;
+        g_expr.long_from16 = from16;
         return;
     }
     if (type_is_bool(t)) {
         if (!ast_expr_yields_bool01(n->a))
-            emit_bool_normalize_hl(g_expr_type);
-        g_expr_type = t;
-        g_long_from16 = 0;
+            emit_bool_normalize_hl(g_expr.type);
+        g_expr.type = t;
+        g_expr.long_from16 = 0;
         return;
     }
-    if (type_is_float(g_expr_type)) {
+    if (type_is_float(g_expr.type)) {
         emit_convert_float_to_intlike(t);
-        g_expr_type = t;
-        g_long_from16 = 0;
+        g_expr.type = t;
+        g_expr.long_from16 = 0;
         return;
     }
     if (type_size(t) == 1) {
@@ -67,8 +410,8 @@ void gen_cast_ast(const struct AstNode *n)
         else
             emit("\tld a,l\n\trlca\n\tsbc a,a\n\tld h,a\n");
     }
-    g_expr_type = t;
-    g_long_from16 = 0;
+    g_expr.type = t;
+    g_expr.long_from16 = 0;
 }
 
 void gen_str_lit(const struct AstNode *n)
@@ -77,9 +420,9 @@ void gen_str_lit(const struct AstNode *n)
      * 1:1 substitution at gen_expr preserves source order, so the assigned
      * string id remains stable. */
     int sid;
-    sid = add_string_ex(n->sval, (int)n->ival);
-    fprintf(outf, "\tld hl,S%d\n", sid);
-    g_expr_type = TYPE_CHAR | TYPE_PTR;
+    sid = add_string_ex(n->sval, (int)n->uval, (int)n->ival);
+    fprintf(g_emit_sink.stream, "\tld hl,S%d\n", sid);
+    g_expr.type = TYPE_CHAR | TYPE_PTR;
 }
 
 void gen_ident(const struct AstNode *n)
@@ -93,24 +436,24 @@ void gen_ident(const struct AstNode *n)
     current_field_bit_width = 0;
     current_field_bit_shift = 0;
     current_field_bit_mask = 0;
-    g_array_decay_stride = 0;
-    g_expr_no_deref = 0;
+    g_expr.decay_stride = 0;
+    g_expr.no_deref = 0;
 
     /* stdin/stdout/stderr -> immediate FILE values 0/1/2, checked before
      * symbol resolution. */
     if (!strcmp(name, "stdin")) {
         emit("\tld hl,0\n");
-        g_expr_type = TYPE_INT;
+        g_expr.type = TYPE_INT;
         return;
     }
     if (!strcmp(name, "stdout")) {
         emit("\tld hl,1\n");
-        g_expr_type = TYPE_INT;
+        g_expr.type = TYPE_INT;
         return;
     }
     if (!strcmp(name, "stderr")) {
         emit("\tld hl,2\n");
-        g_expr_type = TYPE_INT;
+        g_expr.type = TYPE_INT;
         return;
     }
 
@@ -120,23 +463,23 @@ void gen_ident(const struct AstNode *n)
         for (ei = 0; ei < nenum_consts; ++ei) {
             if (!strcmp(enum_const_names[ei], name)) {
                 long ev = (long)(int)enum_const_values[ei];
-                fprintf(outf, "\tld hl,%ld\n", ev & 0xffffL);
-                g_expr_type = TYPE_INT;
+                fprintf(g_emit_sink.stream, "\tld hl,%ld\n", ev & 0xffffL);
+                g_expr.type = TYPE_INT;
                 return;
             }
         }
         {
             char msg[MAX_TOK_TEXT + 64];
             sprintf(msg, "use of undeclared identifier '%s'", name);
-            dcc_error_at(tok.file[0] ? tok.file : (input_name ? input_name : "<input>"),
-                         n->line > 0 ? n->line : tok_line, -1, msg, NULL);
+            dcc_error_at(g_lex.tok.file[0] ? g_lex.tok.file : (input_name ? input_name : "<input>"),
+                         n->line > 0 ? n->line : g_lex.tok_line, -1, msg, NULL);
         }
         emit("\tld hl,0\n");
-        g_expr_type = TYPE_INT;
+        g_expr.type = TYPE_INT;
         return;
     }
 
-    /* Folded local const scalar -> immediate (helper sets g_expr_type). */
+    /* Folded local const scalar -> immediate (helper sets g_expr.type). */
     if (s->is_const_value) {
         emit_load_const_sym_value(s);
         return;
@@ -144,26 +487,39 @@ void gen_ident(const struct AstNode *n)
 
     /* A function name used as a value decays to its address - a real
      * reference regardless of whether it's also inline-eligible, so any
-     * static function's buffered body must be kept. */
+     * static function's buffered body must be kept. A function defined in
+     * a different translation unit (any DCCRTL.MAC/library function, or an
+     * extern-only prototype) needs an EXTRN for that symbol here, exactly
+     * like the general call path already does before its own `call`
+     * (dcc_ast_gen_expr.c's emit_extrn_if_needed(fn_sym) right before
+     * "call %s") and like a global initializer's function-pointer value
+     * already does (dcc_data.c's mark_init_label_extrn). This local-value
+     * path was the one case that never called it - harmless for a
+     * same-file user function (its own `public` label needs no EXTRN),
+     * but a real link failure ("U ... ld hl,__mcmp") for a LOCAL function
+     * pointer initialized from any RTL function, found via a stricmp()
+     * test that happened to be the first one in this whole codebase to
+     * exercise a local (not global) RTL function-pointer variable. */
     if (s->storage == SC_FUNC) {
         if (s->is_static)
             s->deferred_body_needed = 1;
-        fprintf(outf, "\tld hl,%s\n", asm_name_for(sym_asm_name(s)));
-        g_expr_type = type_add_ptr(s->type);
+        emit_extrn_if_needed(s);
+        fprintf(g_emit_sink.stream, "\tld hl,%s\n", asm_name_for(sym_asm_name(s)));
+        g_expr.type = type_add_ptr(s->type);
         return;
     }
 
     /* Local scalar reachable with a direct ix-relative load. */
     if (sym_can_ix_direct(s)) {
         emit_load_sym_value_direct(s);
-        g_expr_type = s->type;
+        g_expr.type = s->type;
         return;
     }
 
     /* 16-bit global/extern: ld hl,(nn) direct load. */
     if (is_global_word_sym(s)) {
         emit_load_global_word_direct(s);
-        g_expr_type = s->type;
+        g_expr.type = s->type;
         return;
     }
 
@@ -171,11 +527,11 @@ void gen_ident(const struct AstNode *n)
      * pointer-to-element or load the scalar value. */
     emit_load_sym_addr(s);
     if (s->is_array) {
-        g_expr_type = type_add_ptr(s->type);
+        g_expr.type = type_add_ptr(s->type);
         if (s->dim_count > 1)
-            g_array_decay_stride = sym_array_index_elem_size(s, 0);
+            g_expr.decay_stride = sym_array_index_elem_size(s, 0);
     } else {
-        g_expr_type = s->type;
+        g_expr.type = s->type;
         emit_load_from_hl(s->type);
     }
 }
@@ -184,35 +540,47 @@ void gen_unary_ast(const struct AstNode *n)
 {
     int op = n->op;
     long fv;
+    unsigned long ffv;
+
+    /* A unary +/- chain over a float literal or folded `const float` local
+     * (e.g. `-PI`) folds to one immediate with the sign bit already flipped,
+     * instead of loading the constant and then flipping its sign at runtime
+     * with `ld a,d / xor 80h / ld d,a` on every execution. */
+    if ((op == '-' || op == '+') &&
+        ast_unary_float_const_fold(n, &ffv)) {
+        emit_load_float_bits(ffv);
+        g_expr.type = TYPE_FLOAT;
+        return;
+    }
 
     /* A unary chain over a single int literal folds to one immediate. */
     if ((op == '-' || op == '+' || op == '~') &&
         ast_unary_long_const_fold(n, &fv)) {
-        fprintf(outf, "\tld hl,%ld\n", fv & 0xffffL);
-        fprintf(outf, "\tld de,%ld\n", (fv >> 16) & 0xffffL);
-        g_expr_type = type_is_long(n->type) ? n->type : n->a->type;
-        g_long_from16 = 0;
+        fprintf(g_emit_sink.stream, "\tld hl,%ld\n", fv & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld de,%ld\n", (fv >> 16) & 0xffffL);
+        g_expr.type = type_is_long(n->type) ? n->type : n->a->type;
+        g_expr.long_from16 = 0;
         return;
     }
     if ((op == '-' || op == '+' || op == '~') &&
         ast_unary_int_const_fold(n, &fv)) {
-        fprintf(outf, "\tld hl,%ld\n", fv & 0xffffL);
-        g_expr_type = TYPE_INT;
+        fprintf(g_emit_sink.stream, "\tld hl,%ld\n", fv & 0xffffL);
+        g_expr.type = TYPE_INT;
         return;
     }
 
     /* `!<constant-int-expr>` (including chains like `!!0`) folds to a single
      * 0/1 immediate; ast_const_scalar_fold already yields the final value. */
     if (op == '!' && ast_const_scalar_fold(n, &fv)) {
-        fprintf(outf, "\tld hl,%ld\n", fv & 0xffffL);
-        g_expr_type = TYPE_INT;
+        fprintf(g_emit_sink.stream, "\tld hl,%ld\n", fv & 0xffffL);
+        g_expr.type = TYPE_INT;
         return;
     }
 
     /* gen_unary clears the "freshly widened from 16-bit" marker on entry; the
      * long negate/complement paths below re-clear it after producing a value
      * that is no longer a faithful widening. */
-    g_long_from16 = 0;
+    g_expr.long_from16 = 0;
 
     if (op == '!') {
         /* Labels are allocated BEFORE the operand in gen_unary; preserve that
@@ -220,13 +588,13 @@ void gen_unary_ast(const struct AstNode *n)
         int lt = new_label();
         int le = new_label();
         ast_gen_expr(n->a);
-        emit_test_expr_nonzero(g_expr_type, lt, 0);
+        emit_test_expr_nonzero(g_expr.type, lt, 0);
         emit("\tld hl,0\n");
         emit_jp_label("jp", le);
         emit_label(lt);
         emit("\tld hl,1\n");
         emit_label(le);
-        g_expr_type = TYPE_INT;
+        g_expr.type = TYPE_INT;
         return;
     }
 
@@ -240,27 +608,27 @@ void gen_unary_ast(const struct AstNode *n)
         current_field_bit_mask = 0;
         if (n->a->kind == AST_INDEX) {
             gen_index_addr_ast(n->a, &val_type);
-            g_expr_type = type_add_ptr(val_type);
+            g_expr.type = type_add_ptr(val_type);
             return;
         }
         if (n->a->kind == AST_MEMBER) {
             gen_member_addr_ast(n->a, &val_type);
-            g_expr_type = type_add_ptr(val_type);
+            g_expr.type = type_add_ptr(val_type);
             return;
         }
         if (n->a->kind == AST_UNARY && n->a->op == '*') {
             /* &*X collapses to the pointer value X. */
             gen_deref_addr_ast(n->a, &val_type);
-            g_expr_type = type_add_ptr(val_type);
+            g_expr.type = type_add_ptr(val_type);
             return;
         }
         if (n->a->kind == AST_COMPOUND_LITERAL) {
-            ast_gen_expr(n->a);
+            gen_compound_literal_ast(n->a);
             return;
         }
         s = find_sym(n->a->sval);
         emit_load_sym_addr(s);
-        g_expr_type = type_add_ptr(s->type);
+        g_expr.type = type_add_ptr(s->type);
         return;
     }
 
@@ -276,6 +644,13 @@ void gen_unary_ast(const struct AstNode *n)
             gen_va_arg_deref_ast(n, base);
             return;
         }
+        if (ast_deref_pointer_array_chain_collect(n, NULL, NULL, NULL, NULL, &base)) {
+            gen_deref_addr_ast(n, &base);
+            emit_load_from_hl(base);
+            g_expr.type = base;
+            g_expr.long_from16 = 0;
+            return;
+        }
         if (n->a->kind != AST_IDENT) {
             gen_pointer_expr_ast(n->a, &ptr_type, &no_deref);
             base = no_deref ? ptr_type : type_decay_ptr(ptr_type);
@@ -283,8 +658,8 @@ void gen_unary_ast(const struct AstNode *n)
                 base = TYPE_CHAR;
             if (!type_is_struct_object(base))
                 emit_load_from_hl(base);
-            g_expr_type = base;
-            g_long_from16 = 0;
+            g_expr.type = base;
+            g_expr.long_from16 = 0;
             return;
         }
         s = find_sym(n->a->sval);
@@ -300,14 +675,14 @@ void gen_unary_ast(const struct AstNode *n)
         if ((base & 15) == TYPE_VOID)
             base = TYPE_CHAR;
         emit_load_from_hl(base);
-        g_expr_type = base;
+        g_expr.type = base;
         return;
     }
 
     if (op == TOK_INC || op == TOK_DEC) {
         /* gen_lvalue_addr + emit_pre_incdec_lvalue: load the object's address,
          * then in-place increment/decrement, leaving the updated value in HL
-         * with g_expr_type = the object type. */
+         * with g_expr.type = the object type. */
         struct Sym *s;
         int val_type;
         current_field_bit_width = 0;
@@ -329,6 +704,31 @@ void gen_unary_ast(const struct AstNode *n)
             return;
         }
         s = find_sym(n->a->sval);
+        /* Plain identifier, directly addressable (an ix-relative local/param
+         * in range, or a global/extern word): load/store its value directly
+         * instead of materializing &s into HL and updating through it -
+         * mirrors the same fast path plain global scalar reads/stores
+         * already get. Found via `*--sp`/`*sp++` on a local stack-pointer
+         * variable in a benchmarked VM interpreter (forint.c's eval_e,
+         * ~54% of that function's own runtime): every prefix decrement of
+         * `sp` was paying for a full "compute &sp, load, dec, store back
+         * through &sp" round trip that a plain 4-instruction load/dec/store
+         * replaces. Bitfields/4-byte types are out of scope (AST_MEMBER
+         * bitfields never reach this branch; long/float take the generic
+         * address-based path below, unchanged). */
+        if (!type_is_bool(s->type) && type_size(s->type) == 2 &&
+            (sym_can_ix_direct(s) || is_global_word_sym(s))) {
+            emit_load_sym_value_direct(s);
+            emit_incdec_value_in_dehl(s->type, op);
+            if (sym_can_ix_direct(s)) {
+                fprintf(g_emit_sink.stream, "\tld (ix%+d),l\n", s->offset);
+                fprintf(g_emit_sink.stream, "\tld (ix%+d),h\n", s->offset + 1);
+            } else {
+                emit_store_global_word_direct(s);
+            }
+            g_expr.type = s->type;
+            return;
+        }
         emit_load_sym_addr(s);
         emit_pre_incdec_lvalue(s->type, op);
         return;
@@ -337,15 +737,15 @@ void gen_unary_ast(const struct AstNode *n)
     ast_gen_expr(n->a);
 
     if (op == '+') {
-        if (!type_is_float(g_expr_type) && !type_is_long(g_expr_type))
-            g_expr_type = promote_int_type(g_expr_type);
+        if (!type_is_float(g_expr.type) && !type_is_long(g_expr.type))
+            g_expr.type = promote_int_type(g_expr.type);
         return;
     }
 
     if (op == '-') {
-        if (type_is_float(g_expr_type)) {
+        if (type_is_float(g_expr.type)) {
             emit("\tld a,d\n\txor 80h\n\tld d,a\n");
-        } else if (type_is_long(g_expr_type)) {
+        } else if (type_is_long(g_expr.type)) {
             int lneg_skip = new_label();
             emit("\tld a,l\n\tcpl\n\tld l,a\n");
             emit("\tld a,h\n\tcpl\n\tld h,a\n");
@@ -356,59 +756,46 @@ void gen_unary_ast(const struct AstNode *n)
             emit_jp_label("jp nz,", lneg_skip);
             emit("\tinc de\n");
             emit_label(lneg_skip);
-            g_long_from16 = 0;
+            g_expr.long_from16 = 0;
         } else {
             emit("\txor a\n\tsub l\n\tld l,a\n\tld a,0\n\tsbc a,h\n\tld h,a\n");
-            g_expr_type = promote_int_type(g_expr_type);
+            g_expr.type = promote_int_type(g_expr.type);
         }
         return;
     }
 
     /* op == '~' */
-    if (type_is_long(g_expr_type)) {
+    if (type_is_long(g_expr.type)) {
         emit("\tld a,h\n\tcpl\n\tld h,a\n\tld a,l\n\tcpl\n\tld l,a\n");
         emit("\tld a,d\n\tcpl\n\tld d,a\n\tld a,e\n\tcpl\n\tld e,a\n");
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
     } else {
         emit("\tld a,h\n\tcpl\n\tld h,a\n\tld a,l\n\tcpl\n\tld l,a\n");
-        g_expr_type = promote_int_type(g_expr_type);
+        g_expr.type = promote_int_type(g_expr.type);
     }
 }
 
 static void gen_compound_literal_ast(const struct AstNode *n)
 {
-    struct AstCompoundLitSpan *sp = (struct AstCompoundLitSpan *)n->aux;
-    long sv_posi = posi;
-    long sv_tok_start = tok_start_pos;
-    int sv_line = line_no;
-    int sv_tok_line = tok_line;
-    struct Token sv_tok = tok;
+    struct Sym *clit_sym = n->sym;
+    int clit_type = n->type;
 
-    posi = sp->posi;
-    tok_start_pos = sp->tok_start_pos;
-    line_no = sp->line_no;
-    tok_line = sp->tok_line;
-    tok = sp->tok;
+    ast_replay_compound_literal(n);
 
-    if ((n->type & TYPE_STRUCT) && type_ptr_depth(n->type) == 0) {
-        emit_init_auto_struct_from_list(n->sym);
-    } else if (accept('{')) {
-        emit_init_auto_struct_scalar(n->sym, 0, n->type);
-        if (tok.kind == ',')
-            next_token();
-        expect('}');
-    } else {
-        emit_init_auto_struct_scalar(n->sym, 0, n->type);
+    emit_load_sym_addr(clit_sym);
+    g_expr.type = type_add_ptr(clit_type);
+}
+
+static void gen_compound_literal_value_ast(const struct AstNode *n)
+{
+    int clit_type = n->type;
+
+    gen_compound_literal_ast(n);
+    if (!type_is_struct_object(clit_type)) {
+        emit_load_from_hl(clit_type);
+        g_expr.type = clit_type;
+        g_expr.long_from16 = 0;
     }
-
-    posi = sv_posi;
-    tok_start_pos = sv_tok_start;
-    line_no = sv_line;
-    tok_line = sv_tok_line;
-    tok = sv_tok;
-
-    emit_load_sym_addr(n->sym);
-    g_expr_type = type_add_ptr(n->type);
 }
 
 void gen_pointer_cmp_operand_ast(const struct AstNode *n)
@@ -423,6 +810,33 @@ void gen_pointer_cmp_operand_ast(const struct AstNode *n)
     }
 }
 
+static void gen_sizeof_expr_ast(const struct AstNode *n)
+{
+    long val;
+
+    if (n->kind == AST_SIZEOF_EXPR) {
+        /* Resolve the operand at EMIT time.  A local declared in a nested
+         * block only enters the symbol table when its declaration span is
+         * emitted, which happens before this node is walked but after the AST
+         * was built - so a build-time size would resolve the wrong (or no)
+         * symbol.  A whole VLA loads its stored run-time byte size; every
+         * other operand is a compile-time constant. */
+        struct Sym *vsym = ast_sizeof_whole_vla_sym(n->a);
+        if (vsym != NULL && vsym->vla_size_offset != 0) {
+            emit("\tpush ix\n\tpop hl\n");
+            fprintf(g_emit_sink.stream, "\tld de,%d\n\tadd hl,de\n", vsym->vla_size_offset);
+            emit("\tld a,(hl)\n\tinc hl\n\tld h,(hl)\n\tld l,a\n");
+            g_expr.type = TYPE_INT;
+            return;
+        }
+        val = ast_sizeof_expr_value(n->a);
+    } else {
+        val = n->ival;
+    }
+    fprintf(g_emit_sink.stream, "\tld hl,%ld\n", val & 0xffffL);
+    g_expr.type = TYPE_INT;
+}
+
 void gen_pointer_cmp_ast(const struct AstNode *n)
 {
     gen_pointer_cmp_operand_ast(n->a);
@@ -430,8 +844,8 @@ void gen_pointer_cmp_ast(const struct AstNode *n)
     gen_pointer_cmp_operand_ast(n->b);
     emit("\tex de,hl\n\tpop hl\n");
     gen_binop_typed(n->op, TYPE_INT | TYPE_UNSIGNED);
-    g_expr_type = TYPE_INT;
-    g_long_from16 = 0;
+    g_expr.type = TYPE_INT;
+    g_expr.long_from16 = 0;
 }
 
 void gen_pointer_diff_ast(const struct AstNode *n)
@@ -448,8 +862,8 @@ void gen_pointer_diff_ast(const struct AstNode *n)
     if (ast_pointer_expr_type(n->a, &lhs_type, &no_deref))
         elem = type_index_elem_size(lhs_type);
     divide_hl_by_elem_size(elem);
-    g_expr_type = TYPE_INT;
-    g_long_from16 = 0;
+    g_expr.type = TYPE_INT;
+    g_expr.long_from16 = 0;
 }
 
 static int emit_signed_long_const_cmp_ast(int op, long c)
@@ -479,9 +893,9 @@ static int emit_signed_long_const_cmp_ast(int op, long c)
     end_label = new_label();
 
     emit("\tld a,d\n\txor 80h\n\tld d,a\n");
-    fprintf(outf, "\tld bc,%u\n", lo);
+    fprintf(g_emit_sink.stream, "\tld bc,%u\n", lo);
     emit("\tor a\n\tsbc hl,bc\n\tex de,hl\n");
-    fprintf(outf, "\tld bc,%u\n", hi);
+    fprintf(g_emit_sink.stream, "\tld bc,%u\n", hi);
     emit("\tsbc hl,bc\n");
     emit_jp_label(true_on_carry ? "jp c," : "jp nc,", true_label);
     emit("\tld hl,0\n");
@@ -501,7 +915,7 @@ void gen_long_cmp_ast(const struct AstNode *n)
     long rhs_const;
 
     ast_gen_expr(n->a);
-    lhs_type = promote_int_type(g_expr_type);
+    lhs_type = promote_int_type(g_expr.type);
     if (!type_is_long(lhs_type)) {
         /* 16-bit LHS against a signed long compile-time constant (e.g.
          * `int x < 40000L`, where the decimal literal is `long` because it
@@ -517,14 +931,14 @@ void gen_long_cmp_ast(const struct AstNode *n)
             type_is_long(n->b->type) && ast_const_scalar_fold(n->b, &rhs_const)) {
             emit_cast_16_to_common(lhs_type, common_type);   /* HL -> DE:HL */
             if (emit_signed_long_const_cmp_ast(n->op, rhs_const)) {
-                g_expr_type = TYPE_INT;
-                g_long_from16 = 0;
+                g_expr.type = TYPE_INT;
+                g_expr.long_from16 = 0;
                 return;
             }
         }
         emit("\tpush hl\n");
         ast_gen_expr(n->b);
-        rhs_type = promote_int_type(g_expr_type);
+        rhs_type = promote_int_type(g_expr.type);
         common_type = common_arith_type(lhs_type, rhs_type);
         if (type_is_long(rhs_type)) {
             gen_binop32_promote_16lhs_ast(n->op, lhs_type, common_type);
@@ -532,8 +946,8 @@ void gen_long_cmp_ast(const struct AstNode *n)
             emit("\tex de,hl\n\tpop hl\n");
             gen_binop_typed(n->op, common_type);
         }
-        g_expr_type = TYPE_INT;
-        g_long_from16 = 0;
+        g_expr.type = TYPE_INT;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -541,19 +955,60 @@ void gen_long_cmp_ast(const struct AstNode *n)
     if ((n->op == '<' || n->op == '>' || n->op == TOK_LE || n->op == TOK_GE) &&
         !(common_type & TYPE_UNSIGNED) && ast_const_scalar_fold(n->b, &rhs_const) &&
         emit_signed_long_const_cmp_ast(n->op, rhs_const)) {
-        g_expr_type = TYPE_INT;
-        g_long_from16 = 0;
+        g_expr.type = TYPE_INT;
+        g_expr.long_from16 = 0;
         return;
     }
 
     emit("\tpush de\n\tpush hl\n");
     ast_gen_expr(n->b);
-    rhs_type = promote_int_type(g_expr_type);
+    rhs_type = promote_int_type(g_expr.type);
     common_type = common_arith_type(lhs_type, rhs_type);
     emit_cast_16_to_common(rhs_type, common_type);
     gen_binop32_typed(n->op, common_type);
-    g_expr_type = TYPE_INT;
-    g_long_from16 = 0;
+    g_expr.type = TYPE_INT;
+    g_expr.long_from16 = 0;
+}
+
+/* Strips a widening-to-long cast (e.g. the `(uint32_t)` in `(uint32_t)b`)
+ * down to the plain <=16-bit value underneath, when the cast is exactly
+ * that and nothing more (not a float conversion). Shared by every
+ * "plain u16 source" check/use around the __m1mu fast path below: proving
+ * a value is one of these already establishes that widening it to long
+ * only appends a zero high word, so evaluating the stripped node directly
+ * is worth exactly the same 16 bits as evaluating the cast - without also
+ * paying for gen_cast_ast's zero-extension of DE, which this fast path
+ * only wants for one of the three "plain u16 source" positions to begin
+ * with (via its own trailing `ld de,0` on the result), or in the "same
+ * source twice" case (ast_same_plain_u16_source), not at all. */
+static const struct AstNode *ast_strip_u16_widen_cast(const struct AstNode *n)
+{
+    if (n != NULL && n->kind == AST_CAST && type_is_long(n->type) && !type_is_float(n->type))
+        return n->a;
+    return n;
+}
+
+/* True if n, once any explicit widening-to-long cast around it is stripped
+ * away, is a plain unsigned value no wider than 16 bits - i.e. widening it
+ * to long (whether via that cast or via the ordinary usual-arithmetic-
+ * conversion promotion applied when it sits next to an already-long sibling
+ * operand) is known, from its own declared type alone, to produce a high
+ * word of exactly 0. Used by gen_long_arith_ast's '%' case to detect the
+ * "((wide)a * (wide)b) % c" idiom - the standard C89 way to multiply two
+ * 16-bit values without overflow before reducing - where a, b, and c all
+ * satisfy this. That pattern can skip straight to __m1mu (multiply and
+ * reduce mod c together, 16 bits at a time) instead of building the full
+ * 32-bit product via __m1u and then dividing it by c via __lmu. */
+static int ast_is_plain_u16_source(const struct AstNode *n)
+{
+    int t;
+
+    n = ast_strip_u16_widen_cast(n);
+    if (n == NULL)
+        return 0;
+    t = promote_int_type(ast_expr_type_for_sizeof(n));
+    return !type_is_long(t) && !type_is_float(t) && !type_ptr_depth(t) &&
+           (t & TYPE_UNSIGNED) != 0;
 }
 
 /* Extract the compile-time value of `n` when it is a bare integer literal or
@@ -576,6 +1031,31 @@ static int ast_const_int_operand_value(const struct AstNode *n, long *out)
     return 0;
 }
 
+/* True if a and b (each already known, via ast_is_plain_u16_source, to be
+ * a plain unsigned <=16-bit source - possibly under a widening cast to
+ * long) are provably the exact same value on every read: the same
+ * local/global variable referenced twice (e.g. `b*b`, `(uint32_t)b *
+ * (uint32_t)b`), not merely two different expressions that happen to
+ * agree. Reading a variable has no side effect, so when this holds,
+ * generating the load once and reusing the value for the second use
+ * gives the identical result while skipping a wholly redundant second
+ * memory read. Deliberately narrow: only a bare identifier, compared by
+ * resolved symbol (not spelling, which could ambiguously match two
+ * different variables of the same name in different scopes) is provably
+ * the same storage on every read; anything else that could textually
+ * repeat (an array subscript, a volatile read, a function call) is
+ * conservatively treated as not provably identical, matching
+ * ast_is_plain_u16_source's own "just a value" scope. */
+static int ast_same_plain_u16_source(const struct AstNode *a, const struct AstNode *b)
+{
+    a = ast_strip_u16_widen_cast(a);
+    b = ast_strip_u16_widen_cast(b);
+    if (a == NULL || b == NULL)
+        return 0;
+    return a->kind == AST_IDENT && b->kind == AST_IDENT && a->sym != NULL &&
+           !a->sym->is_volatile && a->sym == b->sym;
+}
+
 void gen_long_arith_ast(const struct AstNode *n)
 {
     int lhs_type;
@@ -594,16 +1074,93 @@ void gen_long_arith_ast(const struct AstNode *n)
      * divide / modulo / shift keep their signedness-aware paths. */
     if (!type_is_float(n->a->type) && !type_is_float(n->b->type) &&
         ast_const_fold_strict(n, &const_val)) {
-        common_type = common_arith_type(promote_int_type(n->a->type), n->peek_type);
-        fprintf(outf, "\tld hl,%ld\n", const_val & 0xffffL);
-        fprintf(outf, "\tld de,%ld\n", (const_val >> 16) & 0xffffL);
-        g_expr_type = common_type;
-        g_long_from16 = 0;
+        common_type = common_arith_type(
+            promote_int_type(ast_expr_type_for_sizeof(n->a)), n->peek_type);
+        fprintf(g_emit_sink.stream, "\tld hl,%ld\n", const_val & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld de,%ld\n", (const_val >> 16) & 0xffffL);
+        g_expr.type = common_type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    if ((n->op == TOK_SHL || n->op == '|') && emit_long_byte_shift_to_reg(n)) {
+        g_expr.type = TYPE_LONG | TYPE_UNSIGNED;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    if (n->op == '&') {
+        const struct AstNode *byte_base;
+        int byte_index;
+        if (ast_long_byte_extract(n, &byte_base, &byte_index)) {
+            if (byte_index == 0 && byte_base != NULL && byte_base->kind == AST_CAST &&
+                type_is_long(byte_base->type) && ast_value_is_plain_int(byte_base->a)) {
+                ast_gen_expr(byte_base->a);
+                emit("\tld h,0\n\tld de,0\n");
+            } else {
+                ast_gen_expr(byte_base);
+                if (!type_is_long(g_expr.type))
+                    emit_extend_to_long_typed(g_expr.type);
+                emit_long_byte_from_reg(byte_index);
+            }
+            g_expr.type = TYPE_LONG | TYPE_UNSIGNED;
+            g_expr.long_from16 = 0;
+            return;
+        }
+    }
+
+    /* "((wide)a * (wide)b) % c" with a, b, c all plain unsigned <=16-bit
+     * values (the standard C89 overflow-safe-multiply-then-reduce idiom,
+     * e.g. modular exponentiation's `((uint32_t)r * (uint32_t)b) % m`):
+     * skip evaluating the '*' as its own 32-bit subexpression (which would
+     * call __m1u for the multiply and then __lmu for the mod - profiled at
+     * ~59% of total runtime combined in one real workload) and instead
+     * evaluate the three underlying 16-bit values directly, left to right
+     * (preserving this compiler's normal evaluation order for the
+     * expressions such a pattern could contain, e.g. calls with side
+     * effects), and call __m1mu once. That single routine reduces the
+     * running product mod c after every doubling step, so it never needs
+     * more than a carry-extended 16-bit register - see __m1mu in
+     * DCCRTL.MAC for the algorithm. Its result is always < c <= 65535, so
+     * it comes back in HL alone; zero-extend to DE:HL to match this node's
+     * long-typed result. */
+    if (n->op == '%' && n->a != NULL && n->a->kind == AST_BINARY && n->a->op == '*' &&
+        ast_is_plain_u16_source(n->a->a) && ast_is_plain_u16_source(n->a->b) &&
+        ast_is_plain_u16_source(n->b)) {
+        /* Evaluate the stripped (uncast) node, not n->a->a/n->a->b/n->b
+         * themselves: each is already known plain-u16 (possibly under a
+         * widening cast to long), so its stripped form is worth the exact
+         * same 16 bits pushed here - without gen_cast_ast's zero-extension
+         * of DE for the cast, which this fast path has no use for (nothing
+         * reads DE between here and the `pop de`/`pop bc`/`pop hl` below
+         * that overwrite it, and the actual long-typed result gets its own
+         * zero-extension via the trailing `ld de,0` after the call). */
+        ast_gen_expr(ast_strip_u16_widen_cast(n->a->a));
+        emit("\tpush hl\n");
+        if (ast_same_plain_u16_source(n->a->a, n->a->b)) {
+            /* b*b (or (wide)b*(wide)b): the second operand is a re-read of
+             * the exact same variable already sitting in HL - push it
+             * again instead of a second, wholly redundant load from its
+             * slot. */
+            emit("\tpush hl\n");
+        } else {
+            ast_gen_expr(ast_strip_u16_widen_cast(n->a->b));
+            emit("\tpush hl\n");
+        }
+        ast_gen_expr(ast_strip_u16_widen_cast(n->b));
+        emit("\tpush hl\n");
+        emit("\tpop bc\n");             /* BC = c (modulus) */
+        emit("\tpop de\n");             /* DE = b */
+        emit("\tpop hl\n");             /* HL = a */
+        emit_runtime_call("__m1mu");
+        emit("\tld de,0\n");
+        g_expr.type = ast_expr_type_for_sizeof(n);
+        g_expr.long_from16 = 0;
         return;
     }
 
     ast_gen_expr(n->a);
-    lhs_type = promote_int_type(g_expr_type);
+    lhs_type = promote_int_type(g_expr.type);
     common_type = common_arith_type(lhs_type, n->peek_type);
     emit_cast_16_to_common(lhs_type, common_type);
 
@@ -620,8 +1177,8 @@ void gen_long_arith_ast(const struct AstNode *n)
      * (`(long)c & 0xffL`), where the mask is exactly a byte/word boundary. */
     if (n->op == '&' && ast_const_int_operand_value(n->b, &const_val)) {
         emit_and_long_const((unsigned long)const_val);
-        g_expr_type = common_type;
-        g_long_from16 = 0;
+        g_expr.type = common_type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -635,26 +1192,26 @@ void gen_long_arith_ast(const struct AstNode *n)
      * multipliers not to be worth special-casing separately). */
     if (n->op == '*' && ast_const_int_operand_value(n->b, &const_val) &&
         emit_mul_pow2_long_const(const_val)) {
-        g_expr_type = common_type;
-        g_long_from16 = 0;
+        g_expr.type = common_type;
+        g_expr.long_from16 = 0;
         return;
     }
 
-    lhs_from16 = g_long_from16;
+    lhs_from16 = g_expr.long_from16;
     emit("\tpush de\n\tpush hl\n");
     ast_gen_expr(n->b);
-    emit_cast_16_to_common(g_expr_type, common_type);
-    rhs_from16 = g_long_from16;
+    emit_cast_16_to_common(g_expr.type, common_type);
+    rhs_from16 = g_expr.long_from16;
     if (n->op == '*' && lhs_from16 != 0 && lhs_from16 == rhs_from16) {
         emit("\tpop bc\n\tpop de\n");
         emit_runtime_call(lhs_from16 == 2 ? "__m1u" : "__m1s");
-        g_expr_type = common_type;
-        g_long_from16 = 0;
+        g_expr.type = common_type;
+        g_expr.long_from16 = 0;
         return;
     }
     gen_binop32_typed(n->op, common_type);
-    g_expr_type = common_type;
-    g_long_from16 = 0;
+    g_expr.type = common_type;
+    g_expr.long_from16 = 0;
 }
 
 void gen_binop32_promote_16lhs_ast(int op, int lhs_type, int common_type)
@@ -675,7 +1232,7 @@ void gen_binop32_promote_16lhs_ast(int op, int lhs_type, int common_type)
         emit("\tld l,c\n\tld h,b\n");       /* HL = LHS low word */
         emit_cast_16_to_common(lhs_type, common_type); /* DE:HL = (long)LHS */
         gen_binop32_typed(op, common_type);
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -693,18 +1250,15 @@ void gen_binop32_promote_16lhs_ast(int op, int lhs_type, int common_type)
     emit("\tex de,hl\n");
     gen_binop32_typed(op, common_type);
     emit("\tpop bc\n\tpop bc\n");
-    g_long_from16 = 0;
+    g_expr.long_from16 = 0;
 }
 
 /* Emit a plain-int binary operator with the uniform 16-bit sequence: evaluate
  * lhs into HL, promote, capture the common type from the rhs's stored peek,
  * then push / eval rhs / ex de,hl / pop hl / dispatch. Result type is int for
  * comparisons, common type otherwise. */
-void gen_binary_ast(const struct AstNode *n)
+static int gen_binary_try_fast_preeval(const struct AstNode *n)
 {
-    int lhs_type;
-    int common_type;
-    const char *float_helper;
     long const_val;
 
     /* Whole-expression constant fold. The AST builder never folds, so without
@@ -718,14 +1272,15 @@ void gen_binary_ast(const struct AstNode *n)
     if (!type_is_long(n->a->type) && !type_is_float(n->a->type) &&
         !type_is_long(n->b->type) && !type_is_float(n->b->type) &&
         !type_is_long(n->peek_type) && !type_is_float(n->peek_type) &&
+        !type_is_long(ast_expr_type_for_sizeof(n)) &&
         ast_const_fold_strict(n, &const_val)) {
         int fold_type = is_cmp_op(n->op)
             ? TYPE_INT
             : common_arith_type(promote_int_type(n->a->type), n->peek_type);
-        fprintf(outf, "\tld hl,%ld\n", const_val & 0xffffL);
-        g_expr_type = fold_type;
-        g_long_from16 = 0;
-        return;
+        fprintf(g_emit_sink.stream, "\tld hl,%ld\n", const_val & 0xffffL);
+        g_expr.type = fold_type;
+        g_expr.long_from16 = 0;
+        return 1;
     }
 
     /* `CONST * expr` mirror of the `expr * CONST` fast path further below:
@@ -742,11 +1297,32 @@ void gen_binary_ast(const struct AstNode *n)
         !ast_value_is_long_word(n->b) && !ast_value_is_float_word(n->b)) {
         int rhs_type;
         ast_gen_expr(n->b);
-        rhs_type = promote_int_type(g_expr_type);
+        rhs_type = promote_int_type(g_expr.type);
         emit_mul_hl_const(n->a->ival & 0xffffL);
-        g_expr_type = common_arith_type(rhs_type, n->a->type);
-        g_long_from16 = 0;
-        return;
+        g_expr.type = common_arith_type(rhs_type, n->a->type);
+        g_expr.long_from16 = 0;
+        return 1;
+    }
+
+    /* `arr[E] | (arr[E+1] << 8)` - the mem_get_word-shaped byte-memory
+     * word-read idiom shared by adaint.c/cint.c/fint.c's VM interpreters
+     * (each ports the same benchmark suite). Computing the shared element
+     * address once and reusing it via one `inc hl` for the high byte,
+     * instead of recomputing the whole address expression from scratch a
+     * second time, was the single largest dcc-vs-sdcc codegen gap found in
+     * a benchmark comparison - this fires on nearly every VM memory access
+     * in all three interpreters. See ast_byte_pair_word_read_match
+     * (dcc_ast_gen_support.c) for the exact shape/safety proof. */
+    {
+        const struct AstNode *lo_index = ast_byte_pair_word_read_match(n);
+        if (lo_index != NULL) {
+            int val_type;
+            gen_index_addr_ast(lo_index, &val_type);   /* HL = &arr[E] */
+            emit("\tld e,(hl)\n\tinc hl\n\tld d,(hl)\n\tex de,hl\n");
+            g_expr.type = TYPE_INT;
+            g_expr.long_from16 = 0;
+            return 1;
+        }
     }
 
     if (n->op == '+' || n->op == '-') {
@@ -754,64 +1330,199 @@ void gen_binary_ast(const struct AstNode *n)
         int no_deref;
         if (ast_pointer_expr_type(n, &ptr_type, &no_deref)) {
             gen_pointer_expr_ast(n, &ptr_type, &no_deref);
-            return;
+            return 1;
         }
     }
 
     if (ast_pointer_cmp_supported(n)) {
         gen_pointer_cmp_ast(n);
-        return;
+        return 1;
     }
 
     if (ast_pointer_diff_supported(n)) {
         gen_pointer_diff_ast(n);
-        return;
+        return 1;
     }
 
     if (ast_long_cmp_supported(n)) {
         gen_long_cmp_ast(n);
-        return;
+        return 1;
     }
 
     if (ast_long_arith_supported(n)) {
         gen_long_arith_ast(n);
-        return;
+        return 1;
     }
 
+    /* `ident & <const < 256>` (e.g. tchess.c's `return sq & 7;`): such a
+     * mask's result can never depend on the identifier's high byte,
+     * regardless of its value or sign, so load only the low byte instead
+     * of the normal full load (which the '&' fast path further below would
+     * then immediately discard half of via emit_and_hl_const). Checked
+     * before the generic ast_gen_expr(n->a) below runs, since that's
+     * exactly the full load this skips. Declined (falls through to the
+     * generic path) for register-resident/array/long/float/pointer
+     * symbols, where sym_word_load_is_two_byte_fetch's callers already
+     * have a cheap or separate path.
+     *
+     * Excludes the mask 0 and 255 boundary cases: emit_and_word_const
+     * already turns a byte mask of 0x00 into a single immediate load and
+     * a byte mask of 0xFF into skipping the AND entirely (it's a no-op on
+     * a byte), so the generic path's full load followed by that already-
+     * cheap masking beats this fast path's load-into-A/and/move-to-L
+     * sequence for those two values specifically - found via a real
+     * performance regression in tests/trw.c's `x & 0xFF` once measured,
+     * not anticipated up front. */
+    if (n->op == '&' && n->a->kind == AST_IDENT &&
+        ast_const_int_operand_value(n->b, &const_val) &&
+        const_val > 0 && const_val < 255) {
+        struct Sym *land_sym = find_sym(n->a->sval);
+        /* A volatile object's full width must be accessed; loading only its
+         * low byte here would drop the high-byte read the abstract machine
+         * requires, so decline and let the generic full-word path run. */
+        if (land_sym != NULL && !land_sym->is_volatile &&
+            sym_word_load_is_two_byte_fetch(land_sym)) {
+            emit_load_sym_low_byte_and_const(land_sym, (unsigned int)const_val);
+            g_expr.type = TYPE_INT;
+            g_expr.long_from16 = 0;
+            return 1;
+        }
+    }
+
+    /* `byte_ident == byte_ident_or_const` used as a plain value (e.g. the
+     * operand of `||`/`&&`, which evaluates each side as a value via
+     * ast_gen_expr rather than branching on it directly - see
+     * gen_logical_ast) - materialize 0/1 from the same fast compare/branch
+     * ast_gen_cond_branch uses for a direct condition, instead of the
+     * generic path's full 16-bit sign-extend-and-compare. Motivated by
+     * tchess.c's `p == a || p == b`, where p/a/b are all plain char. */
+    if (is_cmp_op(n->op) && ast_is_byte_eq_cond(n, NULL, NULL, NULL)) {
+        int lt = new_label();
+        int le = new_label();
+        ast_gen_byte_eq_branch(n, lt, 1);
+        emit("\tld hl,0\n");
+        emit_jp_label("jp", le);
+        emit_label(lt);
+        emit("\tld hl,1\n");
+        emit_label(le);
+        g_expr.type = TYPE_INT;
+        g_expr.long_from16 = 0;
+        return 1;
+    }
+
+    /* `global_char_arr[idx] == const` used as a plain value - same
+     * "materialize 0/1 from the branch emitter" trick as the byte-eq case
+     * just above, for the same reason (an operand of `||`/`&&` is
+     * evaluated as a value, not branched on directly). Motivated by
+     * tchess.c's is_attacked: `f < 7 && sq >= 7 && board[sq - 7] == 'P'`. */
+    if (is_cmp_op(n->op) && ast_is_global_char_index_eq_cond(n, NULL, NULL, NULL, NULL)) {
+        int lt = new_label();
+        int le = new_label();
+        ast_gen_global_char_index_eq_branch(n, lt, 1);
+        emit("\tld hl,0\n");
+        emit_jp_label("jp", le);
+        emit_label(lt);
+        emit("\tld hl,1\n");
+        emit_label(le);
+        g_expr.type = TYPE_INT;
+        g_expr.long_from16 = 0;
+        return 1;
+    }
+
+    return 0;
+}
+
+void gen_binary_ast(const struct AstNode *n)
+{
+    int lhs_type;
+    int common_type;
+    const char *float_helper;
+    long const_val;
+
+    if (gen_binary_try_fast_preeval(n))
+        return;
+
     ast_gen_expr(n->a);
-    lhs_type = promote_int_type(g_expr_type);
+    lhs_type = promote_int_type(g_expr.type);
 
     if (is_cmp_op(n->op) &&
-        (type_is_float(g_expr_type) || ast_value_is_float_word(n->b))) {
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
+        (type_is_float(g_expr.type) || ast_value_is_float_word(n->b))) {
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
         emit("\tpush de\n\tpush hl\n");
         ast_gen_expr(n->b);
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
-        emit("\tpush de\n\tpush hl\n");
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
+        /* n->b is still live in DE:HL right here - emit_float_compare_call
+         * now emits the fastcall comparison variants, which take it that
+         * way instead of via a second push/pop round trip. */
         emit_float_compare_call(n->op);
-        g_expr_type = TYPE_INT;
-        g_long_from16 = 0;
+        g_expr.type = TYPE_INT;
+        g_expr.long_from16 = 0;
         return;
     }
 
     if (is_float_arith_op(n->op) &&
-        (type_is_float(g_expr_type) || ast_value_is_float_word(n->b))) {
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
+        (type_is_float(g_expr.type) || ast_value_is_float_word(n->b))) {
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
+
+        /* `addend + b*c` (the shape every Horner-scheme polynomial evaluates,
+         * e.g. sinf/cosf/atanf's minimax approximations) otherwise evaluates
+         * the multiply into DE:HL, pushes it, and calls __fadd separately -
+         * two runtime calls and two push/pop round trips through the IEEE
+         * packing where one __fmaf(addend, b, c) call does both. n->a (the
+         * addend) is already evaluated above; mirrors emit_float_compound_rhs's
+         * '+='-only fusion but for the general binary '+' case. __fmaf is
+         * the fastcall entry point (b arrives live in DE:HL - see its header
+         * in DCCRTL.MAC): it just jumps into __fmadd's own body once
+         * unpacked, so linking it in costs only its small unpack prologue,
+         * not a second copy of the multiply/normalize logic.
+         *
+         * Trade-off (measured via perf_results.csv A/B across all 220 tests,
+         * against the original 3-push __fmadd, before the fastcall variant
+         * existed): a program that newly starts using this fusion pays a
+         * one-time link-in cost for the RTL routine (a deliberate full
+         * duplicate of __fmul's body, not shared code), but every affected
+         * program's cycle count improves (-0.2% to -1.3%); none regressed. */
+        if (n->op == '+' && ast_is_float_madd_rhs(n->b)) {
+            emit("\tpush de\n\tpush hl\n");
+            ast_gen_expr(n->b->a);
+            if (!type_is_float(g_expr.type))
+                emit_convert_int_to_float(g_expr.type);
+            emit("\tpush de\n\tpush hl\n");
+            ast_gen_expr(n->b->b);
+            if (!type_is_float(g_expr.type))
+                emit_convert_int_to_float(g_expr.type);
+            /* n->b->b (the second multiplicand) is still live in DE:HL
+             * right here - __fmaf takes it that way instead of via a
+             * third push/pop round trip, matching __faf/__fsf/__fmf's
+             * fastcall convention. */
+            emit_runtime_call("__fmaf");
+            emit("\tpop bc\n\tpop bc\n\tpop bc\n\tpop bc\n");
+            g_expr.type = TYPE_FLOAT;
+            g_expr.long_from16 = 0;
+            return;
+        }
+
         emit("\tpush de\n\tpush hl\n");
         ast_gen_expr(n->b);
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
-        emit("\tpush de\n\tpush hl\n");
-        float_helper = (n->op == '+') ? "__fadd" :
-                       (n->op == '-') ? "__fsub" :
-                       (n->op == '*') ? "__fmul" : "__fdiv";
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
+        /* n->b is still live in DE:HL right here - the fastcall variants
+         * (__faf/__fsf/__fmf/__fdf) take it that way instead of via a
+         * second push/pop round trip, exactly like __fmaf above. These
+         * already exist and are already used by DCCRTL.MAC's own
+         * internal call sites; this is the same technique applied to
+         * ordinary generated '+'/'-'/'*'/'/' float arithmetic, which
+         * until now still paid for both operands' stack traffic. */
+        float_helper = (n->op == '+') ? "__faf" :
+                       (n->op == '-') ? "__fsf" :
+                       (n->op == '*') ? "__fmf" : "__fdf";
         emit_runtime_call(float_helper);
-        emit("\tpop bc\n\tpop bc\n\tpop bc\n\tpop bc\n");
-        g_expr_type = TYPE_FLOAT;
-        g_long_from16 = 0;
+        emit("\tpop bc\n\tpop bc\n");
+        g_expr.type = TYPE_FLOAT;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -822,8 +1533,8 @@ void gen_binary_ast(const struct AstNode *n)
     if (n->op == '*' && n->b->kind == AST_INT_LIT &&
         !type_is_long(common_type) && ast_mul_const_value_ok(n->b->ival)) {
         emit_mul_hl_const(n->b->ival & 0xffffL);
-        g_expr_type = common_type;
-        g_long_from16 = 0;
+        g_expr.type = common_type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -837,8 +1548,8 @@ void gen_binary_ast(const struct AstNode *n)
                 emit_logical_shift_right_hl_const(sh);
             else
                 emit_and_hl_const((unsigned int)((n->b->ival & 0xffffL) - 1));
-            g_expr_type = common_type;
-            g_long_from16 = 0;
+            g_expr.type = common_type;
+            g_expr.long_from16 = 0;
             return;
         }
     }
@@ -853,8 +1564,8 @@ void gen_binary_ast(const struct AstNode *n)
     if (n->op == '&' && ast_const_int_operand_value(n->b, &const_val) &&
         !type_is_long(common_type)) {
         emit_and_hl_const((unsigned int)(const_val & 0xffffL));
-        g_expr_type = common_type;
-        g_long_from16 = 0;
+        g_expr.type = common_type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -871,33 +1582,33 @@ void gen_binary_ast(const struct AstNode *n)
     if (!type_is_long(common_type) &&
         ast_const_int_operand_value(n->b, &const_val) &&
         !type_is_long(n->b->type) && !type_is_float(n->b->type)) {
-        fprintf(outf, "\tld de,%ld\n", const_val & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld de,%ld\n", const_val & 0xffffL);
         gen_binop_typed(n->op, common_type);
         if (is_cmp_op(n->op))
-            g_expr_type = TYPE_INT;
+            g_expr.type = TYPE_INT;
         else
-            g_expr_type = common_type;
-        g_long_from16 = 0;
+            g_expr.type = common_type;
+        g_expr.long_from16 = 0;
         return;
     }
 
     emit("\tpush hl\n");
     ast_gen_expr(n->b);
-    if (type_is_long(g_expr_type)) {
-        common_type = common_arith_type(lhs_type, g_expr_type);
+    if (type_is_long(g_expr.type)) {
+        common_type = common_arith_type(lhs_type, g_expr.type);
         gen_binop32_promote_16lhs_ast(n->op, lhs_type, common_type);
-        g_expr_type = common_type;
-        g_long_from16 = 0;
+        g_expr.type = common_type;
+        g_expr.long_from16 = 0;
         return;
     }
     emit("\tex de,hl\n\tpop hl\n");
     gen_binop_typed(n->op, common_type);
 
     if (is_cmp_op(n->op))
-        g_expr_type = TYPE_INT;
+        g_expr.type = TYPE_INT;
     else
-        g_expr_type = common_type;
-    g_long_from16 = 0;
+        g_expr.type = common_type;
+    g_expr.long_from16 = 0;
 }
 
 /* Emit a plain-int shift with the non-literal shape:
@@ -909,12 +1620,25 @@ void gen_shift_ast(const struct AstNode *n)
 {
     int lhs_type;
 
+    /* `(byte_expr & 0xff) << K` (K a multiple of 8): materializing the whole
+     * long via emit_long_byte_shift_to_reg() is a handful of instructions
+     * (load the byte, drop it in the right DE:HL lane, zero the rest) versus
+     * evaluating the lhs generically first (widen/sign-extend to a full
+     * long) and only then applying the constant-shift fast path below. Must
+     * run before ast_gen_expr(n->a) - that call is the expensive path this
+     * is trying to avoid. */
+    if (n->op == TOK_SHL && emit_long_byte_shift_to_reg(n)) {
+        g_expr.type = TYPE_LONG | TYPE_UNSIGNED;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
     ast_gen_expr(n->a);
-    lhs_type = promote_int_type(g_expr_type);
+    lhs_type = promote_int_type(g_expr.type);
     if (type_is_long(lhs_type)) {
         if (n->b->kind == AST_INT_LIT && ast_value_is_plain_int(n->b)) {
             if (!emit_shift_const_long(n->op, lhs_type, n->b->ival)) {
-                fprintf(outf, "\tld b,%ld\n", n->b->ival & 255L);
+                fprintf(g_emit_sink.stream, "\tld b,%ld\n", n->b->ival & 255L);
                 emit_shift_loop(n->op, lhs_type);
             }
         } else {
@@ -923,8 +1647,8 @@ void gen_shift_ast(const struct AstNode *n)
             emit("\tld b,l\n\tpop hl\n\tpop de\n");
             emit_shift_loop(n->op, lhs_type);
         }
-        g_expr_type = lhs_type;
-        g_long_from16 = 0;
+        g_expr.type = lhs_type;
+        g_expr.long_from16 = 0;
         return;
     }
     /* Compile-time shift count on a plain int: unroll directly instead of
@@ -945,8 +1669,8 @@ void gen_shift_ast(const struct AstNode *n)
         } else {
             emit_arith_shift_right_hl_const(count);
         }
-        g_expr_type = lhs_type;
-        g_long_from16 = 0;
+        g_expr.type = lhs_type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -954,8 +1678,8 @@ void gen_shift_ast(const struct AstNode *n)
     ast_gen_expr(n->b);
     emit("\tld b,l\n\tpop hl\n");
     emit_shift_loop(n->op, lhs_type);
-    g_expr_type = lhs_type;
-    g_long_from16 = 0;
+    g_expr.type = lhs_type;
+    g_expr.long_from16 = 0;
 }
 
 void gen_index_subscript_expr_ast(const struct AstNode *n)
@@ -966,14 +1690,14 @@ void gen_index_subscript_expr_ast(const struct AstNode *n)
         int lhs_type;
         int common_type;
         ast_gen_expr(n->a);
-        lhs_type = promote_int_type(g_expr_type);
+        lhs_type = promote_int_type(g_expr.type);
         common_type = common_arith_type(lhs_type, n->b->type);
         emit("\tpush hl\n");
         gen_int_lit(n->b);
         emit("\tex de,hl\n\tpop hl\n");
         gen_binop_typed(n->op, common_type);
-        g_expr_type = common_type;
-        g_long_from16 = 0;
+        g_expr.type = common_type;
+        g_expr.long_from16 = 0;
         expr_result_dead = saved_dead;
         return;
     }
@@ -983,7 +1707,7 @@ void gen_index_subscript_expr_ast(const struct AstNode *n)
 
 /* Pure-AST emission of a declaration initializer's assignment-expression.
  * The declaration codegen has already positioned the target address (or expects
- * the value in HL for a direct store) and adapts the result using g_expr_type
+ * the value in HL for a direct store) and adapts the result using g_expr.type
  * afterwards, so this only has to emit the initializer expression's
  * natural-typed value into the ABI result registers.  The type dispatch mirrors
  * an assignment's RHS: pointer-valued expressions go through
@@ -995,32 +1719,26 @@ void ast_emit_init_expr(void)
     struct AstNode *n;
     int ptr_type;
     int no_deref;
-    long sv_pos;
-    long sv_tok_start;
-    int sv_line;
-    int sv_tok_line;
-    struct Token sv_tok;
-    long end_pos;
-    long end_tok_start;
-    int end_line;
-    int end_tok_line;
-    struct Token end_tok;
+    LexState _ls;
+    LexState _le;
 
-    sv_pos = posi;
-    sv_tok_start = tok_start_pos;
-    sv_line = line_no;
-    sv_tok_line = tok_line;
-    sv_tok = tok;
+    _ls = lex_save();
 
     n = ast_build_assign_expr(&g_ast_init_arena);
 
-    end_pos = posi;
-    end_tok_start = tok_start_pos;
-    end_line = line_no;
-    end_tok_line = tok_line;
-    end_tok = tok;
+    _le = lex_save();
+    if (n != NULL)
+        ast_validate_expr_symbols(n);
 
     if (n != NULL && ast_pointer_expr_type(n, &ptr_type, &no_deref)) {
+        if (mir_is_active()) {
+            mir_capture_initializer(n);
+            ast_process_expr_metadata(n);
+            g_expr.type = ast_expr_type_for_sizeof(n);
+            g_expr.long_from16 = 0;
+            ast_arena_reset(&g_ast_init_arena);
+            return;
+        }
         gen_pointer_expr_ast(n, &ptr_type, &no_deref);
         ast_arena_reset(&g_ast_init_arena);
         return;
@@ -1028,8 +1746,17 @@ void ast_emit_init_expr(void)
 
     if (n != NULL && (ast_gen_supported(n) || n->kind == AST_CAST ||
                       ast_numeric_value_supported(n) ||
+                      ast_pointer_assign_rhs_supported(n) ||
                       (n->kind == AST_CALL && ast_value_is_pointer_word(n) &&
                        ast_call_named_args_supported(n)))) {
+        if (mir_is_active()) {
+            mir_capture_initializer(n);
+            ast_process_expr_metadata(n);
+            g_expr.type = ast_expr_type_for_sizeof(n);
+            g_expr.long_from16 = 0;
+            ast_arena_reset(&g_ast_init_arena);
+            return;
+        }
         ast_gen_expr(n);
         ast_arena_reset(&g_ast_init_arena);
         return;
@@ -1038,33 +1765,99 @@ void ast_emit_init_expr(void)
     if (getenv("DCC_AST_REPORT") != NULL) {
         if (n == NULL)
             fprintf(stderr, "; AST-unsupported init build token=%d text='%s' line=%d\n",
-                    tok.kind, tok.text, tok_line);
+                    g_lex.tok.kind, g_lex.tok.text, g_lex.tok_line);
         else
             fprintf(stderr, "; AST-unsupported init gate kind=%s line=%d\n",
-                    ast_kind_name(n->kind), tok_line);
+                    ast_kind_name(n->kind), g_lex.tok_line);
     }
     ast_arena_reset(&g_ast_init_arena);
 
-    tok = sv_tok;
-    tok_line = sv_tok_line;
-    line_no = sv_line;
-    posi = sv_pos;
-    tok_start_pos = sv_tok_start;
+    lex_restore(&_ls);
     error_here(n == NULL ? "malformed initializer expression" : "unsupported initializer expression");
 
     if (n != NULL) {
-        posi = end_pos;
-        tok_start_pos = end_tok_start;
-        line_no = end_line;
-        tok_line = end_tok_line;
-        tok = end_tok;
+        lex_restore(&_le);
     } else {
-        while (tok.kind != TOK_EOF && tok.kind != ',' && tok.kind != ';' && tok.kind != '}')
+        while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != ',' && g_lex.tok.kind != ';' && g_lex.tok.kind != '}')
             next_token();
     }
 
-    g_expr_type = TYPE_INT;
+    g_expr.type = TYPE_INT;
     emit("\tld hl,0\n");
+}
+
+void ast_emit_struct_init_expr_assign(struct Sym *s)
+{
+    struct AstNode *rhs;
+    struct AstNode *lhs;
+    LexState _ls;
+    LexState _le;
+
+    _ls = lex_save();
+
+    rhs = ast_build_assign_expr(&g_ast_init_arena);
+
+    _le = lex_save();
+    if (rhs != NULL)
+        ast_validate_expr_symbols(rhs);
+
+    lhs = ast_new(&g_ast_init_arena, AST_IDENT);
+    lhs->sval = ast_arena_strdup(&g_ast_init_arena, s->name);
+    lhs->sym = s;
+    lhs->type = s->type;
+
+    if (rhs != NULL)
+        mir_capture_struct_initializer(s, rhs);
+    if (rhs != NULL && mir_is_active()) {
+        ast_process_expr_metadata(rhs);
+        ast_arena_reset(&g_ast_init_arena);
+        return;
+    }
+
+    if (rhs != NULL && ast_struct_return_call_assign_supported(s->type, rhs)) {
+        gen_struct_return_call_assign_ast(lhs, rhs);
+        ast_arena_reset(&g_ast_init_arena);
+        return;
+    }
+
+    /* Struct initializer from any struct-address expression - most notably a
+     * compound literal `struct T t = (struct T){ ... };` - is a whole-struct
+     * copy from the source object into the new local. */
+    if (rhs != NULL) {
+        int rhs_type;
+        if (ast_struct_addr_expr_supported(rhs, &rhs_type) &&
+            same_struct_type(s->type, rhs_type)) {
+            emit_load_sym_addr(s);                    /* HL = destination */
+            emit("\tpush hl\n");
+            gen_struct_addr_expr_ast(rhs, &rhs_type); /* HL = source       */
+            emit("\tex de,hl\n\tpop hl\n");           /* DE = source, HL = dest */
+            emit_copy_de_to_hl_bytes(type_size(s->type));
+            g_expr.type = s->type;
+            g_expr.long_from16 = 0;
+            ast_arena_reset(&g_ast_init_arena);
+            return;
+        }
+    }
+
+    if (getenv("DCC_AST_REPORT") != NULL) {
+        if (rhs == NULL)
+            fprintf(stderr, "; AST-unsupported struct init build token=%d text='%s' line=%d\n",
+                    g_lex.tok.kind, g_lex.tok.text, g_lex.tok_line);
+        else
+            fprintf(stderr, "; AST-unsupported struct init gate kind=%s line=%d\n",
+                    ast_kind_name(rhs->kind), g_lex.tok_line);
+    }
+    ast_arena_reset(&g_ast_init_arena);
+
+    lex_restore(&_ls);
+    error_here(rhs == NULL ? "malformed initializer expression" : "unsupported struct initializer expression");
+
+    if (rhs != NULL) {
+        lex_restore(&_le);
+    } else {
+        while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != ',' && g_lex.tok.kind != ';' && g_lex.tok.kind != '}')
+            next_token();
+    }
 }
 
 static int ast_bool_bitand_const_rhs(const struct AstNode *n,
@@ -1104,12 +1897,12 @@ static void emit_store_bool_masked_hl_to_addr_on_stack(unsigned int mask,
     byte_mask = 0;
     if ((mask & 0xff00U) == 0) {
         byte_mask = mask & 0xffU;
-        fprintf(outf, "\tld a,l\n\tand %u\n", byte_mask);
+        fprintf(g_emit_sink.stream, "\tld a,l\n\tand %u\n", byte_mask);
     } else if ((mask & 0x00ffU) == 0) {
         byte_mask = (mask >> 8) & 0xffU;
-        fprintf(outf, "\tld a,h\n\tand %u\n", byte_mask);
+        fprintf(g_emit_sink.stream, "\tld a,h\n\tand %u\n", byte_mask);
     } else {
-        fprintf(outf, "\tld a,h\n\tand %u\n\tld e,a\n\tld a,l\n\tand %u\n\tor e\n",
+        fprintf(g_emit_sink.stream, "\tld a,h\n\tand %u\n\tld e,a\n\tld a,l\n\tand %u\n\tor e\n",
                 (mask >> 8) & 0xffU, mask & 0xffU);
     }
     if (need_result)
@@ -1152,7 +1945,7 @@ static int ast_is_float_madd_rhs(const struct AstNode *rhs)
  * skipping one pack+unpack round trip through the runtime's IEEE format.
  * Falls back to the original evaluate/push/call/pop sequence for every
  * other float compound assignment (+=, -=, *=, /= with a non-fusable rhs).
- * g_expr_type is left as whatever ast_gen_expr(n->b) (or n->b->a/n->b->b)
+ * g_expr.type is left as whatever ast_gen_expr(n->b) (or n->b->a/n->b->b)
  * last set it to, matching the pre-existing behavior at every call site -
  * each site overwrites it with the (float) lvalue type immediately after. */
 static void emit_float_compound_rhs(const struct AstNode *n, int saved_dead)
@@ -1162,39 +1955,44 @@ static void emit_float_compound_rhs(const struct AstNode *n, int saved_dead)
     if (n->op == TOK_ADDEQ && ast_is_float_madd_rhs(n->b)) {
         expr_result_dead = 0;
         ast_gen_expr(n->b->a);
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
         emit("\tpush de\n\tpush hl\n");
         ast_gen_expr(n->b->b);
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
-        emit("\tpush de\n\tpush hl\n");
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
         expr_result_dead = saved_dead;
-        emit_runtime_call("__fmadd");
-        emit("\tpop bc\n\tpop bc\n\tpop bc\n\tpop bc\n\tpop bc\n\tpop bc\n");
+        /* n->b->b is still live in DE:HL right here - see __fmaf's
+         * call site above for why this skips a third push/pop. */
+        emit_runtime_call("__fmaf");
+        emit("\tpop bc\n\tpop bc\n\tpop bc\n\tpop bc\n");
         return;
     }
 
     expr_result_dead = 0;
     ast_gen_expr(n->b);
     expr_result_dead = saved_dead;
-    if (!type_is_float(g_expr_type))
-        emit_convert_int_to_float(g_expr_type);
-    emit("\tpush de\n\tpush hl\n");
-    helper = n->op == TOK_ADDEQ ? "__fadd" :
-             n->op == TOK_SUBEQ ? "__fsub" :
-             n->op == TOK_MULEQ ? "__fmul" : "__fdiv";
+    if (!type_is_float(g_expr.type))
+        emit_convert_int_to_float(g_expr.type);
+    /* n->b is still live in DE:HL right here - see the fastcall call
+     * site in gen_binary_ast above for why this skips a second push. */
+    helper = n->op == TOK_ADDEQ ? "__faf" :
+             n->op == TOK_SUBEQ ? "__fsf" :
+             n->op == TOK_MULEQ ? "__fmf" : "__fdf";
     emit_runtime_call(helper);
-    emit("\tpop bc\n\tpop bc\n\tpop bc\n\tpop bc\n");
+    emit("\tpop bc\n\tpop bc\n");
+}
+
+/* Store the 32-bit value held in E,D,C,B (low byte -> high byte) to the address
+ * in HL, advancing HL past it. This exact four-`ld (hl),r` / `inc hl` sequence
+ * appears at the long compound-assignment sites in gen_assign_ast below. */
+static void emit_store_long_edcb_via_hl(void)
+{
+    emit("\tld (hl),e\n\tinc hl\n\tld (hl),d\n\tinc hl\n\tld (hl),c\n\tinc hl\n\tld (hl),b\n");
 }
 
 void gen_assign_ast(const struct AstNode *n)
 {
-    struct Sym *s;
-    int common_type;
-    int binop;
-    int saved_dead;
-
     if (ast_struct_deref_copy_assign_supported(n)) {
         gen_struct_deref_copy_assign_ast(n);
         return;
@@ -1212,6 +2010,11 @@ void gen_assign_ast(const struct AstNode *n)
 
     if (ast_struct_copy_assign_supported(n)) {
         gen_struct_copy_assign_ast(n);
+        return;
+    }
+
+    if (ast_struct_chain_copy_assign_supported(n)) {
+        gen_struct_chain_copy_assign_ast(n);
         return;
     }
 
@@ -1236,80 +2039,153 @@ void gen_assign_ast(const struct AstNode *n)
      * and any wider/pointer element are excluded by the gate. */
     if (n->a->kind == AST_INDEX || n->a->kind == AST_MEMBER ||
         (n->a->kind == AST_UNARY && n->a->op == '*')) {
-        struct Sym *byte_arr;
-        struct Sym *byte_idx_sym;
-        struct Sym *byte_rhs_sym;
-        long byte_idx;
-        long byte_rhs;
-        int byte_idx_has_const;
-        int byte_rhs_kind;
-        int val_type;
-        int want_dead = expr_result_dead;
-        int bf_width;
-        int bf_shift;
-        unsigned int bf_mask;
-        int rhs_bool01;
-        const struct AstNode *mask_value;
-        unsigned int bool_mask;
+        gen_assign_lvalue_expr_ast(n);
+        return;
+    }
+    gen_assign_ident_ast(n);
+}
 
-        if (ast_global_byte_array_const_store(n, &byte_arr, &byte_idx, &byte_rhs)) {
-            emit_global_byte_array_index_addr(byte_arr, NULL, byte_idx, 1);
-            fprintf(outf, "\tld (hl),%ld\n", byte_rhs & 255);
-            g_expr_type = byte_arr->type;
-            g_long_from16 = 0;
-            return;
+/* `arr[idx] = ident + K;` (or `- K`) where `ident` is a directly-loadable
+ * (ix-relative local/param or global/extern) word-sized, non-bool scalar
+ * and K is a compile-time int constant: recognizes the RHS shape fint.c's
+ * `lcrs[lcrp++] = in + 1;` uses for its VM return-stack push (`in` a
+ * `struct Ins *`, K scaled by sizeof(struct Ins) via the pointer-arithmetic
+ * path below) - hit on every recursive call in the ttt.f benchmark's
+ * minimax search, the largest remaining dcc-vs-sdcc gap in the whole
+ * interpreter suite. Returns the resolved symbol and the final (already
+ * pointer-scaled if applicable) signed delta to add. */
+static int ast_ident_plus_const_rhs(const struct AstNode *rhs, struct Sym **out_sym, long *out_delta)
+{
+    struct Sym *s;
+    long k;
+
+    if (rhs == NULL || rhs->kind != AST_BINARY || (rhs->op != '+' && rhs->op != '-'))
+        return 0;
+    if (rhs->a == NULL || rhs->a->kind != AST_IDENT)
+        return 0;
+    if (rhs->b == NULL || rhs->b->kind != AST_INT_LIT)
+        return 0;
+
+    s = find_sym(rhs->a->sval);
+    if (s == NULL || type_is_bool(s->type) || type_size(s->type) != 2)
+        return 0;
+    if (!sym_can_ix_direct(s) && !is_global_word_sym(s))
+        return 0;
+
+    if (type_ptr_depth(s->type) > 0)
+        k = rhs->b->ival * type_index_elem_size(s->type);
+    else
+        k = rhs->b->ival;
+    if (rhs->op == '-')
+        k = -k;
+
+    *out_sym = s;
+    *out_delta = k;
+    return 1;
+}
+
+/* Emit `(hl) = s + delta` (16-bit, little-endian) via byte-wise accumulator
+ * arithmetic - `ld a,(s_lo); add a,delta_lo; ld (hl),a; inc hl; ld a,(s_hi);
+ * adc a,delta_hi; ld (hl),a` - instead of materializing `s + delta` into a
+ * full 16-bit register pair (which would clobber the address already in
+ * HL and so need a push/pop around it, exactly the generic path below
+ * does). This is the same byte-at-a-time idiom sdcc's own codegen uses for
+ * this exact shape (confirmed via fint.c.lis) - Z80's 8-bit ADD/ADC
+ * naturally wrap and carry-propagate, so this holds for any 16-bit delta,
+ * not just a small one. HL (the destination address) is never touched
+ * except by the final two `inc hl`/store steps; A is the only scratch
+ * register needed. Caller (gen_assign_lvalue_expr_ast) only takes this
+ * path when the assignment's own result is dead, so there is no need to
+ * also reassemble the stored value into a register pair afterward. */
+static void emit_store_ident_plus_const_to_addr_hl(struct Sym *s, long delta)
+{
+    unsigned long lo = (unsigned long)delta & 0xffUL;
+    unsigned long hi = ((unsigned long)delta >> 8) & 0xffUL;
+
+    if (sym_can_ix_direct(s))
+        fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset);
+    else {
+        emit_extrn_if_needed(s);
+        fprintf(g_emit_sink.stream, "\tld a,(%s)\n", asm_name_for(sym_asm_name(s)));
+    }
+    fprintf(g_emit_sink.stream, "\tadd a,%lu\n", lo);
+    emit("\tld (hl),a\n\tinc hl\n");
+    if (sym_can_ix_direct(s))
+        fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset + 1);
+    else
+        fprintf(g_emit_sink.stream, "\tld a,(%s+1)\n", asm_name_for(sym_asm_name(s)));
+    fprintf(g_emit_sink.stream, "\tadc a,%lu\n", hi);
+    emit("\tld (hl),a\n");
+}
+
+/* Store to a non-identifier lvalue (subscript arr[i], member s.f / p->f, or
+ * deref *p): the address machine differs per lvalue kind, the store tail is
+ * uniform. Handles plain = and the arithmetic/bitwise compound operators.
+ * Split out of gen_assign_ast. */
+static void gen_assign_lvalue_expr_ast(const struct AstNode *n)
+{
+    int saved_dead;
+    int common_type;
+    int binop;
+
+    struct Sym *byte_arr;
+    struct Sym *byte_idx_sym;
+    struct Sym *byte_rhs_sym;
+    long byte_idx;
+    long byte_rhs;
+    int byte_idx_has_const;
+    int byte_rhs_kind;
+    int val_type;
+    int want_dead = expr_result_dead;
+    int bf_width;
+    int bf_shift;
+    unsigned int bf_mask;
+    int rhs_bool01;
+    const struct AstNode *mask_value;
+    unsigned int bool_mask;
+
+    if (ast_global_byte_array_const_store(n, &byte_arr, &byte_idx, &byte_rhs)) {
+        emit_global_byte_array_index_addr(byte_arr, NULL, byte_idx, 1);
+        fprintf(g_emit_sink.stream, "\tld (hl),%ld\n", byte_rhs & 255);
+        g_expr.type = byte_arr->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    if (ast_global_byte_array_fast_store(n, &byte_arr, &byte_idx_sym,
+                                         &byte_idx, &byte_idx_has_const,
+                                         &byte_rhs_sym, &byte_rhs,
+                                         &byte_rhs_kind)) {
+        emit_global_byte_array_index_addr(byte_arr, byte_idx_sym, byte_idx,
+                                          byte_idx_has_const);
+        if (byte_rhs_kind == 1) {
+            fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", byte_rhs_sym->offset);
+            emit("\tld (hl),a\n");
+        } else {
+            fprintf(g_emit_sink.stream, "\tld (hl),%ld\n", byte_rhs & 255);
         }
+        g_expr.type = byte_arr->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
 
-        if (ast_global_byte_array_fast_store(n, &byte_arr, &byte_idx_sym,
-                                             &byte_idx, &byte_idx_has_const,
-                                             &byte_rhs_sym, &byte_rhs,
-                                             &byte_rhs_kind)) {
-            emit_global_byte_array_index_addr(byte_arr, byte_idx_sym, byte_idx,
-                                              byte_idx_has_const);
-            if (byte_rhs_kind == 1) {
-                fprintf(outf, "\tld a,(ix%+d)\n", byte_rhs_sym->offset);
-                emit("\tld (hl),a\n");
-            } else {
-                fprintf(outf, "\tld (hl),%ld\n", byte_rhs & 255);
-            }
-            g_expr_type = byte_arr->type;
-            g_long_from16 = 0;
-            return;
-        }
+    /* Plain `=` into a scalar word field of a global/extern struct instance
+     * (e.g. `Gst.stp = Gst.stp + 1`): both BASE and BASE.field are link-time
+     * constants, so the store can go straight to `ld (BASE+off),hl` without
+     * ever computing &BASE.field into HL - skipping the address-materialize/
+     * push/pop dance the generic path below needs when the lvalue's address
+     * genuinely is only known at runtime. See ast_member_global_word_field. */
+    if (n->op == '=' && n->a->kind == AST_MEMBER) {
+        struct Sym *direct_base;
+        struct FieldDef *direct_fd;
+        int direct_val_type;
 
-        if (n->a->kind == AST_INDEX)
-            gen_index_addr_ast(n->a, &val_type);    /* HL = element address */
-        else if (n->a->kind == AST_MEMBER)
-            gen_member_addr_ast(n->a, &val_type);   /* HL = field address */
-        else
-            gen_deref_addr_ast(n->a, &val_type);    /* HL = target address */
-
-        bf_width = current_field_bit_width;
-        bf_shift = current_field_bit_shift;
-        bf_mask = current_field_bit_mask;
-
-        if (n->op == '=') {
-            emit("\tpush hl\n");
-            rhs_bool01 = 0;
-
-            if (type_is_bool(val_type) &&
-                ast_bool_bitand_const_rhs(n->b, &mask_value, &bool_mask)) {
-                saved_dead = expr_result_dead;
-                expr_result_dead = 0;
-                ast_gen_expr(mask_value);
-                expr_result_dead = saved_dead;
-                emit_store_bool_masked_hl_to_addr_on_stack(bool_mask, !want_dead);
-                if (!want_dead)
-                    emit("\tex de,hl\n");
-                g_long_from16 = 0;
-                return;
-            }
-
-            saved_dead = expr_result_dead;
+        if (ast_member_global_word_field(n->a, &direct_base, &direct_fd, &direct_val_type)) {
+            int saved_dead_direct = expr_result_dead;
             expr_result_dead = 0;
-            if (type_ptr_depth(val_type) > 0 && n->b->kind == AST_CAST) {
+            if (type_ptr_depth(direct_val_type) > 0 && n->b->kind == AST_CAST) {
                 ast_gen_expr(n->b->a);              /* rhs -> HL */
-            } else if (type_ptr_depth(val_type) > 0) {
+            } else if (type_ptr_depth(direct_val_type) > 0) {
                 int ptr_type;
                 int no_deref;
                 if (ast_pointer_expr_type(n->b, &ptr_type, &no_deref))
@@ -1319,165 +2195,330 @@ void gen_assign_ast(const struct AstNode *n)
             } else {
                 ast_gen_expr(n->b);                 /* rhs -> HL */
             }
-            expr_result_dead = saved_dead;
-            if (type_is_bool(val_type)) {
-                rhs_bool01 = ast_expr_yields_bool01(n->b);
-                if (!rhs_bool01) {
-                    emit_bool_normalize_hl(g_expr_type);
-                    rhs_bool01 = 1;
-                }
-            }
-            if (type_size(val_type) == 4) {
-                if (type_is_float(val_type)) {
-                    if (!type_is_float(g_expr_type))
-                        emit_convert_int_to_float(g_expr_type);
-                } else if (!type_is_long(g_expr_type)) {
-                    emit_extend_to_long_typed(g_expr_type);
-                }
-                emit_store_de_to_addr_hl(val_type);  /* pops address itself */
-                g_long_from16 = 0;
-                return;
-            }
-            if (bf_width > 0) {
-                current_field_bit_width = bf_width;
-                current_field_bit_shift = bf_shift;
-                current_field_bit_mask = bf_mask;
-                emit_store_bitfield_from_hl();
-                g_long_from16 = 0;
-                return;
-            }
-            emit("\tex de,hl\n\tpop hl\n");         /* DE = value, HL = address */
-            if (type_is_bool(val_type) && rhs_bool01)
-                emit("\tld (hl),e\n");
+            expr_result_dead = saved_dead_direct;
+            emit_store_global_field_word_direct(direct_base, direct_fd);
+            g_expr.type = direct_val_type;
+            g_expr.long_from16 = 0;
+            return;
+        }
+    }
+
+    if (n->a->kind == AST_INDEX)
+        gen_index_addr_ast(n->a, &val_type);    /* HL = element address */
+    else if (n->a->kind == AST_MEMBER)
+        gen_member_addr_ast(n->a, &val_type);   /* HL = field address */
+    else
+        gen_deref_addr_ast(n->a, &val_type);    /* HL = target address */
+
+    bf_width = current_field_bit_width;
+    bf_shift = current_field_bit_shift;
+    bf_mask = current_field_bit_mask;
+
+    /* The low-byte store shortcut is correct for char/uchar fields and
+     * array elements, but not for _Bool.  _Bool assignment must first
+     * normalize every non-zero RHS value to exactly 1; otherwise cases
+     * like arr[1] = 123, flags.a = 1000L, and *p = 77 store the raw low
+     * byte and break C99 _Bool semantics.  Let the normal assignment path
+     * below evaluate and emit_bool_normalize_hl() for boolean lvalues. */
+    if (n->op == '=' && type_size(val_type) == 1 && !type_is_bool(val_type) &&
+        bf_width == 0 && emit_low_byte_expr_to_a(n->b)) {
+        emit("\tld (hl),a\n");
+        if (!want_dead) {
+            emit("\tld l,a\n");
+            if (val_type & TYPE_UNSIGNED)
+                emit("\tld h,0\n");
             else
-                emit_store_de_to_addr_hl(val_type);
+                emit("\trlca\n\tsbc a,a\n\tld h,a\n");
+        }
+        g_expr.type = val_type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* `arr[idx] = ident +/- K;`, result dead (a plain statement, not used
+     * as a further expression): store via byte-wise accumulator arithmetic
+     * directly into the already-computed address in HL, with no push/pop
+     * needed at all - see ast_ident_plus_const_rhs/emit_store_ident_plus_
+     * const_to_addr_hl. Gated on want_dead because that path never
+     * reassembles the stored value into a register pair afterward; the
+     * generic path just below still handles a live-result use of this
+     * same shape. */
+    if (n->op == '=' && want_dead && bf_width == 0 &&
+        type_size(val_type) == 2 && !type_is_bool(val_type)) {
+        struct Sym *rhs_sym;
+        long rhs_delta;
+
+        if (ast_ident_plus_const_rhs(n->b, &rhs_sym, &rhs_delta)) {
+            emit_store_ident_plus_const_to_addr_hl(rhs_sym, rhs_delta);
+            g_expr.type = val_type;
+            g_expr.long_from16 = 0;
+            return;
+        }
+    }
+
+    if (n->op == '=') {
+        emit("\tpush hl\n");
+        rhs_bool01 = 0;
+
+        if (type_is_bool(val_type) &&
+            ast_bool_bitand_const_rhs(n->b, &mask_value, &bool_mask)) {
+            saved_dead = expr_result_dead;
+            expr_result_dead = 0;
+            ast_gen_expr(mask_value);
+            expr_result_dead = saved_dead;
+            emit_store_bool_masked_hl_to_addr_on_stack(bool_mask, !want_dead);
             if (!want_dead)
                 emit("\tex de,hl\n");
-            g_long_from16 = 0;
+            g_expr.long_from16 = 0;
             return;
         }
-
-        switch (n->op) {
-        case TOK_ADDEQ: binop = '+'; break;
-        case TOK_SUBEQ: binop = '-'; break;
-        case TOK_MULEQ: binop = '*'; break;
-        case TOK_DIVEQ: binop = '/'; break;
-        case TOK_MODEQ: binop = '%'; break;
-        case TOK_ANDEQ: binop = '&'; break;
-        case TOK_OREQ:  binop = '|'; break;
-        default:        binop = '^'; break;   /* TOK_XOREQ */
-        }
-
-        if (type_size(val_type) == 4) {
-            emit("\tpush hl\n");                    /* save lvalue address */
-            emit_load_from_hl(val_type);             /* DE:HL = current value */
-
-            if (type_is_long(val_type) &&
-                (n->op == TOK_SHLEQ || n->op == TOK_SHREQ) &&
-                n->b->kind == AST_INT_LIT) {
-                if (!emit_shift_const_long(n->op, val_type, n->b->ival)) {
-                    fprintf(outf, "\tld b,%ld\n", n->b->ival & 255L);
-                    emit_shift_loop(n->op, val_type);
-                }
-                emit("\tld b,d\n\tld c,e\n");
-                emit("\tpop de\n");
-                emit("\tex de,hl\n");
-                emit("\tld (hl),e\n\tinc hl\n\tld (hl),d\n\tinc hl\n\tld (hl),c\n\tinc hl\n\tld (hl),b\n");
-                if (!want_dead) {
-                    emit("\tex de,hl\n");
-                    emit("\tld d,b\n\tld e,c\n");
-                }
-                g_expr_type = val_type;
-                g_long_from16 = 0;
-                return;
-            }
-
-            emit("\tpush de\n\tpush hl\n");         /* save current value */
-            saved_dead = expr_result_dead;
-
-            if (type_is_float(val_type)) {
-                emit_float_compound_rhs(n, saved_dead);
-                emit_store_de_to_addr_hl(val_type);
-                g_expr_type = val_type;
-                g_long_from16 = 0;
-                return;
-            }
-
-            expr_result_dead = 0;
-            ast_gen_expr(n->b);                      /* rhs -> DE:HL or HL */
-            expr_result_dead = saved_dead;
-
-            if (type_is_long(val_type) &&
-                (n->op == TOK_SHLEQ || n->op == TOK_SHREQ)) {
-                emit("\tld b,l\n\tpop hl\n\tpop de\n");
-                emit_shift_loop(n->op, val_type);
-                emit("\tld b,d\n\tld c,e\n");
-                emit("\tpop de\n");
-                emit("\tex de,hl\n");
-                emit("\tld (hl),e\n\tinc hl\n\tld (hl),d\n\tinc hl\n\tld (hl),c\n\tinc hl\n\tld (hl),b\n");
-                if (!want_dead) {
-                    emit("\tex de,hl\n");
-                    emit("\tld d,b\n\tld e,c\n");
-                }
-                g_expr_type = val_type;
-                g_long_from16 = 0;
-                return;
-            }
-
-            common_type = common_arith_type(val_type, g_expr_type);
-            emit_cast_16_to_common(g_expr_type, common_type);
-            gen_binop32_typed(binop, common_type);
-            emit_store_de_to_addr_hl(val_type);
-            g_expr_type = val_type;
-            g_long_from16 = 0;
-            return;
-        }
-
-        /* Compound assignment to a non-identifier lvalue.  Streaming's general
-         * normal_assign compound tail: save the address, load the current
-         * value, save it, evaluate the RHS, combine, then store back (also
-         * leaving the result in HL when the statement value is live). */
-        switch (n->op) {
-        case TOK_ADDEQ: binop = '+'; break;
-        case TOK_SUBEQ: binop = '-'; break;
-        case TOK_MULEQ: binop = '*'; break;
-        case TOK_DIVEQ: binop = '/'; break;
-        case TOK_MODEQ: binop = '%'; break;
-        case TOK_ANDEQ: binop = '&'; break;
-        case TOK_OREQ:  binop = '|'; break;
-        default:        binop = '^'; break;   /* TOK_XOREQ */
-        }
-
-        emit("\tpush hl\n");                    /* save lvalue address */
-        emit_load_from_hl(val_type);            /* HL = current value */
-        emit("\tpush hl\n");                    /* save current value */
 
         saved_dead = expr_result_dead;
         expr_result_dead = 0;
-        ast_gen_expr(n->b);                     /* rhs -> HL */
+        if (type_ptr_depth(val_type) > 0 && n->b->kind == AST_CAST) {
+            ast_gen_expr(n->b->a);              /* rhs -> HL */
+        } else if (type_ptr_depth(val_type) > 0) {
+            int ptr_type;
+            int no_deref;
+            if (ast_pointer_expr_type(n->b, &ptr_type, &no_deref))
+                gen_pointer_expr_ast(n->b, &ptr_type, &no_deref);
+            else
+                ast_gen_expr(n->b);
+        } else {
+            ast_gen_expr(n->b);                 /* rhs -> HL */
+        }
         expr_result_dead = saved_dead;
-
-        if (n->op == TOK_SHLEQ || n->op == TOK_SHREQ) {
-            emit("\tld b,l\n\tpop hl\n");
-            emit_shift_loop(n->op, val_type);
-            emit("\tex de,hl\n\tpop hl\n");
-            emit_store_de_to_addr_hl(val_type);
+        if (type_is_bool(val_type)) {
+            rhs_bool01 = ast_expr_yields_bool01(n->b);
+            if (!rhs_bool01) {
+                emit_bool_normalize_hl(g_expr.type);
+                rhs_bool01 = 1;
+            }
+        }
+        if (type_size(val_type) == 4) {
+            if (type_is_float(val_type)) {
+                if (!type_is_float(g_expr.type))
+                    emit_convert_int_to_float(g_expr.type);
+            } else if (!type_is_long(g_expr.type)) {
+                emit_extend_to_long_typed(g_expr.type);
+            }
+            emit_store_de_to_addr_hl(val_type);  /* pops address itself */
+            /* emit_store_de_to_addr_hl leaves the stored 32-bit value as
+             * DE=low word, BC=high word; rebuild DE:HL=value for a live
+             * result (e.g. `x = (p->f = v)`). */
             if (!want_dead)
-                emit("\tex de,hl\n");
-            g_long_from16 = 0;
+                emit("\tex de,hl\n\tld d,b\n\tld e,c\n");
+            g_expr.long_from16 = 0;
             return;
         }
+        if (bf_width > 0) {
+            current_field_bit_width = bf_width;
+            current_field_bit_shift = bf_shift;
+            current_field_bit_mask = bf_mask;
+            emit_store_bitfield_from_hl();
+            g_expr.long_from16 = 0;
+            return;
+        }
+        emit("\tex de,hl\n\tpop hl\n");         /* DE = value, HL = address */
+        if (type_is_bool(val_type) && rhs_bool01)
+            emit("\tld (hl),e\n");
+        else
+            emit_store_de_to_addr_hl(val_type);
+        if (!want_dead)
+            emit("\tex de,hl\n");
+        g_expr.long_from16 = 0;
+        return;
+    }
 
-        emit("\tex de,hl\n\tpop hl\n");         /* DE = rhs, HL = current value */
-        common_type = common_arith_type(val_type, g_expr_type);
-        gen_binop_typed(binop, common_type);    /* HL = result */
+    switch (n->op) {
+    case TOK_ADDEQ: binop = '+'; break;
+    case TOK_SUBEQ: binop = '-'; break;
+    case TOK_MULEQ: binop = '*'; break;
+    case TOK_DIVEQ: binop = '/'; break;
+    case TOK_MODEQ: binop = '%'; break;
+    case TOK_ANDEQ: binop = '&'; break;
+    case TOK_OREQ:  binop = '|'; break;
+    default:        binop = '^'; break;   /* TOK_XOREQ */
+    }
+
+    if ((n->op == TOK_ADDEQ || n->op == TOK_SUBEQ) &&
+        type_ptr_depth(val_type) > 0 && type_size(val_type) == 2) {
+        int elem_size;
+
+        elem_size = type_index_elem_size(val_type);
+        emit("\tpush hl\n");                    /* save lvalue address */
+        emit_load_from_hl(val_type);            /* HL = current pointer */
+        emit("\tpush hl\n");                    /* save current pointer */
+
+        saved_dead = expr_result_dead;
+        expr_result_dead = 0;
+        ast_gen_expr(n->b);                     /* HL = element count */
+        expr_result_dead = saved_dead;
+        scale_hl_by_elem_size(elem_size);
+
+        emit("\tex de,hl\n\tpop hl\n");         /* DE = scaled count, HL = current pointer */
+        if (n->op == TOK_ADDEQ)
+            emit("\tadd hl,de\n");
+        else
+            emit("\tor a\n\tsbc hl,de\n");
         emit("\tex de,hl\n\tpop hl\n");         /* DE = result, HL = address */
         emit_store_de_to_addr_hl(val_type);
         if (!want_dead)
             emit("\tex de,hl\n");
-        g_long_from16 = 0;
+        g_expr.type = val_type;
+        g_expr.long_from16 = 0;
         return;
     }
+
+    if (type_size(val_type) == 4) {
+        emit("\tpush hl\n");                    /* save lvalue address */
+        emit_load_from_hl(val_type);             /* DE:HL = current value */
+
+        if (type_is_long(val_type) &&
+            (n->op == TOK_SHLEQ || n->op == TOK_SHREQ) &&
+            n->b->kind == AST_INT_LIT) {
+            if (!emit_shift_const_long(n->op, val_type, n->b->ival)) {
+                fprintf(g_emit_sink.stream, "\tld b,%ld\n", n->b->ival & 255L);
+                emit_shift_loop(n->op, val_type);
+            }
+            emit("\tld b,d\n\tld c,e\n");
+            emit("\tpop de\n");
+            emit("\tex de,hl\n");
+            emit_store_long_edcb_via_hl();
+            if (!want_dead) {
+                emit("\tex de,hl\n");
+                emit("\tld d,b\n\tld e,c\n");
+            }
+            g_expr.type = val_type;
+            g_expr.long_from16 = 0;
+            return;
+        }
+
+        emit("\tpush de\n\tpush hl\n");         /* save current value */
+        saved_dead = expr_result_dead;
+
+        if (type_is_float(val_type)) {
+            emit_float_compound_rhs(n, saved_dead);
+            emit_store_de_to_addr_hl(val_type);
+            /* Rebuild DE:HL=value from the store's DE=low/BC=high leftovers
+             * so a live result (`x = (p->f += v)`) is correct. */
+            if (!want_dead)
+                emit("\tex de,hl\n\tld d,b\n\tld e,c\n");
+            g_expr.type = val_type;
+            g_expr.long_from16 = 0;
+            return;
+        }
+
+        expr_result_dead = 0;
+        ast_gen_expr(n->b);                      /* rhs -> DE:HL or HL */
+        expr_result_dead = saved_dead;
+
+        if (type_is_long(val_type) &&
+            (n->op == TOK_SHLEQ || n->op == TOK_SHREQ)) {
+            emit("\tld b,l\n\tpop hl\n\tpop de\n");
+            emit_shift_loop(n->op, val_type);
+            emit("\tld b,d\n\tld c,e\n");
+            emit("\tpop de\n");
+            emit("\tex de,hl\n");
+            emit_store_long_edcb_via_hl();
+            if (!want_dead) {
+                emit("\tex de,hl\n");
+                emit("\tld d,b\n\tld e,c\n");
+            }
+            g_expr.type = val_type;
+            g_expr.long_from16 = 0;
+            return;
+        }
+
+        common_type = common_arith_type(val_type, g_expr.type);
+        emit_cast_16_to_common(g_expr.type, common_type);
+        gen_binop32_typed(binop, common_type);
+        emit_store_de_to_addr_hl(val_type);
+        /* Rebuild DE:HL=value from the store's DE=low/BC=high leftovers so a
+         * live result (`x = (p->lf += v)`) is correct. */
+        if (!want_dead)
+            emit("\tex de,hl\n\tld d,b\n\tld e,c\n");
+        g_expr.type = val_type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Compound assignment to a non-identifier lvalue.  Streaming's general
+     * normal_assign compound tail: save the address, load the current
+     * value, save it, evaluate the RHS, combine, then store back (also
+     * leaving the result in HL when the statement value is live). */
+    switch (n->op) {
+    case TOK_ADDEQ: binop = '+'; break;
+    case TOK_SUBEQ: binop = '-'; break;
+    case TOK_MULEQ: binop = '*'; break;
+    case TOK_DIVEQ: binop = '/'; break;
+    case TOK_MODEQ: binop = '%'; break;
+    case TOK_ANDEQ: binop = '&'; break;
+    case TOK_OREQ:  binop = '|'; break;
+    default:        binop = '^'; break;   /* TOK_XOREQ */
+    }
+
+    emit("\tpush hl\n");                    /* save lvalue address */
+    emit_load_from_hl(val_type);            /* HL = current value */
+    if (bf_width > 0) {
+        current_field_bit_width = bf_width;
+        current_field_bit_shift = bf_shift;
+        current_field_bit_mask = bf_mask;
+        g_expr.type = val_type;
+        emit_extract_bitfield();
+    }
+    emit("\tpush hl\n");                    /* save current value */
+
+    saved_dead = expr_result_dead;
+    expr_result_dead = 0;
+    ast_gen_expr(n->b);                     /* rhs -> HL */
+    expr_result_dead = saved_dead;
+
+    if (n->op == TOK_SHLEQ || n->op == TOK_SHREQ) {
+        emit("\tld b,l\n\tpop hl\n");
+        emit_shift_loop(n->op, val_type);
+        emit("\tex de,hl\n\tpop hl\n");
+        if (bf_width > 0) {
+            current_field_bit_width = bf_width;
+            current_field_bit_shift = bf_shift;
+            current_field_bit_mask = bf_mask;
+            g_expr.type = val_type;   /* field type -> correct extract sign */
+            emit_store_bitfield_de_to_addr_hl(!want_dead);
+        } else {
+            emit_store_de_to_addr_hl(val_type);
+            if (!want_dead)
+                emit("\tex de,hl\n");
+        }
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    emit("\tex de,hl\n\tpop hl\n");         /* DE = rhs, HL = current value */
+    common_type = common_arith_type(val_type, g_expr.type);
+    gen_binop_typed(binop, common_type);    /* HL = result */
+    emit("\tex de,hl\n\tpop hl\n");         /* DE = result, HL = address */
+    if (bf_width > 0) {
+        current_field_bit_width = bf_width;
+        current_field_bit_shift = bf_shift;
+        current_field_bit_mask = bf_mask;
+        g_expr.type = val_type;   /* field type -> correct extract sign */
+        emit_store_bitfield_de_to_addr_hl(!want_dead);
+    } else {
+        emit_store_de_to_addr_hl(val_type);
+        if (!want_dead)
+            emit("\tex de,hl\n");
+    }
+    g_expr.long_from16 = 0;
+    return;
+}
+
+/* Assign to a plain identifier lvalue. Split out of gen_assign_ast. */
+static void gen_assign_ident_ast(const struct AstNode *n)
+{
+    struct Sym *s;
+    int common_type;
+    int binop;
+    int saved_dead;
 
     s = find_sym(n->a->sval);
 
@@ -1506,24 +2547,25 @@ void gen_assign_ast(const struct AstNode *n)
         expr_result_dead = saved_dead;
         emit("\tex de,hl\n\tpop hl\n");
         emit_store_de_to_addr_hl(s->type);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
-    if (n->op == '=' && type_is_float(s->type) && !sym_can_ix_direct(s) &&
-        expr_result_dead) {
+    if (n->op == '=' && type_is_float(s->type) && !sym_can_ix_direct(s)) {
         saved_dead = expr_result_dead;
         emit_load_sym_addr(s);
         emit("\tpush hl\n");
         expr_result_dead = 0;
         ast_gen_expr(n->b);
         expr_result_dead = saved_dead;
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
         emit_store_de_to_addr_hl(s->type);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        if (!saved_dead)
+            emit("\tex de,hl\n\tld d,b\n\tld e,c\n");
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -1532,17 +2574,17 @@ void gen_assign_ast(const struct AstNode *n)
         expr_result_dead = 0;
         ast_gen_expr(n->b);
         expr_result_dead = saved_dead;
-        if (!type_is_float(g_expr_type))
-            emit_convert_int_to_float(g_expr_type);
+        if (!type_is_float(g_expr.type))
+            emit_convert_int_to_float(g_expr.type);
         emit_store_hl_to_sym_direct(s);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
     if ((n->op == TOK_ADDEQ || n->op == TOK_SUBEQ ||
          n->op == TOK_MULEQ || n->op == TOK_DIVEQ) &&
-        type_is_float(s->type) && !sym_can_ix_direct(s) && expr_result_dead) {
+        type_is_float(s->type) && !sym_can_ix_direct(s)) {
         saved_dead = expr_result_dead;
         emit_load_sym_addr(s);
         emit("\tpush hl\n");
@@ -1550,26 +2592,29 @@ void gen_assign_ast(const struct AstNode *n)
         emit("\tpush de\n\tpush hl\n");
         emit_float_compound_rhs(n, saved_dead);
         emit_store_de_to_addr_hl(s->type);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        if (!saved_dead)
+            emit("\tex de,hl\n\tld d,b\n\tld e,c\n");
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
-    if (n->op == '=' && type_is_long(s->type) && !sym_can_ix_direct(s) &&
-        expr_result_dead) {
+    if (n->op == '=' && type_is_long(s->type) && !sym_can_ix_direct(s)) {
         saved_dead = expr_result_dead;
         emit_load_sym_addr(s);
         emit("\tpush hl\n");
         expr_result_dead = 0;
         ast_gen_expr(n->b);
         expr_result_dead = saved_dead;
-        if (type_is_float(g_expr_type))
+        if (type_is_float(g_expr.type))
             emit_convert_float_to_intlike(s->type);
-        else if (!type_is_long(g_expr_type))
-            emit_extend_to_long_typed(g_expr_type);
+        else if (!type_is_long(g_expr.type))
+            emit_extend_to_long_typed(g_expr.type);
         emit_store_de_to_addr_hl(s->type);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        if (!saved_dead)
+            emit("\tex de,hl\n\tld d,b\n\tld e,c\n");
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -1581,8 +2626,8 @@ void gen_assign_ast(const struct AstNode *n)
         emit("\tpush de\n\tpush hl\n");
         emit_float_compound_rhs(n, saved_dead);
         emit_store_hl_to_sym_direct(s);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -1591,13 +2636,20 @@ void gen_assign_ast(const struct AstNode *n)
         expr_result_dead = 0;
         ast_gen_expr(n->b);
         expr_result_dead = saved_dead;
-        if (type_is_float(g_expr_type))
+        if (type_is_float(g_expr.type))
             emit_convert_float_to_intlike(s->type);
-        else if (!type_is_long(g_expr_type))
-            emit_extend_to_long_typed(g_expr_type);
+        else if (!type_is_long(g_expr.type))
+            emit_extend_to_long_typed(g_expr.type);
         emit_store_hl_to_sym_direct(s);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    if (n->op == TOK_OREQ && type_is_long(s->type) && sym_can_ix_direct(s) &&
+        emit_long_oreq_byte_lane(s, n->b)) {
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -1612,8 +2664,8 @@ void gen_assign_ast(const struct AstNode *n)
         expr_result_dead = 0;
         ast_gen_expr(n->b);
         expr_result_dead = saved_dead;
-        if (!type_is_long(g_expr_type))
-            emit_extend_to_long_typed(g_expr_type);
+        if (!type_is_long(g_expr.type))
+            emit_extend_to_long_typed(g_expr.type);
         switch (n->op) {
         case TOK_ADDEQ: b32 = '+'; break;
         case TOK_SUBEQ: b32 = '-'; break;
@@ -1626,15 +2678,15 @@ void gen_assign_ast(const struct AstNode *n)
         }
         gen_binop32(b32, s->type);
         emit_store_hl_to_sym_direct(s);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
     if ((n->op == TOK_ADDEQ || n->op == TOK_SUBEQ ||
          n->op == TOK_MULEQ || n->op == TOK_DIVEQ || n->op == TOK_MODEQ ||
          n->op == TOK_ANDEQ || n->op == TOK_OREQ  || n->op == TOK_XOREQ) &&
-        type_is_long(s->type) && !sym_can_ix_direct(s) && expr_result_dead) {
+        type_is_long(s->type) && !sym_can_ix_direct(s)) {
         int b32;
         saved_dead = expr_result_dead;
         emit_load_sym_addr(s);
@@ -1644,8 +2696,8 @@ void gen_assign_ast(const struct AstNode *n)
         expr_result_dead = 0;
         ast_gen_expr(n->b);
         expr_result_dead = saved_dead;
-        if (!type_is_long(g_expr_type))
-            emit_extend_to_long_typed(g_expr_type);
+        if (!type_is_long(g_expr.type))
+            emit_extend_to_long_typed(g_expr.type);
         switch (n->op) {
         case TOK_ADDEQ: b32 = '+'; break;
         case TOK_SUBEQ: b32 = '-'; break;
@@ -1658,20 +2710,22 @@ void gen_assign_ast(const struct AstNode *n)
         }
         gen_binop32(b32, s->type);
         emit_store_de_to_addr_hl(s->type);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        if (!saved_dead)
+            emit("\tex de,hl\n\tld d,b\n\tld e,c\n");
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
     if ((n->op == TOK_SHLEQ || n->op == TOK_SHREQ) &&
-        type_is_long(s->type) && !sym_can_ix_direct(s) && expr_result_dead) {
+        type_is_long(s->type) && !sym_can_ix_direct(s)) {
         saved_dead = expr_result_dead;
         emit_load_sym_addr(s);
         emit("\tpush hl\n");
         emit_load_from_hl(s->type);
         if (n->b->kind == AST_INT_LIT && ast_value_is_plain_int(n->b)) {
             if (!emit_shift_const_long(n->op, s->type, n->b->ival)) {
-                fprintf(outf, "\tld b,%ld\n", n->b->ival & 255L);
+                fprintf(g_emit_sink.stream, "\tld b,%ld\n", n->b->ival & 255L);
                 emit_shift_loop(n->op, s->type);
             }
         } else {
@@ -1685,9 +2739,11 @@ void gen_assign_ast(const struct AstNode *n)
         emit("\tld b,d\n\tld c,e\n");
         emit("\tpop de\n");
         emit("\tex de,hl\n");
-        emit("\tld (hl),e\n\tinc hl\n\tld (hl),d\n\tinc hl\n\tld (hl),c\n\tinc hl\n\tld (hl),b\n");
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        emit_store_long_edcb_via_hl();
+        if (!saved_dead)
+            emit("\tex de,hl\n\tld d,b\n\tld e,c\n");
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -1698,7 +2754,7 @@ void gen_assign_ast(const struct AstNode *n)
         expr_result_dead = 0;
         if (n->b->kind == AST_INT_LIT && ast_value_is_plain_int(n->b)) {
             if (!emit_shift_const_long(n->op, s->type, n->b->ival)) {
-                fprintf(outf, "\tld b,%ld\n", n->b->ival & 255L);
+                fprintf(g_emit_sink.stream, "\tld b,%ld\n", n->b->ival & 255L);
                 emit_shift_loop(n->op, s->type);
             }
         } else {
@@ -1709,8 +2765,8 @@ void gen_assign_ast(const struct AstNode *n)
         }
         expr_result_dead = saved_dead;
         emit_store_hl_to_sym_direct(s);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -1726,18 +2782,25 @@ void gen_assign_ast(const struct AstNode *n)
         ast_gen_expr(n->b);
         expr_result_dead = saved_dead;
         if (type_is_bool(s->type) && !ast_expr_yields_bool01(n->b))
-            emit_bool_normalize_hl(g_expr_type);
+            emit_bool_normalize_hl(g_expr.type);
         if (type_size(s->type) > 1)
-            emit_promote_byte_to_int(g_expr_type);
+            emit_promote_byte_to_int(g_expr.type);
         emit("\tex de,hl\n\tpop hl\n");
         emit_store_de_to_addr_hl(s->type);
         if (!want_dead)
             emit("\tex de,hl\n");
-        g_long_from16 = 0;
+        /* A long rhs was narrowed by storing only its low word; the live
+         * result in HL is that 16-bit word, so the expression's type is the
+         * lvalue's int type.  Leaving g_expr.type as TYPE_LONG would make an
+         * enclosing consumer (e.g. `y = (p = -32768L)`) treat leftover DE as
+         * the high word. */
+        if (type_is_long(g_expr.type))
+            g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
-    if (expr_result_dead && !sym_can_ix_direct(s) && !is_global_word_sym(s) &&
+    if (!sym_can_ix_direct(s) && !is_global_word_sym(s) &&
         (n->op == TOK_ADDEQ || n->op == TOK_SUBEQ ||
          n->op == TOK_ANDEQ || n->op == TOK_OREQ || n->op == TOK_XOREQ) &&
         ast_is_plain_int_type(s->type) &&
@@ -1765,14 +2828,14 @@ void gen_assign_ast(const struct AstNode *n)
         expr_result_dead = saved_dead;
 
         emit("\tex de,hl\n\tpop hl\n");
-        common_type = common_arith_type(s->type, g_expr_type);
+        common_type = common_arith_type(s->type, g_expr.type);
         gen_binop_typed(binop, common_type);
         emit("\tex de,hl\n\tpop hl\n");
         emit_store_de_to_addr_hl(s->type);
         if (!want_dead)
             emit("\tex de,hl\n");
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -1792,11 +2855,11 @@ void gen_assign_ast(const struct AstNode *n)
                 ast_gen_expr(n->b);
                 expr_result_dead = saved_dead;
                 emit("\tex de,hl\n\tpop hl\n");
-                common_type = common_arith_type(s->type, g_expr_type);
+                common_type = common_arith_type(s->type, g_expr.type);
                 gen_binop_typed(binop, common_type);
                 emit_store_hl_to_sym_direct(s);
-                g_expr_type = s->type;
-                g_long_from16 = 0;
+                g_expr.type = s->type;
+                g_expr.long_from16 = 0;
                 return;
         }
 
@@ -1804,7 +2867,8 @@ void gen_assign_ast(const struct AstNode *n)
                 (n->op == TOK_ADDEQ || n->op == TOK_SUBEQ) &&
                 !type_is_long(s->type) && !type_is_float(s->type) &&
         (n->b->kind == AST_INT_LIT || n->b->kind == AST_IDENT ||
-         ast_const_plain_int_binary_supported(n->b))) {
+         ast_const_plain_int_binary_supported(n->b) ||
+         (type_ptr_depth(s->type) > 0 && ast_value_is_plain_int(n->b)))) {
         emit_load_sym_value_direct(s);
         if (n->b->kind == AST_INT_LIT) {
             long scaled = n->b->ival;
@@ -1839,11 +2903,21 @@ void gen_assign_ast(const struct AstNode *n)
         else
             emit("\tor a\n\tsbc hl,de\n");
         emit_store_hl_to_sym_direct(s);
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
         return;
     }
 
     if (n->op == '=') {
+        gen_assign_ident_plain_ast(n, s);
+        return;
+    }
+    gen_assign_ident_compound_ast(n, s);
+}
+
+static void gen_assign_ident_plain_ast(const struct AstNode *n, struct Sym *s)
+{
+    int saved_dead;
+
         if (type_size(s->type) == 1 &&
             (s->storage == SC_GLOBAL || s->storage == SC_EXTERN)) {
             int want_dead = expr_result_dead;
@@ -1858,8 +2932,8 @@ void gen_assign_ast(const struct AstNode *n)
             emit_store_de_to_addr_hl(s->type);
             if (!want_dead)
                 emit("\tex de,hl\n");
-            g_expr_type = s->type;
-            g_long_from16 = 0;
+            g_expr.type = s->type;
+            g_expr.long_from16 = 0;
             return;
         }
         if (type_size(s->type) == 1 && n->b->kind == AST_IDENT) {
@@ -1869,27 +2943,41 @@ void gen_assign_ast(const struct AstNode *n)
                 if (type_is_bool(s->type)) {
                     emit_load_sym_value_direct(rs);
                     emit_store_hl_to_sym_direct(s);
-                    g_expr_type = s->type;
-                    g_long_from16 = 0;
+                    g_expr.type = s->type;
+                    g_expr.long_from16 = 0;
                     return;
                 }
-                fprintf(outf, "\tld a,(ix%+d)\n", rs->offset);
-                fprintf(outf, "\tld (ix%+d),a\n", s->offset);
-                g_expr_type = s->type;
-                g_long_from16 = 0;
+                fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", rs->offset);
+                fprintf(g_emit_sink.stream, "\tld (ix%+d),a\n", s->offset);
+                g_expr.type = s->type;
+                g_expr.long_from16 = 0;
+                /* This statement's value may itself be read by an enclosing
+                 * expression (e.g. a chained `outer = byte_var = other;`) -
+                 * the store above only wrote the byte, it never put the
+                 * (possibly sign/zero-extended) result in HL. Only bother
+                 * when the caller actually needs it: this exact gap (found
+                 * via tests/00040.c's `for (r=i=0; ...)` once `i` narrowed
+                 * to a byte) silently left HL holding unrelated leftover
+                 * register contents, corrupting the outer assignment. */
+                if (!expr_result_dead)
+                    emit_load_sym_value_direct(s);
                 return;
             }
         }
         if (type_size(s->type) == 1 && n->b->kind == AST_INT_LIT) {
             if (type_is_bool(s->type)) {
-                fprintf(outf, "\tld (ix%+d),%d\n", s->offset, n->b->ival ? 1 : 0);
-                g_expr_type = s->type;
-                g_long_from16 = 0;
+                fprintf(g_emit_sink.stream, "\tld (ix%+d),%d\n", s->offset, n->b->ival ? 1 : 0);
+                g_expr.type = s->type;
+                g_expr.long_from16 = 0;
+                if (!expr_result_dead)
+                    emit_load_sym_value_direct(s);
                 return;
             }
-            fprintf(outf, "\tld (ix%+d),%ld\n", s->offset, n->b->ival & 255);
-            g_expr_type = s->type;
-            g_long_from16 = 0;
+            fprintf(g_emit_sink.stream, "\tld (ix%+d),%ld\n", s->offset, n->b->ival & 255);
+            g_expr.type = s->type;
+            g_expr.long_from16 = 0;
+            if (!expr_result_dead)
+                emit_load_sym_value_direct(s);
             return;
         }
         if (type_size(s->type) == 1) {
@@ -1897,9 +2985,11 @@ void gen_assign_ast(const struct AstNode *n)
             if (ast_int_const_cast_fold(n->b, &fv)) {
                 if (type_is_bool(s->type))
                     fv = fv ? 1 : 0;
-                fprintf(outf, "\tld (ix%+d),%ld\n", s->offset, fv & 255);
-                g_expr_type = s->type;
-                g_long_from16 = 0;
+                fprintf(g_emit_sink.stream, "\tld (ix%+d),%ld\n", s->offset, fv & 255);
+                g_expr.type = s->type;
+                g_expr.long_from16 = 0;
+                if (!expr_result_dead)
+                    emit_load_sym_value_direct(s);
                 return;
             }
         }
@@ -1912,8 +3002,8 @@ void gen_assign_ast(const struct AstNode *n)
             ast_gen_expr(n->b);
             expr_result_dead = saved_dead;
             emit_store_hl_to_sym_direct(s);
-            g_expr_type = s->type;
-            g_long_from16 = 0;
+            g_expr.type = s->type;
+            g_expr.long_from16 = 0;
             return;
         }
         if (type_ptr_depth(s->type) > 0 && n->b->kind == AST_CAST) {
@@ -1941,16 +3031,39 @@ void gen_assign_ast(const struct AstNode *n)
             /* emit_store_hl_to_sym_direct normalises the 16-bit value; only
              * wide (long/float) sources need reducing to 0/1 up front. */
             if (!ast_expr_yields_bool01(n->b) &&
-                (type_is_float(g_expr_type) || type_is_long(g_expr_type)))
-                emit_bool_normalize_hl(g_expr_type);
-        } else if (type_is_float(g_expr_type))
+                (type_is_float(g_expr.type) || type_is_long(g_expr.type)))
+                emit_bool_normalize_hl(g_expr.type);
+        } else if (type_is_float(g_expr.type))
             emit_convert_float_to_intlike(s->type);
-        else if (!type_is_long(g_expr_type))
-            emit_promote_byte_to_int(g_expr_type);
+        else if (!type_is_long(g_expr.type) &&
+                 /* gen_index_ast/gen_member_ast already promote a byte-sized
+                  * element's value in H via emit_load_from_hl during the
+                  * read itself - they just leave g_expr.type as the raw
+                  * (unpromoted) element type afterward, since other callers
+                  * need to see the true small type (e.g. this same
+                  * function's own type_size(s->type)==1 fast paths above).
+                  * Re-promoting here is a correct no-op (re-sign-extending
+                  * an already-extended value doesn't change it) but wastes
+                  * 4-5 real instructions every time - measurable in a hot
+                  * path (profiled: tchess.c's `p = board[s]`, the single
+                  * hottest statement shape in its two hottest functions).
+                  * Bitfield extractions (current_field_bit_width > 0) go
+                  * through emit_extract_bitfield() instead and are left
+                  * alone here - not verified to leave H in the same
+                  * already-promoted state. */
+                 !((n->b->kind == AST_INDEX || n->b->kind == AST_MEMBER) &&
+                   type_size(g_expr.type) == 1 && current_field_bit_width == 0))
+            emit_promote_byte_to_int(g_expr.type);
         emit_store_hl_to_sym_direct(s);
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
         return;
-    }
+}
+
+static void gen_assign_ident_compound_ast(const struct AstNode *n, struct Sym *s)
+{
+    int common_type;
+    int binop;
+    int saved_dead;
 
     if (expr_result_dead && type_size(s->type) == 1 && !sym_can_ix_direct(s) &&
         (n->op == TOK_ANDEQ || n->op == TOK_OREQ || n->op == TOK_XOREQ)) {
@@ -1969,12 +3082,12 @@ void gen_assign_ast(const struct AstNode *n)
         ast_gen_expr(n->b);
         expr_result_dead = saved_dead;
         emit("\tex de,hl\n\tpop hl\n");
-        common_type = common_arith_type(s->type, g_expr_type);
+        common_type = common_arith_type(s->type, g_expr.type);
         gen_binop_typed(binop, common_type);
         emit("\tex de,hl\n\tpop hl\n");
         emit_store_de_to_addr_hl(s->type);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -1988,7 +3101,30 @@ void gen_assign_ast(const struct AstNode *n)
         emit("\tld b,l\n\tpop hl\n");
         emit_shift_loop(n->op, s->type);
         emit_store_hl_to_sym_direct(s);
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    if (type_size(s->type) == 2 &&
+        (n->op == TOK_ANDEQ || n->op == TOK_OREQ || n->op == TOK_XOREQ) &&
+        ast_value_is_long_word(n->b)) {
+        emit_load_sym_value_direct(s);
+        emit("\tpush hl\n");
+        saved_dead = expr_result_dead;
+        expr_result_dead = 0;
+        ast_gen_expr(n->b);
+        expr_result_dead = saved_dead;
+        emit("\tex de,hl\n\tpop hl\n");
+        if (n->op == TOK_ANDEQ)
+            binop = '&';
+        else if (n->op == TOK_OREQ)
+            binop = '|';
+        else
+            binop = '^';
+        gen_binop_typed(binop, s->type);
+        emit_store_hl_to_sym_direct(s);
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -2004,7 +3140,7 @@ void gen_assign_ast(const struct AstNode *n)
         expr_result_dead = 0;
         ast_gen_expr(n->b);
         expr_result_dead = saved_dead;
-        emit_cast_16_to_common(g_expr_type, common_type);
+        emit_cast_16_to_common(g_expr.type, common_type);
         switch (n->op) {
         case TOK_MULEQ: b32 = '*'; break;
         case TOK_DIVEQ: b32 = '/'; break;
@@ -2012,8 +3148,8 @@ void gen_assign_ast(const struct AstNode *n)
         }
         gen_binop32(b32, common_type);
         emit_store_hl_to_sym_direct(s);
-        g_expr_type = s->type;
-        g_long_from16 = 0;
+        g_expr.type = s->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -2041,10 +3177,10 @@ void gen_assign_ast(const struct AstNode *n)
     expr_result_dead = saved_dead;
 
     emit("\tex de,hl\n\tpop hl\n");
-    common_type = common_arith_type(s->type, g_expr_type);
+    common_type = common_arith_type(s->type, g_expr.type);
     gen_binop_typed(binop, common_type);
     emit_store_hl_to_sym_direct(s);
-    g_long_from16 = 0;
+    g_expr.long_from16 = 0;
 }
 
 /* First-subscript fast path for a global/static array base. The base address is
@@ -2067,7 +3203,68 @@ static int emit_array_symbase_index(struct Sym *s, const struct AstNode *idx,
     gen_index_subscript_expr_ast(idx);   /* index -> HL */
     scale_hl_by_elem_size(elem);         /* index * elem */
     emit_extrn_if_needed(s);
-    fprintf(outf, "\tld de,%s\n", asm_name_for(sym_asm_name(s)));
+    fprintf(g_emit_sink.stream, "\tld de,%s\n", asm_name_for(sym_asm_name(s)));
+    emit("\tadd hl,de\n");
+    return 1;
+}
+
+static int emit_runtime_pointer_array_stride(struct Sym *s)
+{
+    struct Sym *stride;
+    int elem;
+
+    if (s == NULL || s->runtime_stride_name[0] == 0)
+        return 0;
+
+    stride = find_sym(s->runtime_stride_name);
+    if (stride == NULL)
+        return 0;
+
+    emit("\tpush hl\n");
+    emit_load_sym_de_direct(stride);
+    emit("\tpop hl\n");
+    gen_binop_typed('*', TYPE_INT);
+    elem = type_size(type_decay_ptr(s->type));
+    if (elem <= 0)
+        elem = 2;
+    scale_hl_by_elem_size(elem);
+    return 1;
+}
+
+/* Sibling of emit_array_symbase_index above, for a PLAIN POINTER variable
+ * base (not a true array) that is directly loadable - an ix-relative
+ * local/param or a global/extern word. Same principle, adapted: the base
+ * here is a VALUE that must be loaded (not a compile-time address), so
+ * evaluate the index first into HL, then load the base directly into DE
+ * with emit_load_sym_de_direct and add - instead of the generic sequence's
+ * `push hl` (protecting the just-loaded base) while evaluating the index,
+ * needed only when the base itself requires a nontrivial reload.
+ *
+ * Found via fint.c's `OP_CALL`/`OP_RET` cases (`lcrs[lcrp++] = in + 1;`,
+ * `in = lcrs[--lcrp];`) - the recursive-call return-stack push/pop, hit on
+ * every minimax recursion in the ttt.f benchmark (the single largest
+ * remaining dcc-vs-sdcc gap in the whole interpreter benchmark suite,
+ * ~55% slower). idx++/idx-- itself already compiles efficiently (see
+ * try_emit_post_update_sym_direct/emit_incdec_sym_direct) - the waste was
+ * purely the EXTRA push/pop this function elides, protecting the base
+ * pointer's value across an index evaluation that never needed it live.
+ *
+ * Returns 1 when it emitted the whole first-subscript address (HL = base
+ * value + idx*elem); 0 when the caller should fall back (constant index,
+ * base is a true array, or base isn't directly loadable). */
+static int emit_pointer_symbase_index(struct Sym *s, const struct AstNode *idx,
+                                      int elem)
+{
+    if (s == NULL || s->is_array)
+        return 0;
+    if (!sym_can_ix_direct(s) && !is_global_word_sym(s))
+        return 0;
+    if (idx == NULL || idx->kind == AST_INT_LIT)
+        return 0;                        /* constant index: add-const path is fine */
+    gen_index_subscript_expr_ast(idx);   /* index -> HL */
+    if (!emit_runtime_pointer_array_stride(s))
+        scale_hl_by_elem_size(elem);     /* index * elem */
+    emit_load_sym_de_direct(s);          /* base value -> DE, HL untouched */
     emit("\tadd hl,de\n");
     return 1;
 }
@@ -2091,9 +3288,50 @@ void gen_index_addr_ast(const struct AstNode *n, int *out_val_type)
     int fa_dimc = 0;
     int fa_dims[4];
     int di;
+    long const_index;
 
     for (di = 0; di < 4; ++di)
         fa_dims[di] = 0;
+
+    /* `base[idx++]` / `base[--idx]` / `base[idx-K]` / `base[idx+K]` (a plain
+     * variable, adjusted by inc/dec or a constant offset, used directly as
+     * the subscript) where base is a bare identifier resolving to a
+     * directly-loadable, non-array pointer variable (ix-relative local/param
+     * or a global/extern word): see emit_pointer_symbase_index - evaluates
+     * idx first, then loads base straight into DE, instead of the base-
+     * first/push/pop order every branch below (including this same shape's
+     * own fallback further down) otherwise uses. Motivating shapes, both
+     * from fint.c's VM data-stack access (hit on nearly every opcode of
+     * every interpreted Forth word): `lcrs[lcrp++] = in + 1;` (push) and
+     * `lst[lsp-1] += _t;` (`OP_ADD` et al.'s compound-assign to the stack's
+     * top element, `lsp` the stack pointer).
+     *
+     * Deliberately narrow to inc/dec-or-fixed-offset-of-a-bare-identifier,
+     * NOT any non-constant index: a plain loop variable alone (`b[i]` in a
+     * counting loop) matched an earlier, broader version of this check too,
+     * and reordering it broke several of dccpeep's cross-ITERATION loop-
+     * hoisting passes (the invariant base load they hoist out of the loop
+     * entirely is a bigger win than this single-access push/pop elision,
+     * and their pattern-matching is tuned to the base-first shape) - a real
+     * performance regression (tbig -37%) caught by the full suite's
+     * perf-baseline check, not anticipated up front. `idx+K`/`idx-K` keeps
+     * `idx` itself as a required, non-optional operand of the index
+     * expression (unlike a bare `i`), so it does not newly match that same
+     * loop-counter shape - re-verified against the same full-suite check
+     * that caught the original regression before landing this. */
+    if (n->a != NULL && n->a->kind == AST_IDENT && n->b != NULL &&
+        ((n->b->kind == AST_POSTFIX && (n->b->op == TOK_INC || n->b->op == TOK_DEC)) ||
+         (n->b->kind == AST_UNARY && (n->b->op == TOK_INC || n->b->op == TOK_DEC)) ||
+         (n->b->kind == AST_BINARY && (n->b->op == '+' || n->b->op == '-') &&
+          n->b->a->kind == AST_IDENT && n->b->b->kind == AST_INT_LIT))) {
+        struct Sym *base_sym = find_sym(n->a->sval);
+        if (base_sym != NULL &&
+            emit_pointer_symbase_index(base_sym, n->b,
+                                       sym_pointer_array_index_elem_size(base_sym, base_sym->type, 0))) {
+            *out_val_type = type_decay_ptr(base_sym->type);
+            return;
+        }
+    }
 
     if (ast_index_reversed_pointer_expr_elem_type(n, &val_type)) {
         gen_pointer_expr_ast(n->b, &cur_type, &no_deref);
@@ -2113,7 +3351,7 @@ void gen_index_addr_ast(const struct AstNode *n, int *out_val_type)
     }
 
     if (ast_index_symbol_nd_addressable_addr(n)) {
-        const struct AstNode *idxs[8];
+        const struct AstNode *idxs[MAX_INDEX_DEPTH];
         struct Sym *ns;
         int count;
         int idx;
@@ -2142,7 +3380,8 @@ void gen_index_addr_ast(const struct AstNode *n, int *out_val_type)
             } else {
                 emit("\tpush hl\n");
                 gen_index_subscript_expr_ast(idxs[idx]);
-                scale_hl_by_elem_size(elem_size);
+                if (!(idx == 0 && emit_runtime_pointer_array_stride(ns)))
+                    scale_hl_by_elem_size(elem_size);
                 emit("\tex de,hl\n");
                 emit("\tpop hl\n");
                 emit("\tadd hl,de\n");
@@ -2155,7 +3394,7 @@ void gen_index_addr_ast(const struct AstNode *n, int *out_val_type)
     }
 
     {
-        const struct AstNode *idxs[8];
+        const struct AstNode *idxs[MAX_INDEX_DEPTH];
         const struct AstNode *base;
         struct Sym *ps;
         int count;
@@ -2177,7 +3416,8 @@ void gen_index_addr_ast(const struct AstNode *n, int *out_val_type)
                 } else {
                     emit("\tpush hl\n");
                     gen_index_subscript_expr_ast(idxs[idx]);
-                    scale_hl_by_elem_size(elem_size);
+                    if (!(idx == 0 && emit_runtime_pointer_array_stride(ps)))
+                        scale_hl_by_elem_size(elem_size);
                     emit("\tex de,hl\n");
                     emit("\tpop hl\n");
                     emit("\tadd hl,de\n");
@@ -2321,10 +3561,61 @@ void gen_index_addr_ast(const struct AstNode *n, int *out_val_type)
     } else {
         s = find_sym(n->a->sval);
 
+        /* One-dimensional global/static array with a non-constant subscript:
+         * take the same symbol-base fast path the N-dimensional branch above
+         * already uses for its first subscript (see emit_array_symbase_index).
+         * That branch is gated on ast_index_symbol_nd_collect, which requires
+         * `count >= 2`, so a plain `arr[i]` - by far the most common array
+         * access in C - could never reach it and always fell through to the
+         * base-first `push hl / ex de,hl / pop hl` round-trip below.
+         *
+         * The base is a link-time constant, so evaluating the index first
+         * costs nothing and lets the base go straight into DE:
+         *
+         *     ld hl,SYM / push hl / <index> / add hl,hl        95 T-states
+         *     / ex de,hl / pop hl / add hl,de
+         *  => <index> / add hl,hl / ld de,SYM / add hl,de      70 T-states
+         *
+         * The peephole cannot do this itself: a relocatable symbol is not a
+         * foldable literal, so its const folds skip the load entirely.
+         *
+         * Restricted to arrays (emit_array_symbase_index rejects anything
+         * else, including a frame-relative SC_LOCAL/SC_PARAM base, whose
+         * address is not a constant). A pointer base deliberately keeps the
+         * base-first shape - see the emit_pointer_symbase_index call at the
+         * top of this function for why reordering that one regressed tbig by
+         * 37%: dccpeep's cross-iteration hoisting passes hoist an invariant
+         * pointer RELOAD out of the loop, which beats this elision. An array
+         * base has no reload to hoist - it is one `ld hl,SYM` - so there is
+         * no such trade here.
+         *
+         * A subscript that FOLDS to a constant is excluded even though it is
+         * not an AST_INT_LIT node (those emit_array_symbase_index rejects by
+         * itself).  For a constant offset the base-first order is strictly
+         * better: dccpeep's fold_hl_base_const_offset rewrites the whole
+         * `ld hl,SYM / push hl / <const> / ... / add hl,de` run into a single
+         * `ld hl,SYM+K`, which no reordering can beat.  Index-first hides the
+         * constant behind `ld de,SYM` and defeats that fold - measured as the
+         * only regressions this change produced (tcptrarr, tinlnpar cycles
+         * and tsyntax size), all of them constant subscripts. */
+        if (s != NULL && s->is_array && n->b != NULL &&
+            !ast_const_fold_strict(n->b, &const_index) &&
+            emit_array_symbase_index(s, n->b, sym_array_index_elem_size(s, 0))) {
+            *out_val_type = s->type;
+            return;
+        }
+
         /* Base load: a global pointer immediately subscripted loads its value with
-         * a direct ld hl,(nn); arrays and local pointers load their address. */
-        if (is_global_word_sym(s) && !s->is_array && type_ptr_depth(s->type) > 0) {
+         * a direct ld hl,(nn); an ix-direct local/param pointer loads its value
+         * directly too (ld l,(ix+d)/ld h,(ix+d+1)) instead of computing its
+         * frame address and then dereferencing it; arrays and any other
+         * pointer load their address. */
+        if (is_global_word_sym(s) && !s->is_array &&
+            type_ptr_depth(s->type) > 0) {
             emit_load_global_word_direct(s);
+            global_ptr_preloaded = 1;
+        } else if (!s->is_array && type_ptr_depth(s->type) > 0 && sym_can_ix_direct(s)) {
+            emit_load_sym_value_direct(s);
             global_ptr_preloaded = 1;
         } else {
             emit_load_sym_addr(s);
@@ -2384,7 +3675,7 @@ void gen_index_ast(const struct AstNode *n)
     int val_type;
 
     gen_index_addr_ast(n, &val_type);
-    g_expr_type = val_type;
+    g_expr.type = val_type;
     emit_load_from_hl(val_type);
     if (current_field_bit_width > 0)
         emit_extract_bitfield();
@@ -2393,11 +3684,14 @@ void gen_index_ast(const struct AstNode *n)
 void gen_call_star_indirect_ast(const struct AstNode *n)
 {
     const struct AstNode *base;
+    struct Sym *proto;
+    int callee_type;
     int arg_bytes;
     int old_dead;
     int i;
 
     base = ast_call_star_indirect_base(n);
+    proto = ast_indirect_call_proto_sym(n);
     arg_bytes = 0;
 
     old_dead = expr_result_dead;
@@ -2407,24 +3701,44 @@ void gen_call_star_indirect_ast(const struct AstNode *n)
         if (!ast_index_lvalue_elem_type(base, &elem_type) ||
             type_ptr_depth(elem_type) <= 0 || type_size(elem_type) != 2)
             elem_type = TYPE_INT | TYPE_PTR;
+        callee_type = elem_type;
         gen_index_addr_ast(base, &elem_type);
         emit_load_from_hl(elem_type);
-        g_expr_type = elem_type;
+        g_expr.type = elem_type;
     } else {
         ast_gen_expr(base);
+        callee_type = g_expr.type;
     }
     emit("\tpush hl\n");
     for (i = n->list_len - 1; i >= 0; --i) {
         int actual_type;
+        int want_type;
+        int have_want;
         int ptr_type;
         int no_deref;
 
+        have_want = expected_arg_type(proto, i, &want_type);
         if (ast_pointer_expr_type(n->list[i], &ptr_type, &no_deref))
             gen_pointer_expr_ast(n->list[i], &ptr_type, &no_deref);
         else
             ast_gen_expr(n->list[i]);
-        actual_type = g_expr_type;
-        if (type_is_long(actual_type) || type_is_float(actual_type)) {
+        actual_type = g_expr.type;
+        if (have_want && type_is_float(want_type)) {
+            if (!type_is_float(actual_type))
+                emit_convert_int_to_float(actual_type);
+            emit("\tpush de\n\tpush hl\n");
+            arg_bytes += 4;
+        } else if (have_want && type_is_long(want_type)) {
+            if (!type_is_long(actual_type))
+                emit_promote_int_to_long(actual_type, want_type);
+            emit("\tpush de\n\tpush hl\n");
+            arg_bytes += 4;
+        } else if (have_want) {
+            if (type_is_float(actual_type))
+                emit_convert_float_to_intlike(want_type);
+            emit("\tpush hl\n");
+            arg_bytes += 2;
+        } else if (type_is_long(actual_type) || type_is_float(actual_type)) {
             emit("\tpush de\n\tpush hl\n");
             arg_bytes += 4;
         } else {
@@ -2436,8 +3750,8 @@ void gen_call_star_indirect_ast(const struct AstNode *n)
 
     emit_call_hl_from_stack_offset(arg_bytes);
     emit_cleanup_stack_bytes(arg_bytes + 2);
-    g_expr_type = TYPE_INT;
-    g_long_from16 = 0;
+    g_expr.type = type_decay_ptr(callee_type);
+    g_expr.long_from16 = 0;
 }
 
 /* Emit a direct named call `f(a, b, ...)`: the C89 implicit-declaration side
@@ -2483,35 +3797,62 @@ static const struct AstNode *inline_substitution_body(struct Sym *fn)
     return fn->inline_stmt_body;
 }
 
-static int inline_expr_contains_inline_call(const struct AstNode *n)
+/* Direct substitution may skip, duplicate, or move an argument into the
+ * callee body. That is safe only when the expression depends entirely on
+ * constants and caller-local automatic objects that the body cannot reach.
+ * Everything else is evaluated once into a temp before body generation,
+ * exactly as for a real call. */
+static int inline_arg_is_body_independent(const struct AstNode *n)
 {
+    struct Sym *s;
     int i;
 
     if (n == NULL)
-        return 0;
-    if (n->kind == AST_CALL && n->a != NULL && n->a->kind == AST_IDENT) {
-        struct Sym *s;
-        s = find_global(n->a->sval);
-        if (s != NULL && s->is_static && s->is_inline && inline_substitution_body(s) != NULL)
-            return 1;
-    }
-    if (inline_expr_contains_inline_call(n->a) || inline_expr_contains_inline_call(n->b) ||
-        inline_expr_contains_inline_call(n->c) || inline_expr_contains_inline_call(n->d))
         return 1;
-    for (i = 0; i < n->list_len; ++i)
-        if (inline_expr_contains_inline_call(n->list[i]))
+    switch (n->kind) {
+    case AST_INT_LIT:
+    case AST_FLOAT_LIT:
+    case AST_STR_LIT:
+    case AST_SIZEOF_EXPR:
+    case AST_SIZEOF_TYPE:
+        return 1;
+    case AST_IDENT:
+        if (find_enum_const(n->sval) >= 0)
             return 1;
-    return 0;
+        s = find_local(n->sval);
+        return s != NULL && !s->is_static && !s->is_volatile &&
+               (s->storage == SC_LOCAL || s->storage == SC_PARAM) &&
+               local_name_address_taken_in_function(n->sval) == 0;
+    case AST_UNARY:
+        if (n->op == '*' || n->op == TOK_INC || n->op == TOK_DEC)
+            return 0;
+        break;
+    case AST_BINARY:
+    case AST_LOGAND:
+    case AST_LOGOR:
+    case AST_COMMA:
+    case AST_COND:
+    case AST_CAST:
+        break;
+    default:
+        return 0;
+    }
+    if (!inline_arg_is_body_independent(n->a) ||
+        !inline_arg_is_body_independent(n->b) ||
+        !inline_arg_is_body_independent(n->c) ||
+        !inline_arg_is_body_independent(n->d))
+        return 0;
+    for (i = 0; i < n->list_len; ++i)
+        if (!inline_arg_is_body_independent(n->list[i]))
+            return 0;
+    return 1;
 }
 
-static int inline_call_needs_arg_temps(const struct AstNode *n, struct Sym *fn)
+static int inline_arg_needs_temp(const struct AstNode *n, int use_count)
 {
-    int i;
-
-    for (i = 0; i < n->list_len; ++i)
-        if (fn->inline_param_use_count[i] > 1 && !inline_arg_reusable(n->list[i]))
-            return 1;
-    return 0;
+    if (!inline_arg_is_body_independent(n))
+        return 1;
+    return use_count > 1 && !inline_arg_reusable(n);
 }
 
 static void emit_inline_arg_temp_store(struct Sym *tmp, const struct AstNode *arg,
@@ -2521,13 +3862,12 @@ static void emit_inline_arg_temp_store(struct Sym *tmp, const struct AstNode *ar
     int ptr_type;
     int no_deref;
 
-    tmp->type = want_type;
     if (ast_pointer_expr_type(arg, &ptr_type, &no_deref))
         gen_pointer_expr_ast(arg, &ptr_type, &no_deref);
     else
         ast_gen_expr(arg);
 
-    actual_type = g_expr_type;
+    actual_type = g_expr.type;
     if (type_is_float(actual_type))
         emit_convert_float_to_intlike(want_type);
     else if (type_size(want_type) > 1 && !type_is_long(actual_type))
@@ -2535,37 +3875,118 @@ static void emit_inline_arg_temp_store(struct Sym *tmp, const struct AstNode *ar
     emit_store_hl_to_sym_direct(tmp);
 }
 
-static int emit_inline_arg_temps(const struct AstNode *n, struct Sym *fn,
-                                 const char **temp_names,
-                                 char temp_name_buf[MAX_PROTO_PARAMS][64])
+static unsigned long g_inline_live_temp_mask;
+
+/* The one local declaration the currently-expanding inline call's callee
+ * captured (see struct Sym's inline_local_* fields, dcc_func.c's
+ * try_scan_inline_local_decl), and the #itmpN temp name it was
+ * materialized into for THIS call site - NULL/NULL when no such local is
+ * active. clone_inline_expr checks these directly rather than taking them
+ * as parameters (avoiding threading two more arguments through its six
+ * recursive call sites), the same "scoped mutable state around one bounded
+ * recursive expansion" shape g_inline_live_temp_mask/g_inline_expand_depth
+ * below already use. Save/restore around a nested expansion (the local's
+ * own initializer, or a call inside another inline call's argument) is
+ * required for correctness: without it, an outer local's name would keep
+ * shadowing an inner, unrelated identical parameter name, or an inner
+ * call's cloning would wrongly see an outer local that isn't in scope for
+ * it at all. */
+static const char *g_inline_local_src_name;
+static const char *g_inline_local_temp_name;
+
+static int prepare_inline_arg_temps(
+    const struct AstNode *n, struct Sym *fn,
+    const char **temp_names,
+    char temp_name_buf[MAX_PROTO_PARAMS][64],
+    int emit_values)
 {
+    struct Sym *temp_syms[MAX_PROTO_PARAMS];
+    int temp_types[MAX_PROTO_PARAMS];
     int i;
+    unsigned long unavailable;
+    unsigned long current_mask;
 
-    if (inline_expr_contains_inline_call(inline_substitution_body(fn)))
-        return 0;
+    unavailable = g_inline_live_temp_mask;
+    current_mask = 0;
+    for (i = 0; i < n->list_len; ++i)
+        temp_syms[i] = NULL;
 
+    /* Per-parameter, not per-call: see inline_arg_needs_temp for the two
+     * independent reasons a parameter's argument needs a temp (it may have
+     * a side effect that could reorder against the callee's own, or it's
+     * reused and not cheap to re-evaluate) - a parameter matching neither
+     * never needs a temp, regardless of what else in this call needed one,
+     * and substituting it directly instead of routing it through a temp
+     * preserves its compile-time-constant-ness for arithmetic in the
+     * inlined body (e.g. a literal element-size argument multiplying an
+     * index can still fold to a shift) - routing every parameter through a
+     * temp regardless of need was silently defeating that folding for any
+     * call where a completely unrelated parameter happened to need
+     * protecting. */
     for (i = 0; i < n->list_len; ++i) {
         struct Sym *tmp;
         int want_type;
+        int slot;
 
-        inline_temp_name_for_call(temp_name_buf[i], 64, i);
+        if (!inline_arg_needs_temp(n->list[i], fn->inline_param_use_count[i]))
+            continue;
+
+        slot = i;
+        if ((unavailable & (1UL << slot)) != 0) {
+            for (slot = 0; slot < MAX_PROTO_PARAMS; ++slot)
+                if ((unavailable & (1UL << slot)) == 0)
+                    break;
+            if (slot >= MAX_PROTO_PARAMS)
+                return 0;
+        }
+        unavailable |= 1UL << slot;
+        current_mask |= 1UL << slot;
+        inline_temp_name_for_call(temp_name_buf[i], 64, slot);
         tmp = find_local(temp_name_buf[i]);
         if (tmp == NULL)
             return 0;
         want_type = fn->proto_types[i] ? fn->proto_types[i] : TYPE_INT;
-        if (type_size(want_type) != 2 || type_is_float(want_type) || type_is_long(want_type))
+        /* reserve_inline_temp_locals always reserves 2 bytes for every
+         * #itmpN slot (it can't know the eventual parameter type - that's
+         * this function's job, called far later, once per actual call
+         * site), so a 1-byte want_type just leaves the slot's second byte
+         * unused; emit_store_hl_to_sym_direct and the later read through
+         * this same symbol both already switch on type_size(s->type)
+         * themselves for every size they support, 1 included. */
+        if ((type_size(want_type) != 2 && type_size(want_type) != 1) ||
+            type_is_float(want_type) || type_is_long(want_type))
             return 0;
-        tmp->type = want_type;
+        temp_syms[i] = tmp;
+        temp_types[i] = want_type;
+    }
+
+    /* Commit shared symbol metadata only after every requested slot has
+     * passed validation. A failed nested expansion then falls back to a real
+     * call without leaving a partially retagged #itmp symbol behind. */
+    for (i = 0; i < n->list_len; ++i) {
+        if (temp_syms[i] == NULL)
+            continue;
+        temp_syms[i]->type = temp_types[i];
         temp_names[i] = temp_name_buf[i];
     }
 
+    /* Reserve every selected slot while arguments are evaluated. A nested
+     * inline expansion then allocates from the remaining #itmp slots, so it
+     * cannot overwrite either an already-materialized argument or a slot
+     * this call will materialize later. All 16 slots already exist in the
+     * frame; this remapping adds no runtime instructions or frame bytes. */
+    g_inline_live_temp_mask |= current_mask;
     for (i = n->list_len - 1; i >= 0; --i) {
-        struct Sym *tmp;
-        int want_type;
-
-        tmp = find_local(temp_name_buf[i]);
-        want_type = fn->proto_types[i] ? fn->proto_types[i] : TYPE_INT;
-        emit_inline_arg_temp_store(tmp, n->list[i], want_type);
+        if (temp_names[i] == NULL)
+            continue;
+        if (emit_values) {
+            emit_inline_arg_temp_store(
+                temp_syms[i], n->list[i], temp_types[i]);
+            if (fn->inline_param_use_count[i] == 1)
+                emit(";@dcc-inline-temp-single-use\n");
+        } else {
+            ast_process_expr_metadata(n->list[i]);
+        }
     }
     return 1;
 }
@@ -2581,6 +4002,13 @@ static struct AstNode *clone_inline_expr(struct AstArena *ar, struct Sym *fn,
     if (src == NULL)
         return NULL;
     if (src->kind == AST_IDENT) {
+        if (g_inline_local_src_name != NULL && !strcmp(src->sval, g_inline_local_src_name)) {
+            dst = ast_new(ar, AST_IDENT);
+            dst->type = src->type;
+            dst->sval = ast_arena_strdup(ar, g_inline_local_temp_name);
+            dst->line = src->line;
+            return dst;
+        }
         i = inline_param_index_for_call(fn, src->sval);
         if (i >= 0 && i < call->list_len && temp_names != NULL && temp_names[i] != NULL) {
             dst = ast_new(ar, AST_IDENT);
@@ -2600,7 +4028,12 @@ static struct AstNode *clone_inline_expr(struct AstArena *ar, struct Sym *fn,
     dst->uval = src->uval;
     dst->str_index = src->str_index;
     dst->sym = src->sym;
-    dst->sval = src->sval ? ast_arena_strdup(ar, src->sval) : NULL;
+    if (src->sval == NULL)
+        dst->sval = NULL;
+    else if (src->kind == AST_STR_LIT)
+        dst->sval = ast_arena_memdup(ar, src->sval, (int)src->uval);
+    else
+        dst->sval = ast_arena_strdup(ar, src->sval);
     dst->peek_type = src->peek_type;
     dst->line = src->line;
 
@@ -2613,6 +4046,68 @@ static struct AstNode *clone_inline_expr(struct AstArena *ar, struct Sym *fn,
     return dst;
 }
 
+/* Materializes fn's captured local declaration (struct Sym's
+ * inline_local_* fields, populated by dcc_func.c's
+ * try_scan_inline_local_decl) into a fresh #itmpN slot for THIS call site,
+ * the same way emit_inline_arg_temps already does for a real parameter
+ * that needs one - reusing the identical slot-picking/liveness-tracking
+ * (g_inline_live_temp_mask) so it can't collide with a slot a real
+ * parameter, or a nested inline expansion, is using at the same time.
+ * Always forces a temp (never substitutes the initializer expression
+ * directly at each use): the entire reason a local gets captured at all is
+ * to read something more than once without recomputing it. Returns 0
+ * (nothing emitted) only if out of #itmpN slots - the caller then falls
+ * back to a real, non-inlined call, exactly like emit_inline_arg_temps's
+ * own failure path. temp_name_buf is caller-owned and must outlive the
+ * g_inline_local_temp_name assignment the caller makes from it. */
+static int prepare_inline_local_temp(
+    struct Sym *fn, const struct AstNode *call,
+    const char **temp_names, char temp_name_buf[64],
+    int emit_values)
+{
+    struct AstNode *init_substituted;
+    struct Sym *tmp;
+    int slot;
+    const char *save_src_name;
+    const char *save_temp_name;
+
+    slot = fn->proto_nargs;
+    if ((g_inline_live_temp_mask & (1UL << slot)) != 0) {
+        for (slot = 0; slot < MAX_PROTO_PARAMS; ++slot)
+            if ((g_inline_live_temp_mask & (1UL << slot)) == 0)
+                break;
+        if (slot >= MAX_PROTO_PARAMS)
+            return 0;
+    }
+
+    /* The local's own initializer can only reference real parameters (see
+     * try_scan_inline_local_decl / inline_expr_is_simple), never the local
+     * itself, so no local-name substitution is active while cloning it -
+     * and it must not see whatever OUTER local (if any) is currently
+     * active either. */
+    save_src_name = g_inline_local_src_name;
+    save_temp_name = g_inline_local_temp_name;
+    g_inline_local_src_name = NULL;
+    g_inline_local_temp_name = NULL;
+    init_substituted = clone_inline_expr(&g_ast_arena, fn, fn->inline_local_init, call, temp_names);
+    g_inline_local_src_name = save_src_name;
+    g_inline_local_temp_name = save_temp_name;
+
+    inline_temp_name_for_call(temp_name_buf, 64, slot);
+    tmp = find_local(temp_name_buf);
+    if (tmp == NULL)
+        return 0;
+    tmp->type = fn->inline_local_type;
+
+    g_inline_live_temp_mask |= 1UL << slot;
+    if (emit_values)
+        emit_inline_arg_temp_store(
+            tmp, init_substituted, fn->inline_local_type);
+    else
+        ast_process_expr_metadata(init_substituted);
+    return 1;
+}
+
 static int g_inline_expand_depth;
 
 static int try_gen_inline_call_ast(const struct AstNode *n, struct Sym *fn_sym)
@@ -2622,9 +4117,13 @@ static int try_gen_inline_call_ast(const struct AstNode *n, struct Sym *fn_sym)
     const struct AstNode *src_expr;
     const char *temp_names[MAX_PROTO_PARAMS];
     char temp_name_buf[MAX_PROTO_PARAMS][64];
+    char local_temp_buf[64];
     int i;
+    unsigned long old_live_mask;
+    const char *old_local_src_name;
+    const char *old_local_temp_name;
 
-    if (fn_sym == NULL || !fn_sym->is_static || !fn_sym->is_inline ||
+    if (opt_debug || fn_sym == NULL || !fn_sym->is_static || !fn_sym->is_inline ||
         inline_substitution_body(fn_sym) == NULL)
         return 0;
     if ((fn_sym->inline_stmt_expr != NULL || fn_sym->inline_stmt_body != NULL) &&
@@ -2634,27 +4133,136 @@ static int try_gen_inline_call_ast(const struct AstNode *n, struct Sym *fn_sym)
         return 0;
     if (n->list_len != fn_sym->proto_nargs || n->list_len > MAX_PROTO_PARAMS)
         return 0;
-    for (i = 0; i < MAX_PROTO_PARAMS; ++i)
+    for (i = 0; i < MAX_PROTO_PARAMS; ++i) {
         temp_names[i] = NULL;
+    }
 
-    if (inline_call_needs_arg_temps(n, fn_sym) &&
-        !emit_inline_arg_temps(n, fn_sym, temp_names, temp_name_buf))
+    old_live_mask = g_inline_live_temp_mask;
+    if (!prepare_inline_arg_temps(
+            n, fn_sym, temp_names, temp_name_buf, 1))
         return 0;
+
+    old_local_src_name = g_inline_local_src_name;
+    old_local_temp_name = g_inline_local_temp_name;
+    if (fn_sym->has_inline_local) {
+        if (!prepare_inline_local_temp(
+                fn_sym, n, temp_names, local_temp_buf, 1)) {
+            g_inline_live_temp_mask = old_live_mask;
+            return 0;
+        }
+        g_inline_local_src_name = fn_sym->inline_local_name;
+        g_inline_local_temp_name = local_temp_buf;
+    } else {
+        g_inline_local_src_name = NULL;
+        g_inline_local_temp_name = NULL;
+    }
 
     g_inline_expand_depth++;
     src_expr = inline_substitution_body(fn_sym);
     if (fn_sym->inline_stmt_body != NULL) {
         stmt = clone_inline_expr(&g_ast_arena, fn_sym, src_expr, n, temp_names);
-        ast_gen_stmt(stmt);
+        ast_process_stmt_metadata(stmt);
     } else {
         expr = clone_inline_expr(&g_ast_arena, fn_sym, src_expr, n, temp_names);
         ast_gen_expr(expr);
     }
     g_inline_expand_depth--;
-    g_expr_type = (fn_sym->inline_stmt_expr != NULL || fn_sym->inline_stmt_body != NULL) ?
+    g_inline_live_temp_mask = old_live_mask;
+    g_inline_local_src_name = old_local_src_name;
+    g_inline_local_temp_name = old_local_temp_name;
+    g_expr.type = (fn_sym->inline_stmt_expr != NULL || fn_sym->inline_stmt_body != NULL) ?
                   TYPE_VOID : fn_sym->type;
-    g_long_from16 = 0;
+    g_expr.long_from16 = 0;
     return 1;
+}
+
+int ast_process_inline_call_metadata(
+    const struct AstNode *n, int result_dead)
+{
+    struct Sym *fn_sym;
+    struct AstNode *body;
+    const struct AstNode *source;
+    const char *temp_names[MAX_PROTO_PARAMS];
+    char temp_name_buf[MAX_PROTO_PARAMS][64];
+    char local_temp_buf[64];
+    unsigned long old_live_mask;
+    const char *old_local_src_name;
+    const char *old_local_temp_name;
+    int i;
+
+    if (n == NULL || n->kind != AST_CALL ||
+        n->a == NULL || n->a->kind != AST_IDENT)
+        return 0;
+    fn_sym = find_global(n->a->sval);
+    if (opt_debug || fn_sym == NULL || !fn_sym->is_static ||
+        !fn_sym->is_inline ||
+        inline_substitution_body(fn_sym) == NULL)
+        return 0;
+    if ((fn_sym->inline_stmt_expr != NULL ||
+         fn_sym->inline_stmt_body != NULL) &&
+        !result_dead)
+        return 0;
+    if (g_inline_expand_depth >= 8 ||
+        n->list_len != fn_sym->proto_nargs ||
+        n->list_len > MAX_PROTO_PARAMS)
+        return 0;
+    for (i = 0; i < MAX_PROTO_PARAMS; ++i)
+        temp_names[i] = NULL;
+
+    old_live_mask = g_inline_live_temp_mask;
+    if (!prepare_inline_arg_temps(
+            n, fn_sym, temp_names, temp_name_buf, 0))
+        return 0;
+
+    old_local_src_name = g_inline_local_src_name;
+    old_local_temp_name = g_inline_local_temp_name;
+    if (fn_sym->has_inline_local) {
+        if (!prepare_inline_local_temp(
+                fn_sym, n, temp_names, local_temp_buf, 0)) {
+            g_inline_live_temp_mask = old_live_mask;
+            return 0;
+        }
+        g_inline_local_src_name = fn_sym->inline_local_name;
+        g_inline_local_temp_name = local_temp_buf;
+    } else {
+        g_inline_local_src_name = NULL;
+        g_inline_local_temp_name = NULL;
+    }
+
+    ++g_inline_expand_depth;
+    source = inline_substitution_body(fn_sym);
+    body = clone_inline_expr(
+        &g_ast_arena, fn_sym, source, n, temp_names);
+    if (fn_sym->inline_stmt_body != NULL)
+        ast_process_stmt_metadata(body);
+    else
+        ast_process_expr_metadata(body);
+    --g_inline_expand_depth;
+
+    g_inline_live_temp_mask = old_live_mask;
+    g_inline_local_src_name = old_local_src_name;
+    g_inline_local_temp_name = old_local_temp_name;
+    return 1;
+}
+
+/* Evaluate one fastcall argument the same way the general per-argument
+ * call-evaluation loop below does: a pointer-typed expression (an array
+ * decaying to its address, e.g. `names[nn++]` from a 2D array) must go
+ * through gen_pointer_expr_ast, not plain ast_gen_expr, or it gets
+ * evaluated as a value-context dereference instead of an address - a real
+ * miscompile (crash: "not-implemented z80 instruction 0xdd") caught by a
+ * strcpy(names[nn++], text) call in tests/pint.c's identifier table,
+ * which every fastcall special case below had been skipping since none of
+ * their own hand-written tests happened to pass a 2D-array-row argument. */
+static void gen_fastcall_arg(const struct AstNode *arg)
+{
+    int ptr_type;
+    int no_deref;
+
+    if (ast_pointer_expr_type(arg, &ptr_type, &no_deref))
+        gen_pointer_expr_ast(arg, &ptr_type, &no_deref);
+    else
+        ast_gen_expr(arg);
 }
 
 void gen_call_ast(const struct AstNode *n)
@@ -2673,21 +4281,41 @@ void gen_call_ast(const struct AstNode *n)
     if (ast_call_indirect_supported(n)) {
         int callee_type;
         int no_deref;
+        struct Sym *proto;
+        proto = ast_indirect_call_proto_sym(n);
         gen_pointer_expr_ast(n->a, &callee_type, &no_deref);
         emit("\tpush hl\n");
         old_dead = expr_result_dead;
         expr_result_dead = 0;
         for (i = n->list_len - 1; i >= 0; --i) {
             int actual_type;
+            int want_type;
+            int have_want;
             int ptr_type;
             int arg_no_deref;
 
+            have_want = expected_arg_type(proto, i, &want_type);
             if (ast_pointer_expr_type(n->list[i], &ptr_type, &arg_no_deref))
                 gen_pointer_expr_ast(n->list[i], &ptr_type, &arg_no_deref);
             else
                 ast_gen_expr(n->list[i]);
-            actual_type = g_expr_type;
-            if (type_is_long(actual_type) || type_is_float(actual_type)) {
+            actual_type = g_expr.type;
+            if (have_want && type_is_float(want_type)) {
+                if (!type_is_float(actual_type))
+                    emit_convert_int_to_float(actual_type);
+                emit("\tpush de\n\tpush hl\n");
+                arg_bytes += 4;
+            } else if (have_want && type_is_long(want_type)) {
+                if (!type_is_long(actual_type))
+                    emit_promote_int_to_long(actual_type, want_type);
+                emit("\tpush de\n\tpush hl\n");
+                arg_bytes += 4;
+            } else if (have_want) {
+                if (type_is_float(actual_type))
+                    emit_convert_float_to_intlike(want_type);
+                emit("\tpush hl\n");
+                arg_bytes += 2;
+            } else if (type_is_long(actual_type) || type_is_float(actual_type)) {
                 emit("\tpush de\n\tpush hl\n");
                 arg_bytes += 4;
             } else {
@@ -2697,8 +4325,8 @@ void gen_call_ast(const struct AstNode *n)
         }
         expr_result_dead = old_dead;
         emit_call_hl_from_stack_offset(arg_bytes);
-        g_expr_type = type_decay_ptr(callee_type);
-        g_long_from16 = 0;
+        g_expr.type = type_decay_ptr(callee_type);
+        g_expr.long_from16 = 0;
         emit_cleanup_stack_bytes(arg_bytes + 2);
         return;
     }
@@ -2730,8 +4358,8 @@ void gen_call_ast(const struct AstNode *n)
             emit_store_de_to_addr_hl(ap->type);
         }
         emit("\tld hl,0\n");
-        g_expr_type = TYPE_INT;
-        g_long_from16 = 0;
+        g_expr.type = TYPE_INT;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -2751,11 +4379,11 @@ void gen_call_ast(const struct AstNode *n)
     if (n->list_len == 1 && !strcmp(name, "strlen")) {
         old_dead = expr_result_dead;
         expr_result_dead = 0;
-        ast_gen_expr(n->list[0]);       /* HL = s */
+        gen_fastcall_arg(n->list[0]);       /* HL = s */
         expr_result_dead = old_dead;
         emit_runtime_call("__slf");
-        g_expr_type = fn_sym->type;
-        g_long_from16 = 0;
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -2764,15 +4392,260 @@ void gen_call_ast(const struct AstNode *n)
     if (n->list_len == 2 && !strcmp(name, "strchr")) {
         old_dead = expr_result_dead;
         expr_result_dead = 0;
-        ast_gen_expr(n->list[0]);       /* HL = s */
+        gen_fastcall_arg(n->list[0]);       /* HL = s */
         emit("\tpush hl\n");
-        ast_gen_expr(n->list[1]);       /* HL = c */
+        gen_fastcall_arg(n->list[1]);       /* HL = c */
         expr_result_dead = old_dead;
         emit("\tld a,l\n");
         emit("\tpop hl\n");
         emit_runtime_call("__chf");
-        g_expr_type = fn_sym->type;
-        g_long_from16 = 0;
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall memcmp(s1,s2,n): DCCRTL's __cmpf takes s1 in DE, s2 in HL,
+     * n in BC directly - skipping both the general push-3-args/call/pop-3
+     * convention this call would otherwise use, and __mcmp's own ~20-
+     * instruction stack-argument-reconstruction prologue (see DCCRTL.MAC).
+     * Same rationale as strlen/strchr above, extended to three arguments:
+     * each earlier argument is pushed while the next is evaluated, then
+     * unwound directly into the target registers instead of the stack. */
+    if (n->list_len == 3 && !strcmp(name, "memcmp")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = s1 */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = s2 */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[2]);       /* HL = n */
+        expr_result_dead = old_dead;
+        emit("\tld b,h\n\tld c,l\n");   /* BC = n */
+        emit("\tpop hl\n");             /* HL = s2 */
+        emit("\tpop de\n");             /* DE = s1 */
+        emit_runtime_call("__cmpf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall memset(dest,c,count): DCCRTL's __msf takes dest in HL, the
+     * fill byte in E, count in BC directly - skipping the general
+     * push-3-args/call/pop-3 convention and __mset's own ~10-instruction
+     * stack-argument-reconstruction prologue (see DCCRTL.MAC). Same
+     * rationale as memcmp above. memset is common enough (buffer/struct
+     * zeroing) that this pays off broadly.
+     *
+     * Named __msf, not __msetf: M80 truncates public symbols to 6
+     * significant characters, and __msetf truncates to __MSET, colliding
+     * with __mset's own name (a real "%Mult. Def. Global __MSET" linker
+     * warning plus a miscompile - call sites got linked to __mset's
+     * stack-marshaling entry instead). */
+    if (n->list_len == 3 && !strcmp(name, "memset")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = dest */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = c */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[2]);       /* HL = count */
+        expr_result_dead = old_dead;
+        emit("\tld b,h\n\tld c,l\n");   /* BC = count */
+        emit("\tpop de\n");             /* E = fill byte (low byte of c) */
+        emit("\tpop hl\n");             /* HL = dest */
+        emit_runtime_call("__msf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall bdos(fn,dearg): DCCRTL's __bdosf takes fn's low byte in C and
+     * dearg in DE directly, skipping the general push-2-args/call/pop-2
+     * convention this call would otherwise use - same rationale as
+     * strlen/strchr/memcmp above. BDOS calls are frequent enough in CP/M
+     * programs (console/file I/O) that this pays off broadly. */
+    if (n->list_len == 2 && !strcmp(name, "bdos")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = fn */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = dearg */
+        expr_result_dead = old_dead;
+        emit("\tex de,hl\n");           /* DE = dearg */
+        emit("\tpop hl\n");             /* HL = fn */
+        emit("\tld c,l\n");             /* C = fn low byte */
+        emit_runtime_call("__bdosf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall bdoshl(fn,dearg): same shape as bdos above, but calls
+     * DCCRTL's __bhlf, which returns HL exactly as BDOS left it instead
+     * of zero-extending A into HL. For BDOS functions whose useful result
+     * is a 16-bit HL value rather than a byte in A. */
+    if (n->list_len == 2 && !strcmp(name, "bdoshl")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = fn */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = dearg */
+        expr_result_dead = old_dead;
+        emit("\tex de,hl\n");           /* DE = dearg */
+        emit("\tpop hl\n");             /* HL = fn */
+        emit("\tld c,l\n");             /* C = fn low byte */
+        emit_runtime_call("__bhlf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall bios(fn,dearg): same shape as bdos above, but calls
+     * DCCRTL's __biosf, which invokes the CP/M BIOS jump table instead of
+     * BDOS's fixed CALL 5. See DCCRTL.MAC for why fn/dearg still land in
+     * C/DE despite the BIOS having no single argument convention. */
+    if (n->list_len == 2 && !strcmp(name, "bios")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = fn */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = dearg */
+        expr_result_dead = old_dead;
+        emit("\tex de,hl\n");           /* DE = dearg */
+        emit("\tpop hl\n");             /* HL = fn */
+        emit("\tld c,l\n");             /* C = fn low byte */
+        emit_runtime_call("__biosf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall bioshl(fn,dearg): same shape as bios above, but calls
+     * DCCRTL's __bhf, which returns HL exactly as the BIOS call left it
+     * instead of zero-extending A into HL. For BIOS functions whose useful
+     * result is a 16-bit HL value (e.g. SELDSK, SECTRAN) rather than a
+     * byte in A. */
+    if (n->list_len == 2 && !strcmp(name, "bioshl")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = fn */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = dearg */
+        expr_result_dead = old_dead;
+        emit("\tex de,hl\n");           /* DE = dearg */
+        emit("\tpop hl\n");             /* HL = fn */
+        emit("\tld c,l\n");             /* C = fn low byte */
+        emit_runtime_call("__bhf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall memcpy(dst,src,n): DCCRTL's __mcf takes dst in DE, src in HL,
+     * n in BC directly - same rationale/shape as memcmp above, extended to
+     * memcpy's copy-not-compare semantics. memcpy is common enough
+     * (struct/buffer copies) that this pays off broadly. */
+    if (n->list_len == 3 && !strcmp(name, "memcpy")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = dst */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = src */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[2]);       /* HL = n */
+        expr_result_dead = old_dead;
+        emit("\tld b,h\n\tld c,l\n");   /* BC = n */
+        emit("\tpop hl\n");             /* HL = src */
+        emit("\tpop de\n");             /* DE = dst */
+        emit_runtime_call("__mcf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall memchr(s,c,n): DCCRTL's __mhf takes s in HL, c's low byte in
+     * E, n in BC directly - same rationale/shape as memset above. */
+    if (n->list_len == 3 && !strcmp(name, "memchr")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = s */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = c */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[2]);       /* HL = n */
+        expr_result_dead = old_dead;
+        emit("\tld b,h\n\tld c,l\n");   /* BC = n */
+        emit("\tpop de\n");             /* E = c (low byte) */
+        emit("\tpop hl\n");             /* HL = s */
+        emit_runtime_call("__mhf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall strcpy(dst,src): DCCRTL's __scf takes dst in DE, src in HL
+     * directly - same rationale as memcmp/bdos above, extended to strcpy's
+     * two pointer arguments. */
+    if (n->list_len == 2 && !strcmp(name, "strcpy")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = dst */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = src */
+        expr_result_dead = old_dead;
+        emit("\tpop de\n");             /* DE = dst */
+        emit_runtime_call("__scf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall strrchr(s,c): DCCRTL's __rcf takes s in HL and c's low byte
+     * in A - same shape as strchr above. */
+    if (n->list_len == 2 && !strcmp(name, "strrchr")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = s */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = c */
+        expr_result_dead = old_dead;
+        emit("\tld a,l\n");
+        emit("\tpop hl\n");
+        emit_runtime_call("__rcf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall strstr(haystack,needle): DCCRTL's __ssf takes haystack in
+     * DE, needle in HL directly - same shape as strcpy above. */
+    if (n->list_len == 2 && !strcmp(name, "strstr")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = haystack */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = needle */
+        expr_result_dead = old_dead;
+        emit("\tpop de\n");             /* DE = haystack */
+        emit_runtime_call("__ssf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Fastcall stricmp(s1,s2): DCCRTL's __icf takes s1 in DE, s2 in HL
+     * directly - same shape as strstr above. */
+    if (n->list_len == 2 && !strcmp(name, "stricmp")) {
+        old_dead = expr_result_dead;
+        expr_result_dead = 0;
+        gen_fastcall_arg(n->list[0]);       /* HL = s1 */
+        emit("\tpush hl\n");
+        gen_fastcall_arg(n->list[1]);       /* HL = s2 */
+        expr_result_dead = old_dead;
+        emit("\tpop de\n");             /* DE = s1 */
+        emit_runtime_call("__icf");
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -2781,6 +4654,14 @@ void gen_call_ast(const struct AstNode *n)
      * hinges on. */
     if (fn_sym->is_static)
         fn_sym->deferred_body_needed = 1;
+
+    if (expr_result_dead && type_is_struct_object(fn_sym->type)) {
+        gen_struct_return_call_arg_ast(n, fn_sym->type);
+        emit_cleanup_stack_bytes(type_size(fn_sym->type));
+        g_expr.type = fn_sym->type;
+        g_expr.long_from16 = 0;
+        return;
+    }
 
     /* Push arguments right-to-left, one 16-bit word each (prototype-16-bit /
      * default-int push), with call arguments forced live across evaluation. */
@@ -2802,7 +4683,8 @@ void gen_call_ast(const struct AstNode *n)
         }
         if (!have_want && n->list[i]->kind == AST_IDENT) {
             arg_sym = find_sym(n->list[i]->sval);
-            if (arg_sym != NULL && type_is_struct_object(arg_sym->type)) {
+            if (arg_sym != NULL && !arg_sym->is_array &&
+                type_is_struct_object(arg_sym->type)) {
                 gen_call_struct_arg_ast(n->list[i], arg_sym->type);
                 arg_bytes += type_size(arg_sym->type);
                 continue;
@@ -2813,7 +4695,7 @@ void gen_call_ast(const struct AstNode *n)
             gen_pointer_expr_ast(n->list[i], &ptr_type, &no_deref);
         else
             ast_gen_expr(n->list[i]);
-        actual_type = g_expr_type;
+        actual_type = g_expr.type;
         if (have_want && type_is_float(want_type)) {
             if (!type_is_float(actual_type))
                 emit_convert_int_to_float(actual_type);
@@ -2840,10 +4722,63 @@ void gen_call_ast(const struct AstNode *n)
     }
     expr_result_dead = old_dead;
 
-    emit_extrn_if_needed(fn_sym);
-    fprintf(outf, "\tcall %s\n", asm_name_for(name));
-    g_expr_type = fn_sym->type;
-    g_long_from16 = 0;
+    {
+        int fmt_idx = asm_printf_family_fmt_arg_index(name);
+        if (fmt_idx >= 0 && fmt_idx < n->list_len) {
+            /* printf-family call: pick the runtime entry point this specific
+             * call needs from its own format-string literal (or the
+             * -ffloatio/-flongio override, or conservatively assume both
+             * when the format isn't a compile-time-visible literal) - see
+             * asm_name_for_pf_call. emit_runtime_call (not the usual Sym-
+             * based emit_extrn_if_needed/asm_name_for pairing) is used
+             * because two call sites for the same C function can legitimately
+             * resolve to two different runtime entry points within one file
+             * (e.g. one sprintf() call with no %f, another with %.2f), and
+             * each one needs its own matching extrn. */
+            int needs_float = 0;
+            int needs_long = 0;
+            int needs_hex = 0;
+            int needs_octal = 0;
+            const struct AstNode *fmt_arg = n->list[fmt_idx];
+
+            if (fmt_arg->kind == AST_STR_LIT)
+                asm_scan_format_specifiers(fmt_arg->sval, &needs_float, &needs_long,
+                                            &needs_hex, &needs_octal);
+            else {
+                needs_float = 1;
+                needs_long = 1;
+                needs_hex = 1;
+                needs_octal = 1;
+            }
+            /* -f<x>io/-fno-<x>io are a blanket override: they win over
+             * whatever the literal scan (or the non-literal conservative
+             * fallback above) concluded, in either direction. This is the
+             * only way to claw back the fallback's "assume everything"
+             * cost for a format string that isn't a compile-time literal -
+             * see opt_floatio's declaration in dcc.h. */
+            if (opt_floatio > 0) needs_float = 1; else if (opt_floatio < 0) needs_float = 0;
+            if (opt_longio > 0) needs_long = 1; else if (opt_longio < 0) needs_long = 0;
+            if (opt_hexio > 0) needs_hex = 1; else if (opt_hexio < 0) needs_hex = 0;
+            if (opt_octio > 0) needs_octal = 1; else if (opt_octio < 0) needs_octal = 0;
+            /* %x/%X and %o don't need a variant per printf-family function
+             * (unlike float/long): the hook they install is independent of,
+             * and composes freely with, whichever entry point the float/
+             * long decision above resolves to - see __pfehx/__pfeoc. Names
+             * deliberately differ within their first 6 characters (M80
+             * truncates PUBLIC symbols there) - __pf_ehx/__pf_eoc collided
+             * as "__PF_E" and caused a real miscompilation before this. */
+            if (needs_hex)
+                emit_runtime_call("__pfehx");
+            if (needs_octal)
+                emit_runtime_call("__pfeoc");
+            emit_runtime_call(asm_name_for_pf_call(name, needs_float, needs_long));
+        } else {
+            emit_extrn_if_needed(fn_sym);
+            fprintf(g_emit_sink.stream, "\tcall %s\n", asm_name_for(name));
+        }
+    }
+    g_expr.type = fn_sym->type;
+    g_expr.long_from16 = 0;
 
     emit_cleanup_stack_bytes(arg_bytes);
 }
@@ -2863,7 +4798,18 @@ void gen_struct_return_call_assign_ast(const struct AstNode *lhs,
     if (fn_sym != NULL && fn_sym->is_static)
         fn_sym->deferred_body_needed = 1;
 
-    gen_struct_addr_expr_ast(lhs, &lhs_type);
+    if (lhs == NULL) {
+        /* `return f(args);` in a struct-returning function: the destination
+         * is the caller's own hidden return buffer, whose pointer is the
+         * hidden first parameter at (ix+4/5).  Passing it straight through
+         * as f's destination writes the result in place - no temp, no copy. */
+        if (fn_sym == NULL)
+            fatal("struct-return callee missing after support gate");
+        emit("\tld l,(ix+4)\n\tld h,(ix+5)\n");
+        lhs_type = fn_sym->type;
+    } else {
+        gen_struct_addr_expr_ast(lhs, &lhs_type);
+    }
     emit("\tpush hl\n");
 
     old_dead = expr_result_dead;
@@ -2886,7 +4832,7 @@ void gen_struct_return_call_assign_ast(const struct AstNode *lhs,
             gen_pointer_expr_ast(rhs->list[i], &ptr_type, &no_deref);
         else
             ast_gen_expr(rhs->list[i]);
-        actual_type = g_expr_type;
+        actual_type = g_expr.type;
         if (have_want && type_is_float(want_type)) {
             if (!type_is_float(actual_type))
                 emit_convert_int_to_float(actual_type);
@@ -2916,11 +4862,11 @@ void gen_struct_return_call_assign_ast(const struct AstNode *lhs,
     emit_load_hl_from_sp_offset(arg_bytes);
     emit("\tpush hl\n");
     emit_extrn_if_needed(fn_sym);
-    fprintf(outf, "\tcall %s\n", asm_name_for(name));
+    fprintf(g_emit_sink.stream, "\tcall %s\n", asm_name_for(name));
     emit_cleanup_stack_bytes(arg_bytes + 2);
     emit("\tpop bc\n");
-    g_expr_type = lhs_type;
-    g_long_from16 = 0;
+    g_expr.type = lhs_type;
+    g_expr.long_from16 = 0;
 }
 
 void gen_struct_addr_expr_ast(const struct AstNode *n, int *out_type)
@@ -2929,7 +4875,7 @@ void gen_struct_addr_expr_ast(const struct AstNode *n, int *out_type)
 
     switch (n->kind) {
     case AST_IDENT:
-        s = find_sym(n->sval);
+        s = n->sym != NULL ? n->sym : find_sym(n->sval);
         emit_load_sym_addr(s);
         *out_type = s->type;
         return;
@@ -2941,6 +4887,13 @@ void gen_struct_addr_expr_ast(const struct AstNode *n, int *out_type)
         return;
     case AST_MEMBER:
         gen_member_addr_ast(n, out_type);
+        return;
+    case AST_COMPOUND_LITERAL:
+        /* Materialize the literal into its backing local; gen_compound_literal_ast
+         * emits the initializer and leaves the object's address in HL. */
+        gen_compound_literal_ast(n);
+        if (out_type)
+            *out_type = n->type;
         return;
     default:
         fatal("gen_struct_addr_expr_ast: unsupported node");
@@ -2958,8 +4911,25 @@ void gen_struct_copy_assign_ast(const struct AstNode *n)
     (void)rhs_type;
     emit("\tex de,hl\n\tpop hl\n");
     emit_copy_de_to_hl_bytes(type_size(lhs_type));
-    g_expr_type = lhs_type;
-    g_long_from16 = 0;
+    g_expr.type = lhs_type;
+    g_expr.long_from16 = 0;
+}
+
+void gen_struct_chain_copy_assign_ast(const struct AstNode *n)
+{
+    const struct AstNode *inner = n->b;
+    int lhs_type;
+    int rhs_type;
+
+    gen_struct_copy_assign_ast(inner);
+    gen_struct_addr_expr_ast(n->a, &lhs_type);
+    emit("\tpush hl\n");
+    gen_struct_addr_expr_ast(inner->a, &rhs_type);
+    (void)rhs_type;
+    emit("\tex de,hl\n\tpop hl\n");
+    emit_copy_de_to_hl_bytes(type_size(lhs_type));
+    g_expr.type = lhs_type;
+    g_expr.long_from16 = 0;
 }
 
 void gen_struct_deref_copy_assign_ast(const struct AstNode *n)
@@ -2973,8 +4943,8 @@ void gen_struct_deref_copy_assign_ast(const struct AstNode *n)
     (void)rhs_type;
     emit("\tex de,hl\n\tpop hl\n");       /* DE = source, HL = dest */
     emit_copy_de_to_hl_bytes(type_size(lhs_type));
-    g_expr_type = lhs_type;
-    g_long_from16 = 0;
+    g_expr.type = lhs_type;
+    g_expr.long_from16 = 0;
 }
 
 void gen_struct_member_copy_assign_ast(const struct AstNode *n)
@@ -2988,8 +4958,29 @@ void gen_struct_member_copy_assign_ast(const struct AstNode *n)
     emit_load_sym_addr(rhs);               /* HL = source */
     emit("\tex de,hl\n\tpop hl\n");
     emit_copy_de_to_hl_bytes(type_size(lhs_type));
-    g_expr_type = lhs_type;
-    g_long_from16 = 0;
+    g_expr.type = lhs_type;
+    g_expr.long_from16 = 0;
+}
+
+/* Resolve one side of gen_byte_addr_copy_assign_ast to its address in HL.
+ * `n` is already known (via ast_is_byte_addr_lvalue) to be an AST_INDEX,
+ * AST_MEMBER, AST_UNARY deref, or a zero-arg static inline call that
+ * substitutes to one of those - so a bare call node here is resolved to its
+ * inline body first rather than falling into the deref catch-all below. */
+static void gen_byte_lvalue_addr_ast(const struct AstNode *n, int *out_type)
+{
+    const struct AstNode *sub;
+
+    if (n->kind == AST_INDEX) {
+        gen_index_addr_ast(n, out_type);
+    } else if (n->kind == AST_MEMBER) {
+        gen_member_addr_ast(n, out_type);
+    } else if (n->kind == AST_UNARY && n->op == '*') {
+        gen_deref_addr_ast(n, out_type);
+    } else {
+        sub = ast_zero_arg_inline_body(n);
+        gen_byte_lvalue_addr_ast(sub, out_type);
+    }
 }
 
 /* Emitter for ast_is_byte_addr_copy_assign: compute both addresses (lhs
@@ -3001,26 +4992,16 @@ void gen_byte_addr_copy_assign_ast(const struct AstNode *n)
 {
     int val_type;
 
-    if (n->a->kind == AST_INDEX)
-        gen_index_addr_ast(n->a, &val_type);   /* HL = destination address */
-    else if (n->a->kind == AST_MEMBER)
-        gen_member_addr_ast(n->a, &val_type);
-    else
-        gen_deref_addr_ast(n->a, &val_type);
+    gen_byte_lvalue_addr_ast(n->a, &val_type);   /* HL = destination address */
     emit("\tpush hl\n");
 
-    if (n->b->kind == AST_INDEX)
-        gen_index_addr_ast(n->b, &val_type);   /* HL = source address */
-    else if (n->b->kind == AST_MEMBER)
-        gen_member_addr_ast(n->b, &val_type);
-    else
-        gen_deref_addr_ast(n->b, &val_type);
+    gen_byte_lvalue_addr_ast(n->b, &val_type);   /* HL = source address */
 
     emit("\tpop de\n");        /* DE = destination address, HL = source address */
     emit("\tld a,(hl)\n");
     emit("\tld (de),a\n");
-    g_expr_type = val_type;
-    g_long_from16 = 0;
+    g_expr.type = val_type;
+    g_expr.long_from16 = 0;
 }
 
 /* Emit a single struct field read `id.f` / `id->f` via the identifier-rooted
@@ -3056,6 +5037,31 @@ void gen_member_addr_ast(const struct AstNode *n, int *out_val_type)
             cur_type = TYPE_CHAR;
     } else if (!arrow && n->a->kind == AST_MEMBER) {
         gen_member_addr_ast(n->a, &cur_type);
+    } else if (!arrow && n->a->kind == AST_COMPOUND_LITERAL &&
+               type_is_struct_object(n->a->type)) {
+        gen_compound_literal_ast(n->a);
+        cur_type = n->a->type;
+    } else if (!arrow && n->a->kind == AST_CALL && n->a->a != NULL &&
+               n->a->a->kind == AST_IDENT) {
+        struct AstNode lhs;
+        struct Sym *fn;
+        struct Sym *tmp;
+
+        fn = find_global(n->a->a->sval);
+        if (fn == NULL || fn->storage != SC_FUNC ||
+            !ast_struct_return_call_assign_supported(fn->type, n->a) ||
+            n->sym == NULL)
+            fatal("gen_member_addr_ast: unsupported struct-return member base");
+
+        tmp = n->sym;
+        memset(&lhs, 0, sizeof(lhs));
+        lhs.kind = AST_IDENT;
+        lhs.sval = tmp->name;
+        lhs.sym = tmp;
+        lhs.type = tmp->type;
+        gen_struct_return_call_assign_ast(&lhs, n->a);
+        emit_load_sym_addr(tmp);
+        cur_type = tmp->type;
     } else {
         s = find_sym(n->a->sval);
         cur_type = s->type;
@@ -3119,21 +5125,129 @@ int ast_member_field_value_type(const struct AstNode *n)
     return fd->is_array ? fd->elem_type : fd->type;
 }
 
+/* True when `n` (a `.`-accessed struct/union member, e.g. Gst.stp) resolves
+ * to a scalar word-sized, non-bitfield, non-array field of a global/extern
+ * struct instance - i.e. both the base and the field live at a link-time-
+ * constant address (BASE+offset), the same guarantee is_global_word_sym
+ * already gives a plain global scalar. When true, the field can be read or
+ * written with a single direct `ld hl,(BASE+off)` / `ld (BASE+off),hl`
+ * instead of materializing &BASE.field into HL and indirecting through it via
+ * gen_member_addr_ast - needed in general (the base may be an array element,
+ * a local/param struct, or reached through a runtime pointer) but needlessly
+ * expensive here. Found via a codegen comparison against sdcc: this exact
+ * miss - treating a compile-time-constant field address as something that
+ * must be computed into a register and protected with push/pop across RHS
+ * evaluation - was the single highest-volume gap in dcc's own VM-interpreter
+ * benchmark programs, where a struct-resident stack/frame pointer field
+ * (e.g. an operand-stack top) is bumped on nearly every opcode. */
+static int ast_member_global_word_field(const struct AstNode *n, struct Sym **out_base,
+                                        struct FieldDef **out_fd, int *out_val_type)
+{
+    struct Sym *base;
+    struct FieldDef *fd;
+    int sid;
+    int val_type;
+
+    if (n->kind != AST_MEMBER || n->op == TOK_ARROW)
+        return 0;
+    if (n->a->kind != AST_IDENT)
+        return 0;
+    base = find_sym(n->a->sval);
+    if (base == NULL || base->is_array)
+        return 0;
+    if (base->storage != SC_GLOBAL && base->storage != SC_EXTERN)
+        return 0;
+
+    sid = base_struct_id_from_type(base->type);
+    fd = find_field_def(sid, n->sval);
+    if (fd == NULL || fd->is_array || fd->bit_width > 0)
+        return 0;
+
+    /* Link-80 mis-applies a nonzero addend (BASE+offset) only to a genuine
+     * EXTRN reference - a symbol defined in another module. A symbol defined
+     * in this translation unit is folded by M80 within its own segment, so
+     * BASE+offset is safe even when the symbol is also exported via PUBLIC
+     * (this is exactly emit_extrn_if_needed's "will emit EXTRN" predicate). */
+    if (fd->offset != 0 && base->needs_extrn && !base->is_defined)
+        return 0;
+
+    val_type = fd->type;
+    if (type_size(val_type) != 2 || type_is_bool(val_type))
+        return 0;
+
+    *out_base = base;
+    *out_fd = fd;
+    *out_val_type = val_type;
+    return 1;
+}
+
+static void emit_load_global_field_word_direct(struct Sym *base, struct FieldDef *fd)
+{
+    emit_extrn_if_needed(base);
+    if (fd->offset == 0)
+        fprintf(g_emit_sink.stream, "\tld hl,(%s)\n", asm_name_for(sym_asm_name(base)));
+    else
+        fprintf(g_emit_sink.stream, "\tld hl,(%s+%d)\n", asm_name_for(sym_asm_name(base)), fd->offset);
+}
+
+static void emit_store_global_field_word_direct(struct Sym *base, struct FieldDef *fd)
+{
+    emit_extrn_if_needed(base);
+    if (fd->offset == 0)
+        fprintf(g_emit_sink.stream, "\tld (%s),hl\n", asm_name_for(sym_asm_name(base)));
+    else
+        fprintf(g_emit_sink.stream, "\tld (%s+%d),hl\n", asm_name_for(sym_asm_name(base)), fd->offset);
+}
+
 void gen_member_ast(const struct AstNode *n)
 {
     int val_type;
     int elem_type;
+    struct Sym *direct_base;
+    struct FieldDef *direct_fd;
+
+    if (ast_member_global_word_field(n, &direct_base, &direct_fd, &val_type)) {
+        emit_load_global_field_word_direct(direct_base, direct_fd);
+        g_expr.type = val_type;
+        g_expr.long_from16 = 0;
+        return;
+    }
 
     gen_member_addr_ast(n, &val_type);
     if (ast_member_array_field_elem_type(n, &elem_type)) {
-        g_expr_type = type_add_ptr(elem_type);
-        g_long_from16 = 0;
+        g_expr.type = type_add_ptr(elem_type);
+        g_expr.long_from16 = 0;
         return;
     }
-    g_expr_type = val_type;
+    g_expr.type = val_type;
     emit_load_from_hl(val_type);
     if (current_field_bit_width > 0)
         emit_extract_bitfield();
+}
+
+/* Does `n` (a pointer-arithmetic operand) resolve - through any number of
+ * pointer casts, which only reinterpret a value and never change it - to a
+ * bare reference to a fixed-address global array? Its own address is then a
+ * link-time constant, so `arr + CONST` can fold straight into a single
+ * `ld hl,SYM+OFFSET` instead of loading the symbol, loading the constant, and
+ * adding them at runtime. Excludes VLAs (whose "array" is really a pointer
+ * loaded from a frame slot, not a fixed address) and multi-dimensional
+ * arrays (whose row-decay stride semantics this fold doesn't attempt to
+ * replicate). */
+static struct Sym *ast_const_ptr_array_base(const struct AstNode *n)
+{
+    struct Sym *s;
+
+    while (n != NULL && n->kind == AST_CAST)
+        n = n->a;
+    if (n == NULL || n->kind != AST_IDENT)
+        return NULL;
+    s = find_sym(n->sval);
+    if (s == NULL || !s->is_array || s->is_vla || s->dim_count > 1)
+        return NULL;
+    if (s->storage == SC_LOCAL || s->storage == SC_PARAM)
+        return NULL;
+    return s;
 }
 
 void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
@@ -3145,14 +5259,14 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
 
     if (n->kind == AST_IDENT) {
         ast_gen_expr(n);
-        *out_type = g_expr_type;
+        *out_type = g_expr.type;
         *out_no_deref = 0;
         return;
     }
 
     if (n->kind == AST_STR_LIT) {
         ast_gen_expr(n);
-        *out_type = g_expr_type;
+        *out_type = g_expr.type;
         *out_no_deref = 0;
         return;
     }
@@ -3173,6 +5287,21 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
     }
 
     if (n->kind == AST_UNARY && n->op == '*') {
+        int decay_type;
+        int decay_stride;
+        /* `*P` where P is a pointer-to-array (int (*P)[N]) decays, as an
+         * rvalue, to a pointer to the array element.  Its value is simply P's
+         * stored pointer, so load P and perform no dereference. */
+        if (ast_deref_pointer_array_decay(n, &decay_type, &decay_stride)) {
+            ast_gen_expr(n->a);
+            g_expr.type = decay_type;
+            g_expr.long_from16 = 0;
+            if (decay_stride > 0)
+                g_expr.decay_stride = decay_stride;
+            *out_type = decay_type;
+            *out_no_deref = (decay_stride > 0);
+            return;
+        }
         gen_pointer_expr_ast(n->a, &ptr_type, &no_deref);
         if (no_deref) {
             *out_type = ptr_type;
@@ -3184,7 +5313,7 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
             base = TYPE_CHAR;
         if (!type_is_struct_object(base))
             emit_load_from_hl(base);
-        g_expr_type = base;
+        g_expr.type = base;
         *out_type = base;
         *out_no_deref = 0;
         return;
@@ -3192,14 +5321,14 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
 
     if (n->kind == AST_UNARY && n->op == '&') {
         ast_gen_expr(n);
-        *out_type = g_expr_type;
+        *out_type = g_expr.type;
         *out_no_deref = 0;
         return;
     }
 
     if (n->kind == AST_UNARY && (n->op == TOK_INC || n->op == TOK_DEC)) {
         ast_gen_expr(n);
-        *out_type = g_expr_type;
+        *out_type = g_expr.type;
         *out_no_deref = 0;
         return;
     }
@@ -3209,8 +5338,17 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
             gen_pointer_expr_ast(n->a, &ptr_type, &no_deref);
         else
             ast_gen_expr(n->a);
-        g_expr_type = n->type;
-        g_long_from16 = 0;
+        /* A cast re-types the pointer, so any row-decay stride the operand
+         * signalled (e.g. a 2D array decaying to a pointer-to-row) no
+         * longer applies - subsequent pointer arithmetic on the CAST's
+         * result must scale by the cast's own target type, not the
+         * pre-cast operand's row size. Without this reset, a caller like
+         * `(ftype*)C2D + n` would inherit C2D's stale row stride from the
+         * inner gen_pointer_expr_ast call and scale by the row size
+         * instead of sizeof(ftype). */
+        g_expr.decay_stride = 0;
+        g_expr.type = n->type;
+        g_expr.long_from16 = 0;
         *out_type = n->type;
         *out_no_deref = 0;
         return;
@@ -3226,7 +5364,7 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
         int true_ptr;
         int false_ptr;
         ast_gen_expr(n->a);
-        emit_test_expr_nonzero(g_expr_type, lfalse, 0);
+        emit_test_expr_nonzero(g_expr.type, lfalse, 0);
         true_ptr = ast_pointer_expr_type(n->b, &true_type, &true_no_deref);
         if (true_ptr)
             gen_pointer_expr_ast(n->b, &true_type, &true_no_deref);
@@ -3240,9 +5378,9 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
         else
             ast_gen_expr(n->c);
         emit_label(lend);
-        g_expr_type = true_ptr ? true_type : false_type;
-        g_long_from16 = 0;
-        *out_type = g_expr_type;
+        g_expr.type = true_ptr ? true_type : false_type;
+        g_expr.long_from16 = 0;
+        *out_type = g_expr.type;
         *out_no_deref = true_ptr && false_ptr && true_no_deref && false_no_deref;
         return;
     }
@@ -3254,9 +5392,9 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
 
         if (n->op == '+' && !ast_pointer_expr_type(n->a, &ptr_type, &no_deref)) {
             gen_pointer_expr_ast(n->b, &ptr_type, &no_deref);
-            was_row_ptr = (g_array_decay_stride > 0);
-            elem = was_row_ptr ? g_array_decay_stride : type_index_elem_size(ptr_type);
-            g_array_decay_stride = 0;
+            was_row_ptr = (g_expr.decay_stride > 0);
+            elem = was_row_ptr ? g_expr.decay_stride : type_index_elem_size(ptr_type);
+            g_expr.decay_stride = 0;
 
             emit("\tpush hl\n");
             saved_dead = expr_result_dead;
@@ -3267,17 +5405,32 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
             emit("\tex de,hl\n");
             emit("\tpop hl\n");
             emit("\tadd hl,de\n");
-            g_expr_type = ptr_type;
-            g_long_from16 = 0;
+            g_expr.type = ptr_type;
+            g_expr.long_from16 = 0;
             *out_type = ptr_type;
             *out_no_deref = was_row_ptr;
             return;
         }
 
+        if (n->op == '+' && !no_deref && n->b->kind == AST_INT_LIT) {
+            struct Sym *base_sym = ast_const_ptr_array_base(n->a);
+            if (base_sym != NULL) {
+                elem = type_index_elem_size(ptr_type);
+                emit_extrn_if_needed(base_sym);
+                fprintf(g_emit_sink.stream, "\tld hl,%s+%ld\n", asm_name_for(sym_asm_name(base_sym)),
+                        (n->b->ival * elem) & 0xffffL);
+                g_expr.type = ptr_type;
+                g_expr.long_from16 = 0;
+                *out_type = ptr_type;
+                *out_no_deref = 0;
+                return;
+            }
+        }
+
         gen_pointer_expr_ast(n->a, &ptr_type, &no_deref);
-        was_row_ptr = (g_array_decay_stride > 0);
-        elem = was_row_ptr ? g_array_decay_stride : type_index_elem_size(ptr_type);
-        g_array_decay_stride = 0;
+        was_row_ptr = (g_expr.decay_stride > 0);
+        elem = was_row_ptr ? g_expr.decay_stride : type_index_elem_size(ptr_type);
+        g_expr.decay_stride = 0;
 
         emit("\tpush hl\n");
         saved_dead = expr_result_dead;
@@ -3291,8 +5444,8 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
             emit("\tadd hl,de\n");
         else
             emit("\tor a\n\tsbc hl,de\n");
-        g_expr_type = ptr_type;
-        g_long_from16 = 0;
+        g_expr.type = ptr_type;
+        g_expr.long_from16 = 0;
         *out_type = ptr_type;
         *out_no_deref = was_row_ptr;
         return;
@@ -3300,17 +5453,29 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
 
     if (n->kind == AST_MEMBER) {
         int member_type;
+        struct Sym *direct_base;
+        struct FieldDef *direct_fd;
+
+        if (ast_member_global_word_field(n, &direct_base, &direct_fd, &member_type)) {
+            emit_load_global_field_word_direct(direct_base, direct_fd);
+            g_expr.type = member_type;
+            g_expr.long_from16 = 0;
+            *out_type = member_type;
+            *out_no_deref = 0;
+            return;
+        }
+
         gen_member_addr_ast(n, &member_type);
         if (ast_member_array_field_elem_type(n, &member_type)) {
-            g_expr_type = type_add_ptr(member_type);
-            g_long_from16 = 0;
-            *out_type = g_expr_type;
+            g_expr.type = type_add_ptr(member_type);
+            g_expr.long_from16 = 0;
+            *out_type = g_expr.type;
             *out_no_deref = 0;
             return;
         }
         emit_load_from_hl(member_type);
-        g_expr_type = member_type;
-        g_long_from16 = 0;
+        g_expr.type = member_type;
+        g_expr.long_from16 = 0;
         *out_type = member_type;
         *out_no_deref = 0;
         return;
@@ -3323,16 +5488,16 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
             gen_index_addr_ast(n, &addr_type);
             if (!no_deref)
                 emit_load_from_hl(addr_type);
-            g_expr_type = no_deref ? member_type : addr_type;
-            g_long_from16 = 0;
-            *out_type = g_expr_type;
+            g_expr.type = no_deref ? member_type : addr_type;
+            g_expr.long_from16 = 0;
+            *out_type = g_expr.type;
             *out_no_deref = no_deref;
             return;
         }
         gen_index_addr_ast(n, &member_type);
         emit_load_from_hl(member_type);
-        g_expr_type = member_type;
-        g_long_from16 = 0;
+        g_expr.type = member_type;
+        g_expr.long_from16 = 0;
         *out_type = member_type;
         *out_no_deref = 0;
         return;
@@ -3340,14 +5505,14 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
 
     if (n->kind == AST_ASSIGN) {
         ast_gen_expr(n);
-        *out_type = g_expr_type;
+        *out_type = g_expr.type;
         *out_no_deref = 0;
         return;
     }
 
     if (n->kind == AST_CALL) {
         ast_gen_expr(n);
-        *out_type = g_expr_type;
+        *out_type = g_expr.type;
         *out_no_deref = 0;
         return;
     }
@@ -3361,9 +5526,48 @@ void gen_pointer_expr_ast(const struct AstNode *n, int *out_type,
 void gen_deref_addr_ast(const struct AstNode *n, int *out_val_type)
 {
     struct Sym *s;
+    struct Sym *ps;
+    const struct AstNode *base_expr;
+    const struct AstNode *idxs[DCC_MAX_DEREF_CHAIN];
+    int idx_count;
     int no_deref;
     int ptr_type;
     int base;
+    int elem_size;
+
+    if (ast_deref_pointer_array_chain_collect(n, &ps, &base_expr, idxs,
+                                              &idx_count, &base)) {
+        int d;
+        int di;
+        gen_pointer_expr_ast(base_expr, &ptr_type, &no_deref);
+
+        for (d = 0; d < idx_count; ++d) {
+            /* Stride for dimension d is the element size scaled by the product
+             * of all inner dimensions from d onward: dimension 0 spans a whole
+             * pointed-to array object, the last index spans one element. */
+            elem_size = type_size(base);
+            if (elem_size <= 0)
+                elem_size = 2;
+            for (di = d; di < ps->dim_count; ++di)
+                if (ps->dims[di] > 0)
+                    elem_size *= ps->dims[di];
+
+            if (idxs[d]->kind == AST_INT_LIT) {
+                emit_add_const_to_hl(idxs[d]->ival * elem_size);
+            } else {
+                emit("\tpush hl\n");
+                gen_index_subscript_expr_ast(idxs[d]);
+                if (!(d == 0 && emit_runtime_pointer_array_stride(ps)))
+                    scale_hl_by_elem_size(elem_size);
+                emit("\tex de,hl\n");
+                emit("\tpop hl\n");
+                emit("\tadd hl,de\n");
+            }
+        }
+
+        *out_val_type = base;
+        return;
+    }
 
     if (n->a->kind == AST_POSTFIX &&
         (n->a->op == TOK_INC || n->a->op == TOK_DEC) &&
@@ -3429,19 +5633,19 @@ void gen_logical_ast(const struct AstNode *n)
         emit_label(lt);
         emit("\tld hl,1\n");
         emit_label(le);
-        g_expr_type = TYPE_INT;
+        g_expr.type = TYPE_INT;
         return;
     }
 
     if (n->kind == AST_LOGAND) {
         int lf = 0;
         ast_gen_expr(n->a);
-        lhs_type = g_expr_type;
+        lhs_type = g_expr.type;
         lf = new_label();
         le = new_label();
         emit_test_expr_nonzero(lhs_type, lf, 0);
         ast_gen_expr(n->b);
-        emit_test_expr_nonzero(g_expr_type, lf, 0);
+        emit_test_expr_nonzero(g_expr.type, lf, 0);
         emit("\tld hl,1\n");
         emit_jp_label("jp", le);
         emit_label(lf);
@@ -3450,19 +5654,19 @@ void gen_logical_ast(const struct AstNode *n)
     } else {
         int lt = 0;
         ast_gen_expr(n->a);
-        lhs_type = g_expr_type;
+        lhs_type = g_expr.type;
         lt = new_label();
         le = new_label();
         emit_test_expr_nonzero(lhs_type, lt, 1);
         ast_gen_expr(n->b);
-        emit_test_expr_nonzero(g_expr_type, lt, 1);
+        emit_test_expr_nonzero(g_expr.type, lt, 1);
         emit("\tld hl,0\n");
         emit_jp_label("jp", le);
         emit_label(lt);
         emit("\tld hl,1\n");
         emit_label(le);
     }
-    g_expr_type = TYPE_INT;
+    g_expr.type = TYPE_INT;
 }
 
 /* Emit a plain-int conditional `cond ? a : b` (AST_COND) via the
@@ -3480,16 +5684,25 @@ void gen_cond_ast(const struct AstNode *n)
     int need_long_result;
     int result_is_float;
     int no_deref;
+    int know_not_long;
 
     if (ast_pointer_expr_type(n, &true_type, &no_deref)) {
         gen_pointer_expr_ast(n, &true_type, &no_deref);
         return;
     }
 
+    {
+        const struct AstNode *abs_x;
+        if (ast_cond_is_abs_idiom(n, &abs_x)) {
+            ast_gen_abs_idiom_value(abs_x);
+            return;
+        }
+    }
+
     ast_gen_expr(n->a);                 /* condition */
     lfalse = new_label();
     lend = new_label();
-    emit_test_expr_nonzero(g_expr_type, lfalse, 0);
+    emit_test_expr_nonzero(g_expr.type, lfalse, 0);
 
     if (ast_cond_void_supported(n)) {
         ast_gen_expr(n->b);
@@ -3497,22 +5710,37 @@ void gen_cond_ast(const struct AstNode *n)
         emit_label(lfalse);
         ast_gen_expr(n->c);
         emit_label(lend);
-        g_expr_type = TYPE_VOID;
-        g_long_from16 = 0;
+        g_expr.type = TYPE_VOID;
+        g_expr.long_from16 = 0;
         return;
     }
 
     result_is_float = ast_cond_result_is_float(n);
 
+    /* `cond ? a : b` where neither arm's static type is long (the common
+     * case, e.g. tchess.c's `x < 0 ? -x : x`) - proven with the same
+     * static, side-effect-free type predicates ast_cond_result_is_long
+     * already uses elsewhere (dcc_ast_gen_support.c), just not previously
+     * consulted here. Without this, the true arm below was unconditionally
+     * widened to a long result in DE:HL (on the chance the false arm might
+     * turn out to be long) even when it plainly isn't - dead work on every
+     * evaluation, since DE never ends up read: the whole expression's type
+     * only depends on true_type/false_type, and once both arms are known
+     * in hand after evaluating them, a not-actually-long result already
+     * takes the plain `g_expr.type = common_arith_type(...)` path at the
+     * bottom regardless of what got widened along the way. */
+    know_not_long = !result_is_float && ast_cond_numeric_supported(n) &&
+                     !ast_cond_result_is_long(n);
+
     ast_gen_expr(n->b);                 /* true arm */
-    true_type = g_expr_type;
+    true_type = g_expr.type;
     need_long_result = 0;
     if (result_is_float) {
         if (!type_is_float(true_type))
             emit_convert_int_to_float(true_type);
     } else {
         need_long_result = type_is_long(true_type);
-        if (!type_is_long(true_type))
+        if (!type_is_long(true_type) && !know_not_long)
             emit_extend_to_long((true_type & TYPE_UNSIGNED) ||
                                 (true_type & (TYPE_PTR | TYPE_PTR2)));
     }
@@ -3520,7 +5748,7 @@ void gen_cond_ast(const struct AstNode *n)
 
     emit_label(lfalse);
     ast_gen_expr(n->c);                 /* false arm */
-    false_type = g_expr_type;
+    false_type = g_expr.type;
 
     if (result_is_float) {
         if (!type_is_float(false_type))
@@ -3538,16 +5766,16 @@ void gen_cond_ast(const struct AstNode *n)
 
     emit_label(lend);
     if (result_is_float) {
-        g_expr_type = TYPE_FLOAT;
+        g_expr.type = TYPE_FLOAT;
     } else if (need_long_result) {
         if ((true_type & TYPE_UNSIGNED) || (false_type & TYPE_UNSIGNED))
-            g_expr_type = TYPE_LONG | TYPE_UNSIGNED;
+            g_expr.type = TYPE_LONG | TYPE_UNSIGNED;
         else
-            g_expr_type = TYPE_LONG;
+            g_expr.type = TYPE_LONG;
     } else {
-        g_expr_type = common_arith_type(true_type, false_type);
+        g_expr.type = common_arith_type(true_type, false_type);
     }
-    g_long_from16 = 0;
+    g_expr.long_from16 = 0;
 }
 
 /* Emit a postfix `lv++` / `lv--` on a plain-int identifier/member. */
@@ -3559,21 +5787,21 @@ void gen_postfix_ast(const struct AstNode *n)
     if (n->a->kind == AST_MEMBER) {
         gen_member_addr_ast(n->a, &val_type);
         gen_post_update_from_addr(val_type, n->op);
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
         return;
     }
 
     if (n->a->kind == AST_INDEX) {
         gen_index_addr_ast(n->a, &val_type);
         gen_post_update_from_addr(val_type, n->op);
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
         return;
     }
 
     if (n->a->kind == AST_UNARY && n->a->op == '*') {
         gen_deref_addr_ast(n->a, &val_type);
         gen_post_update_from_addr(val_type, n->op);
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -3584,7 +5812,7 @@ void gen_postfix_ast(const struct AstNode *n)
      * old value in HL.  It deliberately bails (returns 0) on long/float and on
      * symbols it cannot address directly. */
     if (try_emit_post_update_sym_direct(s, n->op)) {
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -3592,7 +5820,22 @@ void gen_postfix_ast(const struct AstNode *n)
         (type_size(s->type) == 1 || type_size(s->type) == 2)) {
         emit_load_sym_addr(s);
         gen_post_update_from_addr(s->type, n->op);
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
+        return;
+    }
+
+    /* Global/static byte scalar (uint8_t/char): try_emit_post_update_sym_direct
+     * handles global WORDS (is_global_word_sym) and IX-direct locals but
+     * declines a global BYTE, and emit_load_sym_value_direct's byte branch
+     * assumes an (ix+d) frame slot.  Route it through its address like the
+     * SC_LOCAL case above so the load/increment/store and byte wrap are
+     * correct. */
+    if (s != NULL && (s->storage == SC_GLOBAL || s->storage == SC_EXTERN) &&
+        !s->is_array && ast_is_plain_int_type(s->type) &&
+        type_size(s->type) == 1) {
+        emit_load_sym_addr(s);
+        gen_post_update_from_addr(s->type, n->op);
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -3603,7 +5846,7 @@ void gen_postfix_ast(const struct AstNode *n)
     if (s != NULL && type_is_long(s->type)) {
         emit_load_sym_addr(s);
         gen_post_update_from_addr(s->type, n->op);
-        g_long_from16 = 0;
+        g_expr.long_from16 = 0;
         return;
     }
 
@@ -3615,23 +5858,25 @@ void gen_postfix_ast(const struct AstNode *n)
         emit("\tdec hl\n");
     emit_store_hl_to_sym_direct(s);     /* store new value */
     emit("\tpop hl\n");                 /* old value = expression result */
-    g_expr_type = s->type;
+    g_expr.type = s->type;
 }
 
 void ast_gen_expr(const struct AstNode *n)
 {
+    if (mir_is_active())
+        fatal("AST expression emission attempted during MIR function lowering");
+
     switch (n->kind) {
     case AST_INT_LIT:
         gen_int_lit(n);
         break;
     case AST_SIZEOF_EXPR:
     case AST_SIZEOF_TYPE:
-        fprintf(outf, "\tld hl,%ld\n", n->ival & 0xffffL);
-        g_expr_type = TYPE_INT;
+        gen_sizeof_expr_ast(n);
         break;
     case AST_FLOAT_LIT:
         emit_load_float_bits(n->uval);
-        g_expr_type = TYPE_FLOAT;
+        g_expr.type = TYPE_FLOAT;
         break;
     case AST_STR_LIT:
         gen_str_lit(n);
@@ -3674,10 +5919,15 @@ void ast_gen_expr(const struct AstNode *n)
         gen_cast_ast(n);
         break;
     case AST_COMPOUND_LITERAL:
-        gen_compound_literal_ast(n);
+        gen_compound_literal_value_ast(n);
         break;
     case AST_COMMA:
-        ast_gen_expr(n->a);
+        {
+            int old_dead = expr_result_dead;
+            expr_result_dead = 1;
+            ast_gen_dead_expr(n->a);
+            expr_result_dead = old_dead;
+        }
         ast_gen_expr(n->b);
         break;
     default:

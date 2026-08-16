@@ -1,12 +1,14 @@
 #Requires -Version 7
 <#
 .SYNOPSIS
-Build dcc, dccpeep, dccrtlstrip, and dccmake on Windows, macOS, and Linux.
+Build dcc, dccpeep, dccrtlstrip, dccmake, m80c, and l80c on Windows, macOS, and Linux.
 
 .DESCRIPTION
 Compiles the host tools with the native compiler for the current platform:
 MSVC on Windows, clang on macOS, and gcc on Linux by default. Build artifacts
 are placed under build/; final commands are placed in the repository root.
+On Linux, these tools are linked -static by default (see -NoStatic);
+macOS has no static libSystem to link against, so this never applies there.
 
 .PARAMETER OutputPath
   Output directory for build artifacts. Defaults to ./build.
@@ -15,16 +17,24 @@ are placed under build/; final commands are placed in the repository root.
   Override the C compiler used on macOS/Linux. Ignored on Windows, where MSVC
   cl.exe is used.
 
+.PARAMETER NoStatic
+  On Linux, link dcc/dccpeep/dccrtlstrip/dccmake dynamically instead of the
+  default -static (useful if the static libc dev package, e.g. glibc-static
+  on Fedora/RHEL, isn't installed). Ignored on macOS (no static linking
+  there - Apple's libSystem has no static archive) and Windows.
+
 .EXAMPLE
   pwsh ./scripts/build-dcc.ps1
   pwsh ./scripts/build-dcc.ps1 -OutputPath ./build-custom
   pwsh ./scripts/build-dcc.ps1 -CC clang
+  pwsh ./scripts/build-dcc.ps1 -NoStatic
 #>
 
 param(
     [string]$OutputPath = "build",
     [string]$CC,
-    [switch]$VerboseCommands
+    [switch]$VerboseCommands,
+    [switch]$NoStatic
 )
 
 $ErrorActionPreference = "Stop"
@@ -248,9 +258,11 @@ function Build-WindowsMsvc {
     }
 
     $tools = @(
-        @{ Name = "dccpeep"; Source = Join-Path $repoRoot "src\dccpeep\dccpeep.c" },
-        @{ Name = "dccrtlstrip"; Source = Join-Path $repoRoot "src\dccrtlstrip\dccrtlstrip.c" },
-        @{ Name = "dccmake"; Source = Join-Path $repoRoot "src\dccmake\dccmake.c" }
+        @{ Name = "dccpeep"; Sources = @(Get-ChildItem (Join-Path $repoRoot "src\dccpeep") -Filter "*.c" | Sort-Object Name | ForEach-Object FullName) },
+        @{ Name = "dccrtlstrip"; Sources = @((Join-Path $repoRoot "src\dccrtlstrip\dccrtlstrip.c")) },
+        @{ Name = "dccmake"; Sources = @((Join-Path $repoRoot "src\dccmake\dccmake.c")) },
+        @{ Name = "m80c"; Sources = @((Join-Path $repoRoot "src\m80c\m80c.c")) },
+        @{ Name = "l80c"; Sources = @((Join-Path $repoRoot "src\l80c\l80c.c")) }
     )
 
     foreach ($tool in $tools) {
@@ -259,7 +271,7 @@ function Build-WindowsMsvc {
         $toolOut = Join-Path $repoRoot "$($tool.Name).exe"
         New-BuildDirectory $toolObjDir
 
-        $arguments = @($tool.Source) + $cflags + @(
+        $arguments = @($tool.Sources) + $cflags + @(
             "/Fo:$toolObjDir\",
             "/Fa$toolObjDir\",
             "/Fd:$toolObjDir\$($tool.Name).pdb",
@@ -269,7 +281,7 @@ function Build-WindowsMsvc {
         Invoke-Checked "cl" $arguments "$($tool.Name) compilation"
     }
 
-    return @($dccOut, (Join-Path $repoRoot "dccpeep.exe"), (Join-Path $repoRoot "dccrtlstrip.exe"), (Join-Path $repoRoot "dccmake.exe"))
+    return @($dccOut, (Join-Path $repoRoot "dccpeep.exe"), (Join-Path $repoRoot "dccrtlstrip.exe"), (Join-Path $repoRoot "dccmake.exe"), (Join-Path $repoRoot "m80c.exe"), (Join-Path $repoRoot "l80c.exe"))
 }
 
 function Get-UnixCompiler {
@@ -283,6 +295,54 @@ function Get-UnixCompiler {
         return "clang"
     }
     return "gcc"
+}
+
+# Compiles each source to its own object file in parallel runspaces (one
+# process invocation per file, no shared state between them), then returns
+# the object paths in stable source-name order for a deterministic link
+# command. The C compiler does not parallelize across multiple input files
+# within a single invocation, so compiling N files one at a time in this
+# loop previously ran effectively single-threaded even on a many-core
+# machine; each file is an independent compiler subprocess, so this is safe
+# to run concurrently up to the machine's processor count.
+function Invoke-ParallelCompileSources {
+    param(
+        [System.IO.FileInfo[]]$Sources,
+        [string]$Compiler,
+        [string[]]$BaseCflags,
+        [string]$ObjDir,
+        [string]$IncludeDir
+    )
+
+    $throttle = [Environment]::ProcessorCount
+    $results = $Sources | ForEach-Object -ThrottleLimit $throttle -Parallel {
+        $source = $_
+        $compiler = $using:Compiler
+        $baseCflags = $using:BaseCflags
+        $objDir = $using:ObjDir
+        $includeDir = $using:IncludeDir
+        $object = Join-Path $objDir ([System.IO.Path]::ChangeExtension($source.Name, ".o"))
+        $arguments = @($baseCflags) + @("-I", $includeDir, "-c", $source.FullName, "-o", $object)
+        $output = & $compiler @arguments 2>&1
+        [PSCustomObject]@{
+            Name     = $source.Name
+            Object   = $object
+            ExitCode = $LASTEXITCODE
+            Output   = ($output | Out-String)
+        }
+    }
+
+    foreach ($result in ($results | Sort-Object Name)) {
+        Write-Host "  compiling $($result.Name)"
+        if ($result.Output) {
+            Write-Host $result.Output.TrimEnd()
+        }
+        if ($result.ExitCode -ne 0) {
+            throw "compiling $($result.Name) failed with exit code $($result.ExitCode)"
+        }
+    }
+
+    return ($results | Sort-Object Name | ForEach-Object Object)
 }
 
 function Build-UnixNative {
@@ -304,10 +364,12 @@ function Build-UnixNative {
     $baseCflags = if ($env:CFLAGS) {
         @($env:CFLAGS -split "\s+" | Where-Object { $_ })
     } else {
-        # Host build tools (run on the dev machine, not the Z80 target), so
-        # gnu89 is fine and lets glibc declare snprintf/etc. under C89.
-        # -w suppresses compiler warnings for a quiet default build.
-        @("-std=gnu89", "-w", "-O2")
+        # Host build tools run on the development machine, not the Z80 target.
+        # Use the same portable C11 baseline as the Windows/MSVC build.
+        # -w suppresses compiler warnings for a quiet default build. -g
+        # matches the Windows path's /Zi: debug symbols by default even in
+        # an optimized build.
+        @("-std=c11", "-w", "-O2", "-g")
     }
     if ($IsMacOS -and ($baseCflags -notcontains "-fno-common")) {
         $baseCflags += "-fno-common"
@@ -325,39 +387,48 @@ function Build-UnixNative {
         )
     }
 
+    # These are host build tools, not the Z80 target, so static linking is
+    # purely about making the resulting binaries easy to copy/run on a
+    # different Linux box without matching the exact glibc version - not
+    # something Apple's libSystem supports (there is no libSystem.a), so this
+    # only applies on Linux, and only if -NoStatic wasn't passed (e.g.
+    # because the static libc dev package isn't installed).
+    $linkFlags = @()
+    if ($IsLinux -and -not $NoStatic) {
+        $linkFlags = @("-static")
+    }
+
     Write-Host "`n=== Building dcc compiler ==="
     $dccObjDir = Join-Path $outputRoot "dcc"
     $dccOut = Join-Path $repoRoot "dcc"
     New-BuildDirectory $dccObjDir
 
     $dccSources = Get-ChildItem -Path (Join-Path $repoRoot "src\dcc") -Filter "*.c" | Sort-Object Name
-    $dccObjects = @()
-    foreach ($source in $dccSources) {
-        $object = Join-Path $dccObjDir ([System.IO.Path]::ChangeExtension($source.Name, ".o"))
-        $dccObjects += $object
-        $arguments = @($baseCflags) + @("-I", (Join-Path $repoRoot "src\dcc"), "-c", $source.FullName, "-o", $object)
-        Invoke-Checked $compiler $arguments "compiling $($source.Name)"
-    }
-    Invoke-Checked $compiler (@($baseCflags) + $dccObjects + @("-o", $dccOut)) "linking dcc"
+    $dccObjects = Invoke-ParallelCompileSources -Sources $dccSources -Compiler $compiler `
+        -BaseCflags $baseCflags -ObjDir $dccObjDir -IncludeDir (Join-Path $repoRoot "src\dcc")
+    Invoke-Checked $compiler (@($baseCflags) + $dccObjects + $linkFlags + @("-o", $dccOut)) "linking dcc"
 
     $tools = @(
-        @{ Name = "dccpeep"; Source = Join-Path $repoRoot "src\dccpeep\dccpeep.c" },
-        @{ Name = "dccrtlstrip"; Source = Join-Path $repoRoot "src\dccrtlstrip\dccrtlstrip.c" },
-        @{ Name = "dccmake"; Source = Join-Path $repoRoot "src\dccmake\dccmake.c" }
+        @{ Name = "dccpeep"; Sources = @(Get-ChildItem (Join-Path $repoRoot "src/dccpeep") -Filter "*.c" | Sort-Object Name | ForEach-Object FullName) },
+        @{ Name = "dccrtlstrip"; Sources = @((Join-Path $repoRoot "src/dccrtlstrip/dccrtlstrip.c")) },
+        @{ Name = "dccmake"; Sources = @((Join-Path $repoRoot "src/dccmake/dccmake.c")) },
+        @{ Name = "m80c"; Sources = @((Join-Path $repoRoot "src/m80c/m80c.c")) },
+        @{ Name = "l80c"; Sources = @((Join-Path $repoRoot "src/l80c/l80c.c")) }
     )
 
     foreach ($tool in $tools) {
         Write-Host "`n=== Building $($tool.Name) ==="
         $toolObjDir = Join-Path $outputRoot $tool.Name
-        $toolObject = Join-Path $toolObjDir "$($tool.Name).o"
         $toolOut = Join-Path $repoRoot $tool.Name
         New-BuildDirectory $toolObjDir
 
-        Invoke-Checked $compiler (@($baseCflags) + @("-c", $tool.Source, "-o", $toolObject)) "compiling $($tool.Name)"
-        Invoke-Checked $compiler (@($baseCflags) + @($toolObject, "-o", $toolOut)) "linking $($tool.Name)"
+        $toolSources = $tool.Sources | ForEach-Object { Get-Item $_ }
+        $toolObjects = Invoke-ParallelCompileSources -Sources $toolSources -Compiler $compiler `
+            -BaseCflags $baseCflags -ObjDir $toolObjDir -IncludeDir (Split-Path $tool.Sources[0] -Parent)
+        Invoke-Checked $compiler (@($baseCflags) + $toolObjects + $linkFlags + @("-o", $toolOut)) "linking $($tool.Name)"
     }
 
-    return @($dccOut, (Join-Path $repoRoot "dccpeep"), (Join-Path $repoRoot "dccrtlstrip"), (Join-Path $repoRoot "dccmake"))
+    return @($dccOut, (Join-Path $repoRoot "dccpeep"), (Join-Path $repoRoot "dccrtlstrip"), (Join-Path $repoRoot "dccmake"), (Join-Path $repoRoot "m80c"), (Join-Path $repoRoot "l80c"))
 }
 
 Write-Host "Build artifacts will go to: $outputPathDisplay"

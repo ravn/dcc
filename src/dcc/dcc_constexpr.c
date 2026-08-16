@@ -1,324 +1,227 @@
 /*
- * dcc_constexpr.c - integer constant-expression parser.
+ * dcc_constexpr.c - integer constant-expression context wrappers.
  *
- * The parse_const_long_* precedence ladder that evaluates compile-time integer
- * constant expressions directly from the token stream, used for array bounds,
- * enum values, case labels and other contexts requiring a constant.
- *
- * MODULE: compiled as its own translation unit; shared declarations are in dcc.h.
- * Source provenance: monolith src/ddc.c lines 3560-3828.
+ * Typed constant evaluation is implemented by the ConstVal engine in
+ * dcc_fold.c.  This module provides the context-specific conversions used by
+ * declarations and parses the C11 _Static_assert declaration.
  */
 
 #include "dcc.h"
-long parse_const_long_primary(void)
+
+static int parse_integer_const_expr(struct ConstVal *value)
 {
-    long v;
-    int sign;
+    int errors_before;
 
-    sign = 1;
-    if (tok.kind == '!') {
-        next_token();
-        return !parse_const_long_primary();
-    }
-    if (tok.kind == '~') {
-        next_token();
-        return ~parse_const_long_primary();
-    }
-    if (tok.kind == '-') {
-        sign = -1;
-        next_token();
-    } else if (tok.kind == '+') {
-        next_token();
-    }
-
-    if (tok.kind == TOK_ID && strcmp(tok.text, "__offsetof") == 0) {
-        v = parse_offsetof_value();
-        return sign * v;
-    }
-
-    if (tok.kind == TOK_SIZEOF) {
-        next_token();
-        if (accept('(')) {
-            if (starts_type()) {
-                int t;
-                int sz;
-                parse_type_name_decl(&t, &sz);
-                v = sz;
-                (void)t;
-            } else {
-                v = parse_sizeof_expr_operand();
-            }
-            expect(')');
-        } else {
-            if (starts_type()) {
-                int t;
-                int sz;
-                error_here("expected an expression");
-                parse_type_name_decl(&t, &sz);
-                (void)t;
-                (void)sz;
-            } else {
-                error_here("'(' expected after sizeof in constant expression");
-            }
-            v = 2;
-        }
-        return sign * v;
-    }
-
-    if (tok.kind == '(') {
-        next_token();
-
-        /*
-         * Casts are allowed in C constant expressions, and lzpack uses
-         * forms such as (size_t)(MAXDIST * 2).  DCC's small integer model
-         * does not need to distinguish the cast for sizing/initializers, so
-         * parse and ignore the type, then evaluate the cast operand.
-         */
-        if (starts_type()) {
-            int t;
-            t = parse_type();
-            while (accept('*')) { skip_type_qualifiers(); t = type_add_ptr(t); }
-            expect(')');
-            v = parse_const_long_primary();
-            /*
-             * A cast to float rounds through single precision before any
-             * outer integer cast consumes the value: (long)(float)16777217 is
-             * 16777216, because 16777217 is not representable as a 32-bit
-             * float.  This integer-only evaluator otherwise ignores the cast
-             * type, which silently dropped that rounding.  The host build has
-             * real floats, so round the operand the same way the Z80 runtime
-             * would.  Pointer casts (t became a pointer above) are not float. */
-            if (type_is_float(t)) {
-                float ftmp;
-                ftmp = (float)v;
-                v = (long)ftmp;
-            }
-            return sign * v;
-        }
-
-        v = parse_const_long_expr();
-        expect(')');
-        return sign * v;
-    }
-
-    if (tok.kind == TOK_NUM || tok.kind == TOK_CHARLIT) {
-        v = tok.val;
-        next_token();
-        return sign * v;
-    }
-
-    if (tok.kind == TOK_ID) {
-        int i;
-        for (i = 0; i < nenum_consts; ++i) {
-            if (!strcmp(enum_const_names[i], tok.text)) {
-                v = enum_const_values[i];
-                next_token();
-                return sign * v;
-            }
-        }
-    }
-
-    error_here("constant integer expression expected");
+    errors_before = g_diag_error_count;
+    if (try_parse_integer_const_expr_value(value))
+        return 1;
+    if (g_diag_error_count == errors_before)
+        error_here("constant integer expression expected");
     return 0;
 }
 
-long parse_const_long_mul(void)
+int parse_typed_const_int_expr(void)
 {
-    long v;
-    int op;
-    long r;
+    struct ConstVal value;
+    unsigned long raw_value;
 
-    v = parse_const_long_primary();
-    while (tok.kind == '*' || tok.kind == '/' || tok.kind == '%') {
-        op = tok.kind;
-        next_token();
-        r = parse_const_long_primary();
-        if (op == '*') v *= r;
-        else if (op == '/') {
-            if (r == 0) {
-                error_here("division by zero in constant expression");
-                r = 1;
-            }
-            v /= r;
-        } else {
-            if (r == 0) {
-                error_here("division by zero in constant expression");
-                r = 1;
-            }
-            v %= r;
+    if (!parse_integer_const_expr(&value))
+        return 0;
+    if (value.type & TYPE_UNSIGNED) {
+        raw_value = value.u & cf_mask_for_type(value.type);
+        if (raw_value > 0x7fffffffUL) {
+            error_here("integer constant expression out of range");
+            return 0;
         }
+        return (int)raw_value;
     }
-    return v;
+    return (int)cf_signed_value(value);
 }
 
-long parse_const_long_add(void)
+int parse_typed_array_bound_expr(void)
 {
-    long v;
-    int op;
-    long r;
+    int errors_before;
+    int bound;
 
-    v = parse_const_long_mul();
-    while (tok.kind == '+' || tok.kind == '-') {
-        op = tok.kind;
+    errors_before = g_diag_error_count;
+    bound = parse_typed_const_int_expr();
+    if (g_diag_error_count != errors_before)
+        return 1;
+    if (bound <= 0 || (unsigned long)bound > 0xffffUL) {
+        error_here("invalid array bound for 16-bit target");
+        return 1;
+    }
+    return bound;
+}
+
+int parse_typed_designator_index_expr(void)
+{
+    int errors_before;
+    int index;
+
+    errors_before = g_diag_error_count;
+    index = parse_typed_const_int_expr();
+    if (g_diag_error_count != errors_before)
+        return 0;
+    if (index < 0) {
+        error_here("negative array initializer designator");
+        return 0;
+    }
+    if ((unsigned long)index > 0xffffUL) {
+        error_here("array initializer designator out of range");
+        return 0;
+    }
+    return index;
+}
+
+long parse_typed_const_expr_long(void)
+{
+    struct ConstVal value;
+
+    if (try_parse_const_expr_value(&value))
+        return cf_signed_value(value);
+    return 0;
+}
+
+int parse_typed_enum_const_expr(void)
+{
+    struct ConstVal value;
+    long enum_value;
+
+    if (!parse_integer_const_expr(&value))
+        return 0;
+    if (value.type & TYPE_UNSIGNED) {
+        unsigned long raw_value;
+
+        raw_value = value.u & cf_mask_for_type(value.type);
+        if (raw_value > 32767UL) {
+            error_here("enumerator value is not representable as 16-bit int");
+            return 0;
+        }
+        return (int)raw_value;
+    }
+    enum_value = cf_signed_value(value);
+    if (enum_value < -32768L || enum_value > 32767L) {
+        error_here("enumerator value is not representable as 16-bit int");
+        return 0;
+    }
+    return (int)enum_value;
+}
+
+long parse_typed_const_long_expr(void)
+{
+    struct ConstVal value;
+
+    if (parse_integer_const_expr(&value))
+        return cf_signed_value(value);
+    return 0;
+}
+
+static void recover_static_assert_decl(void)
+{
+    while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != ';')
         next_token();
-        r = parse_const_long_mul();
-        if (op == '+') v += r;
-        else v -= r;
-    }
-    return v;
-}
-
-long parse_const_long_shift(void)
-{
-    long v;
-    int op;
-    long r;
-
-    v = parse_const_long_add();
-    while (tok.kind == TOK_SHL || tok.kind == TOK_SHR) {
-        op = tok.kind;
+    if (g_lex.tok.kind == ';')
         next_token();
-        r = parse_const_long_add();
-        if (r < 0) r = 0;
-        if (r > 31) r = 31;
-        if (op == TOK_SHL) v <<= (int)r;
-        else v = (long)((unsigned long)v >> (int)r);
-    }
-    return v;
 }
 
-long parse_const_long_rel(void)
+void parse_static_assert_decl(void)
 {
-    long v;
-    int op;
-    long r;
+    struct Token assert_tok;
+    int assert_line;
+    long assert_pos;
+    int errors_before;
+    struct ConstVal value;
+    const char *prefix;
+    char *message;
+    size_t capacity;
+    size_t used;
 
-    v = parse_const_long_shift();
-    while (tok.kind == '<' || tok.kind == '>' || tok.kind == TOK_LE || tok.kind == TOK_GE) {
-        op = tok.kind;
+    assert_tok = g_lex.tok;
+    assert_line = g_lex.tok_line;
+    assert_pos = g_lex.tok_start_pos;
+    expect(TOK_STATIC_ASSERT);
+    if (g_lex.tok.kind != '(') {
+        error_here("expected '(' in static assertion");
+        recover_static_assert_decl();
+        return;
+    }
+    next_token();
+    errors_before = g_diag_error_count;
+    if (!try_parse_integer_const_expr_value(&value)) {
+        if (g_diag_error_count == errors_before)
+            error_here("constant integer expression expected");
+        recover_static_assert_decl();
+        return;
+    }
+    if (g_diag_error_count != errors_before) {
+        recover_static_assert_decl();
+        return;
+    }
+    if (g_lex.tok.kind != ',') {
+        error_here("expected ',' in static assertion");
+        recover_static_assert_decl();
+        return;
+    }
+    next_token();
+    if (g_lex.tok.kind != TOK_STR && g_lex.tok.kind != TOK_WSTR) {
+        error_here("string literal expected in static assertion");
+        recover_static_assert_decl();
+        return;
+    }
+
+    prefix = "static assertion failed: ";
+    used = strlen(prefix);
+    capacity = used + 1;
+    message = (char *)xmalloc(capacity);
+    strcpy(message, prefix);
+    while (g_lex.tok.kind == TOK_STR || g_lex.tok.kind == TOK_WSTR) {
+        size_t piece_len;
+        size_t needed;
+
+        piece_len = strlen(g_lex.tok.text);
+        needed = used + piece_len + 1;
+        if (needed > capacity) {
+            char *grown;
+
+            capacity = needed * 2;
+            grown = (char *)xmalloc(capacity);
+            memcpy(grown, message, used + 1);
+            free(message);
+            message = grown;
+        }
+        memcpy(message + used, g_lex.tok.text, piece_len + 1);
+        used += piece_len;
         next_token();
-        r = parse_const_long_shift();
-        if (op == '<') v = (v < r);
-        else if (op == '>') v = (v > r);
-        else if (op == TOK_LE) v = (v <= r);
-        else v = (v >= r);
     }
-    return v;
-}
-
-long parse_const_long_eq(void)
-{
-    long v;
-    int op;
-    long r;
-
-    v = parse_const_long_rel();
-    while (tok.kind == TOK_EQ || tok.kind == TOK_NE) {
-        op = tok.kind;
-        next_token();
-        r = parse_const_long_rel();
-        if (op == TOK_EQ) v = (v == r);
-        else v = (v != r);
+    if (g_lex.tok.kind != ')') {
+        error_here("expected ')' after static assertion message");
+        free(message);
+        recover_static_assert_decl();
+        return;
     }
-    return v;
-}
-
-long parse_const_long_band(void)
-{
-    long v;
-
-    v = parse_const_long_eq();
-    while (tok.kind == '&') {
-        next_token();
-        v &= parse_const_long_eq();
+    next_token();
+    if (g_lex.tok.kind != ';') {
+        error_here("expected ';' after static assertion");
+        free(message);
+        return;
     }
-    return v;
-}
-
-long parse_const_long_xor(void)
-{
-    long v;
-
-    v = parse_const_long_band();
-    while (tok.kind == '^') {
-        next_token();
-        v ^= parse_const_long_band();
+    next_token();
+    if (cf_signed_value(value) == 0) {
+        dcc_error_at(assert_tok.file, assert_line, assert_pos,
+                     message, assert_tok.text);
     }
-    return v;
+    free(message);
 }
-
-long parse_const_long_bitor(void)
-{
-    long v;
-
-    v = parse_const_long_xor();
-    while (tok.kind == '|') {
-        next_token();
-        v |= parse_const_long_xor();
-    }
-    return v;
-}
-
-long parse_const_long_andand(void)
-{
-    long v;
-    long r;
-
-    v = parse_const_long_bitor();
-    while (tok.kind == TOK_ANDAND) {
-        next_token();
-        r = parse_const_long_bitor();
-        v = (v && r);
-    }
-    return v;
-}
-
-long parse_const_long_oror(void)
-{
-    long v;
-    long r;
-
-    v = parse_const_long_andand();
-    while (tok.kind == TOK_OROR) {
-        next_token();
-        r = parse_const_long_andand();
-        v = (v || r);
-    }
-    return v;
-}
-
-long parse_const_long_expr(void)
-{
-    long v;
-    long t;
-    long f;
-
-    v = parse_const_long_oror();
-    if (tok.kind == '?') {
-        next_token();
-        t = parse_const_long_expr();
-        expect(':');
-        f = parse_const_long_expr();
-        v = v ? t : f;
-    }
-    return v;
-}
-
-int parse_const_int_expr(void)
-{
-    return (int)(parse_const_long_expr() & 0xffffL);
-}
-
 
 int starts_type(void)
 {
-    return tok.kind == TOK_INT || tok.kind == TOK_LONG || tok.kind == TOK_SHORT || tok.kind == TOK_FLOAT || tok.kind == TOK_CHAR || tok.kind == TOK_VOID ||
-            tok.kind == TOK_BOOL ||
-           tok.kind == TOK_UNSIGNED || tok.kind == TOK_SIGNED || tok.kind == TOK_CONST || tok.kind == TOK_VOLATILE ||
-           tok.kind == TOK_EXTERN || tok.kind == TOK_STATIC || tok.kind == TOK_REGISTER || tok.kind == TOK_AUTO ||
-           tok.kind == TOK_INLINE ||
-           tok.kind == TOK_TYPEDEF || tok.kind == TOK_STRUCT ||
-           tok.kind == TOK_UNION || tok.kind == TOK_ENUM ||
-           (tok.kind == TOK_ID && find_typedef(tok.text) >= 0);
+    return g_lex.tok.kind == TOK_INT || g_lex.tok.kind == TOK_LONG || g_lex.tok.kind == TOK_SHORT || g_lex.tok.kind == TOK_FLOAT || g_lex.tok.kind == TOK_CHAR || g_lex.tok.kind == TOK_VOID ||
+            g_lex.tok.kind == TOK_BOOL ||
+           g_lex.tok.kind == TOK_UNSIGNED || g_lex.tok.kind == TOK_SIGNED || g_lex.tok.kind == TOK_CONST || g_lex.tok.kind == TOK_VOLATILE ||
+           g_lex.tok.kind == TOK_EXTERN || g_lex.tok.kind == TOK_STATIC || g_lex.tok.kind == TOK_REGISTER || g_lex.tok.kind == TOK_AUTO ||
+           g_lex.tok.kind == TOK_INLINE || g_lex.tok.kind == TOK_NORETURN ||
+           g_lex.tok.kind == TOK_TYPEDEF || g_lex.tok.kind == TOK_STRUCT ||
+           g_lex.tok.kind == TOK_UNION || g_lex.tok.kind == TOK_ENUM ||
+           (g_lex.tok.kind == TOK_ID && find_typedef(g_lex.tok.text) >= 0);
 }
-

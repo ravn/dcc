@@ -22,7 +22,7 @@ These limits apply at every language level.
 | `double`, `long double` | not distinct types; use `float` |
 | `long long` | not supported |
 | hosted environment | outside the CP/M 2.2 target model |
-| processes, threads, signals, locales | outside the CP/M 2.2 target model |
+| processes, threads, asynchronous signals, locale databases | outside the CP/M 2.2 target model; C89 signal/locale APIs provide documented CP/M stubs/defaults |
 
 ## Practical implications of the target model
 
@@ -49,7 +49,7 @@ portability surprises when code is moved from a hosted desktop compiler.
 | Function declarations and prototypes | Supported |
 | Old-style function declarations and definitions | Supported |
 | `typedef` | Supported |
-| Storage classes: `auto`, `extern`, `register`, `static` | Supported; `auto` is a no-op and `register` is only a hint |
+| Storage classes: `auto`, `extern`, `register`, `static` | Supported; `auto` is a no-op and `register` is an MIR allocation hint (see below) |
 | Type qualifiers: `const`, `volatile` | Accepted for source compatibility; no CP/M/Z80 memory-model semantics are provided |
 | Expressions and usual arithmetic conversions | Supported within the target type model |
 | `if`, `switch`, loops, `break`, `continue`, `goto`, `return` | Supported |
@@ -59,18 +59,43 @@ portability surprises when code is moved from a hosted desktop compiler.
 | String literals and adjacent string literal concatenation | Supported |
 | Global and automatic initializers | Supported |
 
+### The `register` storage class
+
+`register` is an optimization hint for automatic objects and function
+parameters, including old-style parameter declarations. DCC preserves the
+hint through declaration parsing and MIR object promotion, and the MIR
+register allocator gives profitable register-backed values priority over
+otherwise-equivalent candidates. The allocator can still choose a stack home
+when calls, interference, value width, fixed operands, or transfer costs make
+that choice better, so the keyword does not guarantee a particular Z80
+register.
+
+Taking the address of a register-qualified object is a constraint violation:
+
+```c
+void example(void)
+{
+	register int value;
+	int *pointer = &value; /* error DCC-E0921 */
+}
+```
+
+The same rule applies in an unevaluated expression such as `sizeof &value`
+and to register-qualified function parameters. Arrays, aggregates, wide
+values, and values live across calls may remain in memory while still
+retaining these language semantics.
+
 ## Missing from C89
 
 | Language or environment feature | Status |
 | --- | --- |
 | Distinct `double` and `long double` arithmetic | Not supported |
 | Full hosted C library behavior | Outside the CP/M 2.2 target model |
-| Locale-sensitive execution environment | Outside the CP/M 2.2 target model |
-| Standard signal environment | Outside the CP/M 2.2 target model |
+| Locale-sensitive execution environment | Fixed to the `C` locale; no external locale database |
+| Standard signal environment | APIs exist, but CP/M has no asynchronous delivery; see the header contracts |
 | Wide-character library behavior | Outside the CP/M 2.2 target model |
 | Read-only storage for `const` objects | Outside the CP/M 2.2 memory model |
 | Strict `volatile` memory/device access semantics | Outside the CP/M 2.2 memory model |
-| Forced register allocation from `register` | Not implemented |
 
 ## C99 additions
 
@@ -84,6 +109,7 @@ portability surprises when code is moved from a hosted desktop compiler.
 | Unnamed parameters in prototypes | Supported |
 | Array parameters adjusted to pointers | Supported |
 | C99 array parameter qualifiers: `int a[const 5]`, `int a[static 5]`, `int a[volatile 5]`, `int a[restrict 5]`, `int a[const *]` | Accepted as syntax compatibility; array parameters still decay to pointers |
+| Variable-length arrays (local) | Supported when the only variable dimension is the outermost, with constant inner dimensions (`a[n]`, `a[n][3]`). The array decays to a pointer to stack-allocated storage and is reclaimed at ordinary block-scope exit, including loop iterations, `break`, `continue`, `return`, and a `goto` that leaves the scope (forward or backward, across any number of nested VLA scopes) |
 | Function-typed parameters adjusted to pointers | Supported |
 | `restrict` qualifier | Accepted as source compatibility; no alias-analysis optimization semantics are provided |
 | Variadic macros and `__VA_ARGS__` | Supported |
@@ -100,13 +126,19 @@ portability surprises when code is moved from a hosted desktop compiler.
 | C99 feature | Status |
 | --- | --- |
 | `long long` and 64-bit integer types | Not supported |
-| Variable-length arrays | Not supported |
+| Variable-length arrays with a variable inner dimension (`a[n][m]`) | Not supported; the runtime row stride is not modelled (variable outermost dimension is supported, above) |
+| `goto`/`case` entry into VLA scopes | Not supported; a jump that would bypass a VLA's allocation is rejected. Jumps that *leave* VLA scopes — `break`, `continue`, `return`, and forward or backward `goto` — are fully supported and reclaim the stack correctly |
+| `sizeof` applied to a whole VLA | Supported for DCC's VLA subset; produces the VLA's run-time byte size |
 | `_Complex` and complex arithmetic | Not supported |
 | Full C99 compound literal value semantics | Partly supported only |
 | Flexible array member initialization | Not supported |
 | C99 external `inline` linkage rules | Not implemented |
 | Full C99 floating-point environment | Outside the CP/M 2.2 target model |
 | Full C99 hosted library | Outside the CP/M 2.2 target model |
+
+For the practical VLA guide — supported forms, block-scope reclamation in loops
+and recursion, and worked examples — see
+[Variable-length arrays](03-types-and-conventions.md#variable-length-arrays).
 
 ## C11 additions
 
@@ -115,6 +147,7 @@ portability surprises when code is moved from a hosted desktop compiler.
 | Anonymous `struct` members | Supported |
 | Anonymous `union` members | Supported |
 | Initialization through anonymous aggregate members | Supported |
+| `_Static_assert` declarations | Supported at file, block, and `struct`/`union` member scope; `<assert.h>` also defines `static_assert` |
 
 ## Missing from C11
 

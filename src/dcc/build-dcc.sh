@@ -3,9 +3,8 @@
 # build-dcc.sh - build the modularised dcc compiler (separate compilation).
 #
 # Compiles each module translation unit (dcc.c and the dcc_*.c files, all of
-# which include the umbrella header dcc.h) and links them into the `dcc`
-# executable at the repo root, matching the flags used for the monolithic
-# build so the produced binary and its generated assembly are equivalent.
+# which include the shared dcc contracts) and links them into the `dcc`
+# executable at the repo root using the portable C11 host baseline.
 #
 # Usage (from anywhere):
 #   sh src/dcc/build-dcc.sh            # build ./dcc at the repo root
@@ -27,16 +26,30 @@ if [ -z "$CC" ]; then
         *)      CC=gcc ;;
     esac
 fi
-CFLAGS=${CFLAGS:--std=c89 -Wall -Wextra -O2}
+CFLAGS=${CFLAGS:--std=c11 -Wall -Wextra -O2 -g}
 
 # On macOS, clang can emit large tentative definitions into __DATA,__common
 # with very high alignment (for large objects), which triggers an ld warning
 # about reducing alignment. Force normal definitions to avoid __common.
+#
+# On Linux, link statically by default so the binary is copyable/runnable on
+# another Linux box without matching the exact glibc version - this is a host
+# build tool, not the Z80 target, so that's the only reason to link it any
+# particular way. Not possible on macOS (no static libSystem to link
+# against), so this never applies there. Set STATICFLAGS before calling this
+# script to override (e.g. STATICFLAGS= to force dynamic linking if the
+# static libc dev package, e.g. glibc-static, isn't installed).
 case "$(uname)" in
     Darwin)
         CFLAGS="$CFLAGS -fno-common"
         ;;
 esac
+if [ -z "${STATICFLAGS+set}" ]; then
+    case "$(uname)" in
+        Linux) STATICFLAGS=-static ;;
+        *)     STATICFLAGS= ;;
+    esac
+fi
 
 OUT="$REPO_ROOT/dcc"
 
@@ -45,7 +58,34 @@ if [ "$1" = "-o" ] && [ -n "$2" ]; then
     OUT="$2"
 fi
 
-echo "Building modular dcc -> $OUT"
+# Determine a parallelism level. gcc/clang do not parallelize compilation
+# across multiple input files within one invocation, so a single "$CC ...
+# *.c" call compiling 37+ translation units runs effectively single-threaded
+# (measured ~11.6s wall on a 24-core box, ~11s of it in one thread) even
+# though the individual files compile quickly in isolation (the largest,
+# ~8,700-line file alone compiles in ~1.5s). Compile each file to its own
+# object in parallel, then link once, for the same output with no behavior
+# change - only wall-clock time differs. JOBS=1 restores the old serial
+# per-file behavior if xargs -P misbehaves in some environment.
+if [ -z "${JOBS+set}" ]; then
+    if command -v nproc >/dev/null 2>&1; then
+        JOBS=$(nproc)
+    elif command -v sysctl >/dev/null 2>&1; then
+        JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+    else
+        JOBS=4
+    fi
+fi
+
+OBJDIR=$(mktemp -d "${TMPDIR:-/tmp}/dcc-build-obj.XXXXXX")
+trap 'rm -rf "$OBJDIR"' EXIT
+
+echo "Building modular dcc -> $OUT (parallel compile, $JOBS jobs)"
 # All .c files in this directory are module translation units linked together.
-( cd "$SCRIPT_DIR" && $CC $CFLAGS -I . -o "$OUT" ./*.c )
+# STATICFLAGS is a linker-only flag; it is intentionally applied only at the
+# final link step below, not to the per-file -c compiles.
+( cd "$SCRIPT_DIR" && \
+  ls ./*.c | xargs -P "$JOBS" -I{} sh -c \
+    "$CC $CFLAGS -I . -c '{}' -o \"$OBJDIR/\$(basename '{}' .c).o\"" )
+$CC $CFLAGS $STATICFLAGS -o "$OUT" "$OBJDIR"/*.o
 echo "Done."

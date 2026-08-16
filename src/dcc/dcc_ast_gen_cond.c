@@ -6,6 +6,7 @@
  */
 #include <string.h>
 #include "dcc_ast_gen_internal.h"
+#include "dcc_mir.h"
 
 
 /* ------------------------------------------------------------------------- *
@@ -22,20 +23,16 @@ int ast_return_stmt_supported(const struct AstNode *n)
     int rt = current_return_type;
 
     if (type_is_struct_object(rt)) {
-        struct Sym *rs;
         int src_type;
         if (n->a == NULL)
             return 0;
-        if (n->a->kind == AST_IDENT) {
-            rs = find_sym(n->a->sval);
-            return rs != NULL && !rs->is_const_value && rs->storage != SC_FUNC &&
-                   !rs->is_array && type_is_struct_object(rs->type) &&
-                   same_struct_type(rt, rs->type);
-        }
-        if (n->a->kind == AST_UNARY && n->a->op == '*' &&
-            ast_deref_lvalue_type(n->a, &src_type))
-            return type_is_struct_object(src_type) && same_struct_type(rt, src_type);
-        return 0;
+        /* `return f(args);` where f returns this same struct type: emitted
+         * as a destination-passthrough call (gen_return_ast). */
+        if (n->a->kind == AST_CALL &&
+            ast_struct_return_call_assign_supported(rt, n->a))
+            return 1;
+        return ast_struct_addr_expr_supported(n->a, &src_type) &&
+               same_struct_type(rt, src_type);
     }
     if (rt & (TYPE_PTR | TYPE_PTR2)) {
         int ptr_type;
@@ -83,76 +80,6 @@ int ast_return_stmt_supported(const struct AstNode *n)
 
 /* Emit `return [expr] ;`: evaluate the value into the ABI return registers
  * when present, then jump to the function's shared return label. */
-void gen_return_ast(const struct AstNode *n)
-{
-    if (n->a != NULL && type_is_struct_object(current_return_type)) {
-        int src_type;
-        if (n->a->kind == AST_IDENT) {
-            struct Sym *rs = find_sym(n->a->sval);
-            emit_load_sym_addr(rs);
-        } else {
-            gen_deref_addr_ast(n->a, &src_type);
-            (void)src_type;
-        }
-        emit("\tex de,hl\n");
-        emit("\tld l,(ix+4)\n\tld h,(ix+5)\n");
-        emit_copy_de_to_hl_bytes(type_size(current_return_type));
-        g_expr_type = current_return_type;
-    } else if (n->a != NULL && type_size(current_return_type) == 1) {
-        if (n->a->kind == AST_IDENT) {
-            struct Sym *rs = find_sym(n->a->sval);
-            fprintf(outf, "\tld l,(ix%+d)\n", rs->offset);
-            if (current_return_type & TYPE_UNSIGNED)
-                emit("\tld h,0\n");
-            else
-                emit("\tld a,l\n\trlca\n\tsbc a,a\n\tld h,a\n");
-            if (type_is_bool(current_return_type) && rs->storage == SC_PARAM)
-                emit_bool_normalize_hl(current_return_type);
-            g_expr_type = current_return_type;
-        } else if (n->a->kind == AST_INT_LIT) {
-            fprintf(outf, "\tld hl,%ld\n", n->a->ival & 255);
-            g_expr_type = current_return_type;
-        } else {
-            ast_gen_expr(n->a);
-        }
-    } else if (n->a != NULL) {
-        int ptr_type;
-        int no_deref;
-        if ((current_return_type & (TYPE_PTR | TYPE_PTR2)) &&
-            n->a->kind == AST_CAST)
-            ast_gen_expr(n->a->a);
-        else if ((current_return_type & (TYPE_PTR | TYPE_PTR2)) &&
-                 ast_pointer_expr_type(n->a, &ptr_type, &no_deref))
-            gen_pointer_expr_ast(n->a, &ptr_type, &no_deref);
-        else
-            ast_gen_expr(n->a);
-    }
-    if (n->a != NULL) {
-        if (type_is_bool(current_return_type)) {
-            /* Only non-bool sources need normalising; a bool value is 0/1. */
-            if (!ast_expr_yields_bool01(n->a))
-                emit_bool_normalize_hl(g_expr_type);
-            g_expr_type = current_return_type;
-        } else if (type_is_float(current_return_type) && !type_is_float(g_expr_type)) {
-            emit_convert_int_to_float(g_expr_type);
-            g_expr_type = current_return_type;
-        } else if (!type_is_float(current_return_type) && type_is_float(g_expr_type)) {
-            emit_convert_float_to_intlike(current_return_type);
-            g_expr_type = current_return_type;
-        } else if (type_size(current_return_type) == 1 && !type_is_long(g_expr_type)) {
-            if (current_return_type & TYPE_UNSIGNED)
-                emit("\tld h,0\n");
-            else
-                emit("\tld a,l\n\trlca\n\tsbc a,a\n\tld h,a\n");
-            g_expr_type = current_return_type;
-        } else if (type_is_long(current_return_type) && !type_is_long(g_expr_type)) {
-            emit_promote_int_to_long(g_expr_type, current_return_type);
-            g_expr_type = current_return_type;
-        }
-    }
-    emit_jp_label("jp", current_return_label);
-}
-
 /* A comparison operand that reaches the plain-16-bit direct-branch
  * path: a non-const, non-array, size-2 plain-int (signed/unsigned) or pointer
  * identifier reachable by the direct load (IX-direct local/param or global
@@ -394,13 +321,83 @@ int ast_is_const_plain_int_cmp_cond(const struct AstNode *n)
 }
 
 /* Translate a comparison operand expression into a ByteOperand, or return 0.
- * Recognises three kinds: kind 1 (IX-direct UNSIGNED char local/param),
- * kind 2 (0..255 constant), and kind 3 (global byte array element, indexed by
- * either a constant or an IX-direct UNSIGNED char local/param). The kind-3
+ * Recognises four kinds: kind 1 (IX-direct UNSIGNED char local/param),
+ * kind 2 (0..255 constant), kind 3 (global byte array element, indexed by
+ * either a constant or an IX-direct UNSIGNED char local/param), and kind 4
+ * (`*p`, p an IX-direct pointer-to-unsigned-char local/param - e.g. the very
+ * common `for (...) if (*p != val) ...; p++;` byte-scan loop). The kind-3
  * emitters (emit_byte_operand_to_a / emit_cp_byte_operand in dcc_cmp.c)
  * zero-extend op->idx_sym's single byte into D before the address add, so a
  * qualifying index must itself be a byte - a wider index is not handled here
  * (falls through to the generic path, same as any other unsupported shape). */
+
+static int ast_strip_byte_cast_mask_cond(const struct AstNode **ep)
+{
+    long mask;
+    const struct AstNode *e = *ep;
+
+    if (e != NULL && e->kind == AST_CAST && type_size(e->type) == 1)
+        e = e->a;
+    if (e != NULL && e->kind == AST_BINARY && e->op == '&' &&
+        e->b != NULL && e->b->kind == AST_INT_LIT &&
+        ((unsigned long)e->b->ival & 0xffffffffUL) == 255UL)
+        e = e->a;
+    if (e != NULL && e->kind == AST_CAST && type_size(e->type) == 1)
+        e = e->a;
+    (void)mask;
+    *ep = e;
+    return e != NULL;
+}
+
+static int ast_low_byte_sum_operand_cond(const struct AstNode *e, struct ByteOperand *op)
+{
+    struct Sym *s;
+    struct Sym *t;
+    const struct AstNode *lhs;
+    const struct AstNode *rhs;
+
+    if (!ast_strip_byte_cast_mask_cond(&e))
+        return 0;
+
+    if (e->kind == AST_IDENT) {
+        s = find_sym(e->sval);
+        if (s != NULL && sym_can_ix_direct(s) && type_size(s->type) <= 4) {
+            op->kind = 6;
+            op->sym = s;
+            op->idx_sym = NULL;
+            op->val = 0;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (e->kind != AST_BINARY || e->op != '+')
+        return 0;
+    lhs = e->a;
+    rhs = e->b;
+    if (lhs == NULL || lhs->kind != AST_IDENT)
+        return 0;
+    s = find_sym(lhs->sval);
+    if (s == NULL || !sym_can_ix_direct(s) || type_size(s->type) > 4)
+        return 0;
+    op->kind = 6;
+    op->sym = s;
+    op->idx_sym = NULL;
+    op->val = 0;
+    if (rhs != NULL && rhs->kind == AST_IDENT) {
+        t = find_sym(rhs->sval);
+        if (t == NULL || !sym_can_ix_direct(t) || type_size(t->type) > 4)
+            return 0;
+        op->idx_sym = t;
+        return 1;
+    }
+    if (rhs != NULL && rhs->kind == AST_INT_LIT) {
+        op->val = rhs->ival;
+        return 1;
+    }
+    return 0;
+}
+
 int ast_byte_operand(const struct AstNode *e, struct ByteOperand *op)
 {
     struct Sym *s;
@@ -410,8 +407,8 @@ int ast_byte_operand(const struct AstNode *e, struct ByteOperand *op)
         return 0;
     if (e->kind == AST_IDENT) {
         s = find_sym(e->sval);
-        if (s != NULL && sym_can_ix_direct(s) && type_size(s->type) == 1 &&
-            (s->type & TYPE_UNSIGNED)) {
+        if (s != NULL && sym_can_ix_direct(s) &&
+            type_size(s->type) == 1 && (s->type & TYPE_UNSIGNED)) {
             op->kind = 1;
             op->sym = s;
             return 1;
@@ -429,29 +426,86 @@ int ast_byte_operand(const struct AstNode *e, struct ByteOperand *op)
     if (e->kind == AST_INDEX && e->a != NULL && e->a->kind == AST_IDENT &&
         e->b != NULL) {
         struct Sym *arr = find_global(e->a->sval);
-        if (arr == NULL || !arr->is_array || type_size(arr->type) != 1)
+        if (arr != NULL && arr->is_array && type_size(arr->type) == 1) {
+            if (e->b->kind == AST_INT_LIT) {
+                if (e->b->ival < 0)
+                    return 0;
+                op->kind = 3;
+                op->sym = arr;
+                op->idx_sym = NULL;
+                op->val = e->b->ival;
+                return 1;
+            }
+            if (e->b->kind == AST_IDENT) {
+                struct Sym *idx = find_sym(e->b->sval);
+                if (idx == NULL || !sym_can_ix_direct(idx) ||
+                    type_size(idx->type) != 1 || !(idx->type & TYPE_UNSIGNED))
+                    return 0;
+                op->kind = 3;
+                op->sym = arr;
+                op->idx_sym = idx;
+                return 1;
+            }
             return 0;
-        if (e->b->kind == AST_INT_LIT) {
-            if (e->b->ival < 0)
-                return 0;
-            op->kind = 3;
-            op->sym = arr;
-            op->idx_sym = NULL;
-            op->val = e->b->ival;
-            return 1;
         }
-        if (e->b->kind == AST_IDENT) {
-            struct Sym *idx = find_sym(e->b->sval);
-            if (idx == NULL || !sym_can_ix_direct(idx) ||
-                type_size(idx->type) != 1 || !(idx->type & TYPE_UNSIGNED))
-                return 0;
-            op->kind = 3;
-            op->sym = arr;
-            op->idx_sym = idx;
-            return 1;
-        }
-        return 0;
+        /* Not a global byte array: fall through so the local pointer
+         * subscript case below can recognise forms such as b[i]. */
     }
+    if (e->kind == AST_UNARY && e->op == '*' &&
+        e->a != NULL && e->a->kind == AST_IDENT) {
+        int base;
+        struct Sym *ps = find_sym(e->a->sval);
+        if (ps == NULL || !sym_can_ix_direct(ps))
+            return 0;
+        base = type_decay_ptr(ps->type);
+        if (type_size(base) != 1 || !(base & TYPE_UNSIGNED))
+            return 0;
+        op->kind = 4;
+        op->sym = ps;
+        return 1;
+    }
+    if (e->kind == AST_INDEX && e->a != NULL && e->a->kind == AST_IDENT &&
+        e->b != NULL) {
+        int base;
+        struct Sym *ps = find_sym(e->a->sval);
+        if (ps != NULL && sym_can_ix_direct(ps)) {
+            base = type_decay_ptr(ps->type);
+            if (type_size(base) == 1) {
+                if (e->b->kind == AST_IDENT) {
+                    struct Sym *idx = find_sym(e->b->sval);
+                    /* A byte-sized (unsigned) index is just as valid as a
+                     * plain int one here - emit_byte_operand_to_a/
+                     * emit_cp_byte_operand (dcc_cmp.c) branch on the index
+                     * symbol's own size to zero-extend a byte or load both
+                     * bytes of an int, either way producing the right 16-bit
+                     * offset. Originally only the 2-byte case was handled;
+                     * once a loop counter narrows to a byte (e.g. via
+                     * try_narrow_for_counter), a `p[i]` comparison like
+                     * tests/tbig.c's `b[i] != (char)((rec+i)&0xff)` no
+                     * longer matched this fast path at all and fell all the
+                     * way back to full long-arithmetic codegen - a real
+                     * performance regression, not just a missed byte-sized
+                     * optimization. */
+                    if (idx != NULL && sym_can_ix_direct(idx) &&
+                        (type_size(idx->type) == 2 ||
+                         (type_size(idx->type) == 1 && (idx->type & TYPE_UNSIGNED)))) {
+                        op->kind = 5;
+                        op->sym = ps;
+                        op->idx_sym = idx;
+                        return 1;
+                    }
+                } else if (e->b->kind == AST_INT_LIT && e->b->ival >= 0) {
+                    op->kind = 5;
+                    op->sym = ps;
+                    op->idx_sym = NULL;
+                    op->val = e->b->ival;
+                    return 1;
+                }
+            }
+        }
+    }
+    if (ast_low_byte_sum_operand_cond(e, op))
+        return 1;
     return 0;
 }
 
@@ -712,11 +766,89 @@ int ast_is_float_cmp_cond(const struct AstNode *n)
  * only a conservative whitelist proven to reach the generic path; anything else
  * defers (always safe).  The while gate additionally excludes bare deref
  * conditions that belong to pointer-walk fast paths. */
+static int ast_cond_indexed_array_row_operand(const struct AstNode *n, int *out_count);
+
+static int ast_cond_not_indexed_scalar(const struct AstNode *n)
+{
+    int elem_type;
+
+    if (n == NULL || n->kind != AST_UNARY || n->op != '!' ||
+        n->a == NULL || n->a->kind != AST_INDEX)
+        return 0;
+    if (ast_cond_indexed_array_row_operand(n->a, NULL))
+        return 0;
+    if (!ast_index_lvalue_elem_type(n->a, &elem_type))
+        return 0;
+    return !type_is_struct_object(elem_type);
+}
+
+static int ast_cond_indexed_array_row_operand(const struct AstNode *n, int *out_count)
+{
+    const struct AstNode *root;
+    struct Sym *s;
+    int count;
+
+    if (n == NULL || n->kind != AST_INDEX)
+        return 0;
+
+    root = n;
+    count = 0;
+    while (root != NULL && root->kind == AST_INDEX) {
+        if (root->b == NULL || !ast_index_subscript_supported(root->b))
+            return 0;
+        count++;
+        root = root->a;
+    }
+
+    if (root == NULL || count <= 0)
+        return 0;
+    if (out_count != NULL)
+        *out_count = count;
+    if (root->kind == AST_IDENT) {
+        s = find_sym(root->sval);
+        if (s == NULL || s->is_const_value || s->storage == SC_FUNC)
+            return 0;
+        if (s->is_array)
+            return s->dim_count > count;
+        return type_ptr_depth(s->type) > 0 && s->dim_count + 1 > count;
+    }
+    if (root->kind == AST_MEMBER) {
+        int cur_type;
+        int sid;
+        struct FieldDef *fd;
+
+        if (!ast_member_base_type(root, &cur_type))
+            return 0;
+        sid = base_struct_id_from_type(cur_type);
+        fd = find_field_def(sid, root->sval);
+        return fd != NULL && fd->is_array && fd->bit_width <= 0 &&
+               fd->dim_count > count;
+    }
+    return 0;
+}
+
+static int ast_cond_not_indexed_array_row(const struct AstNode *n)
+{
+    int count;
+
+    return n != NULL && n->kind == AST_UNARY && n->op == '!' &&
+           ast_cond_indexed_array_row_operand(n->a, &count) && count == 1;
+}
+
 int ast_cond_generic(const struct AstNode *n)
 {
     long cv;
     if (n == NULL)
         return 0;
+    if (n->kind == AST_COMMA)
+        /* `a , b` as a controlling expression: `a` is evaluated for its side
+         * effects (value discarded) and `b` is the condition tested.  Gate the
+         * left operand as a dead-result expression (same rule the for-init /
+         * increment / expression-statement paths use, so a pointer postfix or
+         * `x += c` left operand that has no value-context lowering is still
+         * accepted) and require the right operand to be a generic condition. */
+        return (ast_is_local_self_add_stmt(n->a) || ast_dead_expr_supported(n->a)) &&
+               ast_cond_generic(n->b);
     if (ast_const_condition_fold(n, &cv))
         return 1;
     if (ast_is_const_cmp_cond(n))
@@ -743,6 +875,10 @@ int ast_cond_generic(const struct AstNode *n)
         (ast_value_is_float_word(n) || ast_value_is_pointer_word(n) ||
          ast_value_is_long_word(n)) &&
         !ast_node_is_const(n))
+        return 1;
+    if (ast_cond_not_indexed_array_row(n))
+        return 1;
+    if (ast_cond_not_indexed_scalar(n))
         return 1;
     if (!ast_gen_supported(n) || !ast_value_is_plain_int(n))
         return 0;
@@ -861,10 +997,10 @@ void ast_emit_local_self_add_stmt(const struct AstNode *e)
     struct Sym *rhs1_sym = find_sym(rhs1->sval);
     struct Sym *rhs2_sym = find_sym(rhs2->sval);
 
-    fprintf(outf, "\tld l,(ix%+d)\n", rhs1_sym->offset);
-    fprintf(outf, "\tld h,(ix%+d)\n", rhs1_sym->offset + 1);
-    fprintf(outf, "\tld e,(ix%+d)\n", rhs2_sym->offset);
-    fprintf(outf, "\tld d,(ix%+d)\n", rhs2_sym->offset + 1);
+    fprintf(g_emit_sink.stream, "\tld l,(ix%+d)\n", rhs1_sym->offset);
+    fprintf(g_emit_sink.stream, "\tld h,(ix%+d)\n", rhs1_sym->offset + 1);
+    fprintf(g_emit_sink.stream, "\tld e,(ix%+d)\n", rhs2_sym->offset);
+    fprintf(g_emit_sink.stream, "\tld d,(ix%+d)\n", rhs2_sym->offset + 1);
     if ((rhs1_sym->type & (TYPE_PTR | TYPE_PTR2)) &&
         !(rhs2_sym->type & (TYPE_PTR | TYPE_PTR2))) {
         int elem = type_index_elem_size(rhs1_sym->type);
@@ -884,14 +1020,14 @@ void ast_emit_local_self_add_stmt(const struct AstNode *e)
             (rhs2_sym->type & (TYPE_PTR | TYPE_PTR2))) {
             int elem = type_index_elem_size(rhs1_sym->type);
             if (elem > 1) {
-                fprintf(outf, "\tld de,%d\n", elem);
+                fprintf(g_emit_sink.stream, "\tld de,%d\n", elem);
                 emit_runtime_call("__divs");
             }
         }
     }
-    fprintf(outf, "\tld (ix%+d),l\n", lhs_sym->offset);
-    fprintf(outf, "\tld (ix%+d),h\n", lhs_sym->offset + 1);
-    g_expr_type = lhs_sym->type;
+    fprintf(g_emit_sink.stream, "\tld (ix%+d),l\n", lhs_sym->offset);
+    fprintf(g_emit_sink.stream, "\tld (ix%+d),h\n", lhs_sym->offset + 1);
+    g_expr.type = lhs_sym->type;
 }
 
 /* For a dead-result top-level ++/-- statement on a bare identifier, return the
@@ -919,7 +1055,8 @@ int ast_deadincdec_member_ok(const struct AstNode *e)
     int t;
     if (e->a == NULL || e->a->kind != AST_MEMBER)
         return 0;
-    if (!ast_member_lvalue_type(e->a, &t))
+    if (!ast_member_bitfield_lvalue_type(e->a, &t) &&
+        !ast_member_lvalue_type(e->a, &t))
         return 0;
     if (type_ptr_depth(t) > 0)
         return type_index_elem_size(t) == 1;
@@ -1000,7 +1137,8 @@ int ast_deadincdec_addr_lvalue_type(const struct AstNode *e, int *out_type)
         t = s->type;
         break;
     case AST_MEMBER:
-        if (!ast_member_lvalue_type(lv, &t))
+        if (!ast_member_bitfield_lvalue_type(lv, &t) &&
+            !ast_member_lvalue_type(lv, &t))
             return 0;
         break;
     case AST_UNARY:
@@ -1051,6 +1189,9 @@ int ast_dead_expr_supported(const struct AstNode *e)
     int ok;
     if (e == NULL)
         return 0;
+    if (e->kind == AST_COMMA)
+        return (ast_is_local_self_add_stmt(e->a) || ast_dead_expr_supported(e->a)) &&
+               (ast_is_local_self_add_stmt(e->b) || ast_dead_expr_supported(e->b));
     if ((e->kind == AST_UNARY || e->kind == AST_POSTFIX) &&
         (e->op == TOK_INC || e->op == TOK_DEC)) {
         /* Dead-result ++/-- statement: mirror the sym-direct fast path
@@ -1065,7 +1206,8 @@ int ast_dead_expr_supported(const struct AstNode *e)
         return 0;
     }
     if (e->kind == AST_CAST && (e->type & 15) == TYPE_VOID)
-        return e->a != NULL && ast_gen_supported(e->a);
+        return e->a != NULL &&
+               (ast_is_local_self_add_stmt(e->a) || ast_dead_expr_supported(e->a));
     if (ast_is_local_self_add_stmt(e))
         return 0;
     /* Evaluate the support gate in the SAME dead-result context the walker will
@@ -1083,20 +1225,23 @@ int ast_dead_expr_supported(const struct AstNode *e)
 
 int ast_for_init_expr_supported(const struct AstNode *e)
 {
-    int old_dead;
-    int ok;
+    /* The for-init clause is a full expression evaluated only for its side
+     * effects - its value is discarded - exactly like the third (increment)
+     * clause and an ordinary expression statement (C89 6.6.5 / C99-C11 6.8.5:
+     * `for ( expression_opt ; expression_opt ; expression_opt )`).  Gate it
+     * with the same dead-result rule those two paths use so every emittable
+     * side-effecting form is accepted uniformly: plain and compound assignment
+     * (`i = 0`, `i += 5`, `*p -= 1`, `a[k] |= m`), pre/post increment and
+     * decrement (including pointer postfix, which has no value-context
+     * lowering), comma expressions, function calls, the `x = a + b` local
+     * self-add shape, and a discarded `(void)` cast.  The walker emits the
+     * init through ast_gen_dead_expr, which mirrors this gate exactly, so
+     * anything accepted here is emittable and anything genuinely unsupported
+     * on the Z80 target is declined cleanly (the whole for statement falls
+     * back to the DCC-E1002 diagnostic rather than miscompiling). */
     if (e == NULL)
-        return 1;
-    old_dead = expr_result_dead;
-    expr_result_dead = 1;
-    if (e->kind == AST_ASSIGN)
-        ok = e->op == '=' && ast_gen_supported(e);
-    else if (e->kind == AST_COMMA)
-        ok = ast_gen_supported(e);
-    else
-        ok = e->kind == AST_CALL && ast_gen_supported(e);
-    expr_result_dead = old_dead;
-    return ok;
+        return 1;                         /* empty init clause */
+    return ast_is_local_self_add_stmt(e) || ast_dead_expr_supported(e);
 }
 
 /* Is the expression-statement node `n` (n->a is the expression) AST-emittable?
@@ -1193,25 +1338,25 @@ int ast_stmt_supported(const struct AstNode *n)
         int rename_count;
         /* Narrow slice: for ([init] ; [cond] ; [inc]) body.  The builder
          * stores init in a, cond in b, inc in c, and body in d.  A C99 for-init
-         * declaration arrives as an AST_DECL span; ast_gen_for_stmt replays it
-         * through declaration codegen and for-scope rename
+         * declaration arrives as an AST_DECL span; the metadata walker replays
+         * it through declaration parsing and for-scope rename
          * machinery.  An expression init excludes the transform-prone constant
          * assignment shape and must have no recorded for-scope renames.
          *
-         * This gate mirrors ast_gen_for_stmt's pre-order g_for_seq numbering.
+         * This gate mirrors the metadata walker's pre-order for_seq numbering.
          * For a for-init declaration the loop variable's local slot does not
          * exist yet (codegen creates it only when the declaration is emitted),
          * so we replay the declaration with emission suppressed (scan_mode) to
          * materialise the slot and push its rename, gate the
          * condition/increment/body while they can resolve, then roll back the
-         * local table and rename stack.  g_for_seq is intentionally left at the
+         * local table and rename stack.  g_func_pass.for_seq is intentionally left at the
          * post-order cursor for sibling gates; the top-level AST statement
          * probe restores it before real emission. */
         if (n->d == NULL)
             return 0;
-        if (g_for_seq >= MAX_FOR_SCOPES)
+        if (g_func_pass.for_seq >= MAX_FOR_SCOPES)
             return 0;
-        for_seq = g_for_seq++;
+        for_seq = g_func_pass.for_seq++;
         /* g_for_rename_count[] is indexed by for_seq, reused across
          * functions and across passes; nothing resets it on its own now
          * that dcc_func.c's old hand-written frame-sizing scanner (which
@@ -1219,59 +1364,69 @@ int ast_stmt_supported(const struct AstNode *n)
          * gone. Reset unconditionally before reading it, so a plain
          * expression init reliably sees "no renames" instead of whatever a
          * decl-init loop that previously owned this for_seq slot left
-         * behind - matching the same reset in ast_gen_for_stmt. Not rolled
+         * behind - matching the same reset in ast_plan_for_metadata. Not rolled
          * back afterward: this probe's own speculative work IS rolled back
-         * below (nlocals/local_size/etc.), but the real ast_gen_for_stmt
-         * call that follows for this same for_seq always resets and
+         * below (nlocals/local_size/etc.), but the real metadata walk
+         * that follows for this same for_seq always resets and
          * re-records its own count independently regardless, so leaving
          * this slot at whatever this probe computed cannot affect it. */
         g_for_rename_count[for_seq] = 0;
         rename_count = g_for_rename_count[for_seq];
 
         if (n->a != NULL && n->a->kind == AST_DECL) {
-            int s_nlocals = nlocals;
-            int s_local_size = local_size;
-            int s_forren_n = g_forren_n;
+            int s_nlocals = g_frame.nlocals;
+            int s_local_size = g_frame.local_size;
+            int s_forren_n = g_func_pass.forren_n;
             int s_nulabels = nulabels;
-            int s_static_seq = g_static_local_seq;
-            int s_scope_depth = g_scope_depth;
+            int s_static_seq = g_func_pass.static_local_seq;
+            int s_scope_depth = g_func_pass.scope_depth;
             int s_has_call = current_function_has_call;
-            int s_decl_seq = g_for_decl_seq;
-            int s_decl_index = g_for_decl_rename_index;
-            int s_decl_recording = g_for_decl_recording;
+            int s_decl_seq = g_func_pass.for_decl_seq;
+            int s_decl_index = g_func_pass.for_decl_rename_index;
+            int s_decl_recording = g_func_pass.for_decl_recording;
+            int s_decl_nonobject = g_for_decl_saw_nonobject;
+            int decl_object_count;
+            int decl_saw_nonobject;
             int s_scan_mode = scan_mode;
-            FILE *s_outf = outf;
-            static FILE *sink = NULL;
 
-            ok = 1;
-            /* Redirect emission to a throwaway sink so the suppressed replay
-             * cannot leak partial output (scan_mode guards most but not every
-             * emit path), and set scan_mode so nested AST build/gen and the
-             * remaining guarded emits stay quiet.
-             *
-             * g_for_decl_recording=1 (not 0): nothing pre-populates
-             * g_for_rename_count[for_seq] any more (see the matching comment
-             * in ast_gen_for_stmt - the hand-written frame-sizing scanner
+            ok = ast_for_decl_storage_supported(n->a);
+            /* g_func_pass.for_decl_recording=1 (not 0): nothing pre-populates
+            * g_for_rename_count[for_seq] any more (see ast_plan_for_metadata);
+            * the hand-written frame-sizing scanner
              * that used to do that recording is gone), so this probe must
              * record its own fresh count from the just-reset slot rather
              * than validate against a stale/zero one. */
-            if (sink == NULL)
-                sink = fopen(DCC_NULL_DEVICE, "w");
-            if (sink != NULL)
-                outf = sink;
             scan_mode = 1;
-            g_for_decl_seq = for_seq;
-            g_for_decl_rename_index = 0;
-            g_for_decl_recording = 1;
-            ast_emit_decl_span(n->a);
-            g_for_decl_seq = s_decl_seq;
-            g_for_decl_rename_index = s_decl_index;
-            g_for_decl_recording = s_decl_recording;
+            g_func_pass.for_decl_seq = for_seq;
+            g_func_pass.for_decl_rename_index = 0;
+            g_func_pass.for_decl_recording = 1;
+            g_for_decl_saw_nonobject = 0;
+            if (ok) {
+                if (mir_is_active())
+                    ast_replay_decl_span(n->a);
+                else
+                    ast_scan_decl_span(n->a);
+            }
+            decl_object_count = g_func_pass.for_decl_rename_index;
+            decl_saw_nonobject = g_for_decl_saw_nonobject;
+            /* Declaration replay changes the symbols visible to the loop's
+             * condition, increment and body. Discard support decisions that
+             * may have been cached while the builder inspected those nodes
+             * before the for-init local existed. */
+            ast_support_cache_begin();
+            g_func_pass.for_decl_seq = s_decl_seq;
+            g_func_pass.for_decl_rename_index = s_decl_index;
+            g_func_pass.for_decl_recording = s_decl_recording;
+            g_for_decl_saw_nonobject = s_decl_nonobject;
 
-            if (n->b != NULL && !ast_cond_generic(n->b)) {
+            if (ok && (decl_object_count == 0 || decl_saw_nonobject)) {
                 ok = 0;
             }
-            if (ok && n->c != NULL && !ast_dead_expr_supported(n->c)) {
+            if (ok && n->b != NULL && !ast_cond_generic(n->b)) {
+                ok = 0;
+            }
+            if (ok && n->c != NULL &&
+                !ast_is_local_self_add_stmt(n->c) && !ast_dead_expr_supported(n->c)) {
                 ok = 0;
             }
             if (ok) {
@@ -1281,14 +1436,13 @@ int ast_stmt_supported(const struct AstNode *n)
                 nflow = old_nflow;
             }
             scan_mode = s_scan_mode;
-            outf = s_outf;
 
-            nlocals = s_nlocals;
-            local_size = s_local_size;
-            g_forren_n = s_forren_n;
+            g_frame.nlocals = s_nlocals;
+            g_frame.local_size = s_local_size;
+            g_func_pass.forren_n = s_forren_n;
             nulabels = s_nulabels;
-            g_static_local_seq = s_static_seq;
-            g_scope_depth = s_scope_depth;
+            g_func_pass.static_local_seq = s_static_seq;
+            g_func_pass.scope_depth = s_scope_depth;
             current_function_has_call = s_has_call;
             return ok;
         }
@@ -1302,7 +1456,8 @@ int ast_stmt_supported(const struct AstNode *n)
         if (n->b != NULL && !ast_cond_generic(n->b)) {
             return 0;
         }
-        if (n->c != NULL && !ast_dead_expr_supported(n->c)) {
+        if (n->c != NULL &&
+            !ast_is_local_self_add_stmt(n->c) && !ast_dead_expr_supported(n->c)) {
             return 0;
         }
         old_nflow = nflow;
@@ -1333,10 +1488,9 @@ int ast_stmt_supported(const struct AstNode *n)
          * *later* sibling referencing a block-local name cannot resolve it at
          * gate time because codegen only creates the local when the decl is
          * emitted.  So replay each declaration with emission suppressed
-         * (scan_mode + a throwaway outf sink) to materialise its local slots
-         * and scope, gate the remaining children while they resolve, then roll
-         * back every mutated codegen counter (ast_gen_stmt re-emits the decls
-         * for real). */
+         * in scan mode to materialise its local slots and scope, gate the
+         * remaining children while they resolve, then roll back every mutated
+         * parser counter. */
         int i;
         int ok;
         int has_decl;
@@ -1356,28 +1510,25 @@ int ast_stmt_supported(const struct AstNode *n)
         }
 
         {
-            int s_nlocals = nlocals;
-            int s_local_size = local_size;
-            int s_scope_depth = g_scope_depth;
-            int s_forren_n = g_forren_n;
+            int s_nlocals = g_frame.nlocals;
+            int s_local_size = g_frame.local_size;
+            int s_scope_depth = g_func_pass.scope_depth;
+            int s_forren_n = g_func_pass.forren_n;
             int s_nulabels = nulabels;
-            int s_static_seq = g_static_local_seq;
+            int s_static_seq = g_func_pass.static_local_seq;
             int s_has_call = current_function_has_call;
             int s_scan_mode = scan_mode;
-            FILE *s_outf = outf;
-            static FILE *sink = NULL;
 
-            if (sink == NULL)
-                sink = fopen(DCC_NULL_DEVICE, "w");
-            if (sink != NULL)
-                outf = sink;
             scan_mode = 1;
             enter_scope();
             ok = 1;
             for (i = 0; i < n->list_len; ++i) {
                 struct AstNode *c = n->list[i];
                 if (c->kind == AST_DECL) {
-                    ast_emit_decl_span(c);
+                    if (mir_is_active())
+                        ast_replay_decl_span(c);
+                    else
+                        ast_scan_decl_span(c);
                 } else if (!ast_stmt_supported(c)) {
                     ok = 0;
                     break;
@@ -1385,14 +1536,13 @@ int ast_stmt_supported(const struct AstNode *n)
             }
             leave_scope();
             scan_mode = s_scan_mode;
-            outf = s_outf;
 
-            nlocals = s_nlocals;
-            local_size = s_local_size;
-            g_scope_depth = s_scope_depth;
-            g_forren_n = s_forren_n;
+            g_frame.nlocals = s_nlocals;
+            g_frame.local_size = s_local_size;
+            g_func_pass.scope_depth = s_scope_depth;
+            g_func_pass.forren_n = s_forren_n;
             nulabels = s_nulabels;
-            g_static_local_seq = s_static_seq;
+            g_func_pass.static_local_seq = s_static_seq;
             current_function_has_call = s_has_call;
             return ok;
         }
@@ -1419,10 +1569,10 @@ void ast_gen_cmp_branch(const struct AstNode *n, int label,
 
     ptr_cmp = ast_operand_is_ptr_ident(n->a) || ast_operand_is_ptr_ident(n->b);
     ast_gen_expr(n->a);
-    lhs_type = g_expr_type;
+    lhs_type = g_expr.type;
     emit("\tpush hl\n");
     ast_gen_expr(n->b);
-    rhs_type = g_expr_type;
+    rhs_type = g_expr.type;
     common_type = common_arith_type(lhs_type, rhs_type);
     emit("\tex de,hl\n\tpop hl\n");
     if ((common_type & TYPE_UNSIGNED) || ptr_cmp) {
@@ -1472,6 +1622,22 @@ void ast_gen_byte_cmp_branch(const struct AstNode *n, int label,
         lhs = rhs;
         rhs = tmp;
     }
+    /* A kind-6 operand (an arithmetic expression, e.g. `(rec + i) & 0xff`)
+     * needs A as scratch to compute, clobbering whatever the other
+     * operand's value was already loaded there - forcing emit_cp_byte_
+     * operand's own kind-6 case to park the other value in B (and the
+     * freshly computed one in C) before the actual compare. Every other
+     * kind's cp form reaches its value without ever touching A (a direct
+     * ix-relative/global cp, or address math using only e/d/hl), so if the
+     * kind-6 operand ends up on the right, swap it to the left instead:
+     * computing it into A first needs no preservation, and the original
+     * left operand's cheap cp form becomes the final step - no B/C at all. */
+    if (rhs.kind == 6 && lhs.kind != 6) {
+        op = invert_relop_for_swap(op);
+        tmp = lhs;
+        lhs = rhs;
+        rhs = tmp;
+    }
     emit_byte_operand_to_a(&lhs);
     emit_cp_byte_operand(&rhs);
     emit_byte_cmp_branch_after_cp(op, label, branch_when_true);
@@ -1485,8 +1651,8 @@ void ast_gen_direct_byte_bitand_branch(const struct AstNode *n, int label,
 
     s = find_sym(n->a->sval);
     mask = n->b->ival & 255;
-    fprintf(outf, "\tld a,(ix%+d)\n", s->offset);
-    fprintf(outf, "\tand %ld\n", mask);
+    fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset);
+    fprintf(g_emit_sink.stream, "\tand %ld\n", mask);
     if (branch_when_true)
         emit_jp_label("jp nz,", label);
     else
@@ -1505,8 +1671,8 @@ void ast_gen_direct_wide_bitand_branch(const struct AstNode *n, int label,
 
     s = find_sym(n->a->sval);
     mask = n->b->ival & 255;
-    fprintf(outf, "\tld a,(ix%+d)\n", s->offset);
-    fprintf(outf, "\tand %ld\n", mask);
+    fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset);
+    fprintf(g_emit_sink.stream, "\tand %ld\n", mask);
     if (branch_when_true)
         emit_jp_label("jp nz,", label);
     else
@@ -1529,15 +1695,340 @@ void ast_gen_range_check_branch(const struct AstNode *n, int label,
     const struct AstNode *x;
     long lo;
     long hi;
+    struct Sym *xs;
 
     ast_is_range_check_cond(n, &x, &lo, &hi);
+
+    /* Byte-width fast path: x is a directly-fetchable char/uchar/bool
+     * scalar and the whole [lo,hi] span fits in the positive half of a
+     * byte (0..127) - the only region an 8-bit unsigned subtract-and-
+     * compare on x's raw byte can't be fooled by a negative signed char's
+     * high bit. (A span reaching into 128..255 would wrongly accept
+     * negative values whose raw byte happens to land there too - e.g.
+     * `p >= 0 && p <= 200` on a signed char must still reject p == -50,
+     * whose raw byte 206 is well inside that wider span.) Skips the
+     * general byte-read path's int-promotion (sign-extend into H) and the
+     * 16-bit ld de/sbc hl,de pair below in favor of the 8-bit sub/cp
+     * equivalent - e.g. tchess.c's piece_side/upiece, almost entirely
+     * `p >= 'A' && p <= 'Z'`-shaped range checks over a char parameter,
+     * where lo/hi are always plain ASCII (< 128). */
+    xs = (x->kind == AST_IDENT) ? find_sym(x->sval) : NULL;
+    if (lo >= 0 && hi <= 127 && sym_is_direct_byte_fetch(xs)) {
+        emit_load_sym_byte_to_a(xs);
+        if (lo != 0)
+            fprintf(g_emit_sink.stream, "\tsub %ld\n", lo);
+        fprintf(g_emit_sink.stream, "\tcp %ld\n", hi - lo + 1);
+        emit_jp_label(branch_when_true ? "jp c," : "jp nc,", label);
+        return;
+    }
 
     ast_gen_expr(x);
 
     if ((lo & 0xffffL) != 0)
-        fprintf(outf, "\tld de,%ld\n\tor a\n\tsbc hl,de\n", lo & 0xffffL);
-    fprintf(outf, "\tld de,%ld\n\tor a\n\tsbc hl,de\n", (hi - lo + 1) & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld de,%ld\n\tor a\n\tsbc hl,de\n", lo & 0xffffL);
+    fprintf(g_emit_sink.stream, "\tld de,%ld\n\tor a\n\tsbc hl,de\n", (hi - lo + 1) & 0xffffL);
     emit_jp_label(branch_when_true ? "jp c," : "jp nc,", label);
+}
+
+/* Is `n` the classic absolute-value idiom `x < 0 ? -x : x` (or its mirror
+ * `x >= 0 ? x : -x`), where all three `x` mentions are the exact same bare
+ * identifier? Extremely common (e.g. tchess.c's own `abs_i`, in lieu of
+ * calling abs()/labs()). The generic ?: codegen evaluates `x` three times
+ * over - once for the condition, once for the arm that's the plain read,
+ * once more for the arm that negates it - each a fresh reload from its
+ * frame slot, since a bare identifier read has no reason on its own to
+ * suspect it's about to be read twice more nearby. Since `x` is a bare
+ * identifier here (never a call/deref/anything with a side effect or a
+ * reason to differ on a second read), fusing all three into one is always
+ * safe. */
+int ast_cond_is_abs_idiom(const struct AstNode *n, const struct AstNode **out_x)
+{
+    const struct AstNode *cx;
+    const struct AstNode *neg_x;
+    const struct AstNode *plain_x;
+
+    if (n == NULL || n->kind != AST_COND || n->a == NULL || n->b == NULL || n->c == NULL)
+        return 0;
+    if (n->a->kind != AST_BINARY || n->a->a == NULL || n->a->b == NULL ||
+        n->a->b->kind != AST_INT_LIT || n->a->b->ival != 0)
+        return 0;
+
+    if (n->a->op == '<') {
+        cx = n->a->a;
+        neg_x = n->b;
+        plain_x = n->c;
+    } else if (n->a->op == TOK_GE) {
+        cx = n->a->a;
+        plain_x = n->b;
+        neg_x = n->c;
+    } else {
+        return 0;
+    }
+
+    if (cx == NULL || cx->kind != AST_IDENT)
+        return 0;
+    if (neg_x == NULL || neg_x->kind != AST_UNARY || neg_x->op != '-' ||
+        neg_x->a == NULL || neg_x->a->kind != AST_IDENT)
+        return 0;
+    if (plain_x == NULL || plain_x->kind != AST_IDENT)
+        return 0;
+    if (strcmp(cx->sval, neg_x->a->sval) != 0 || strcmp(cx->sval, plain_x->sval) != 0)
+        return 0;
+
+    if (!ast_gen_supported(cx) || !ast_value_is_plain_int(cx))
+        return 0;
+
+    /* The comparison must be a genuine SIGNED `x < 0` / `x >= 0`. It is
+     * evaluated in the usual-arithmetic-conversion type of ITS operands,
+     * so if either operand is unsigned - an unsigned x, OR a signed x
+     * against an unsigned zero literal like `0U`/`0UL` - the comparison is
+     * done unsigned and `x < 0U` is constant-false (`x >= 0U`
+     * constant-true). The value is then always the plain-x arm, x itself
+     * unchanged, but ast_gen_abs_idiom_value would still negate whenever
+     * bit 7 of x's high byte is set (an ordinary large magnitude for an
+     * unsigned/wrapped value, not a sign), miscompiling e.g. unsigned
+     * 40000 to 25536 and signed -5 (`-5 < 0U`) to +5. Guarding on the
+     * COMMON type of both comparison operands - not x alone - is exactly
+     * right: unsigned char promotes to signed int (zero-extends, so bit 7
+     * of H is never set and negation never fires - correctly left in),
+     * while any unsigned participant excludes the match, falling back to
+     * the generic ?: codegen that honours the constant condition. */
+    if (common_arith_type(promote_int_type(ast_expr_type_for_sizeof(cx)),
+                          ast_expr_type_for_sizeof(n->a->b)) & TYPE_UNSIGNED)
+        return 0;
+
+    /* x is read three times by the source (the test plus one arm); this
+     * idiom fuses them into a single load, which is invalid for a volatile
+     * object whose every access must occur. */
+    {
+        struct Sym *xs = find_sym(cx->sval);
+        if (xs != NULL && xs->is_volatile)
+            return 0;
+    }
+
+    if (out_x)
+        *out_x = cx;
+    return 1;
+}
+
+/* Emitter for ast_cond_is_abs_idiom: evaluate x exactly once, then negate
+ * in place iff its sign bit is set. Leaves the result (a plain int, same
+ * width as x already promoted to) in HL. */
+void ast_gen_abs_idiom_value(const struct AstNode *x)
+{
+    int lpos = new_label();
+
+    ast_gen_expr(x);
+    emit("\tbit 7,h\n");
+    emit_jp_label("jp z,", lpos);
+    emit("\txor a\n\tsub l\n\tld l,a\n\tld a,0\n\tsbc a,h\n\tld h,a\n");
+    emit_label(lpos);
+    g_expr.type = TYPE_INT;
+    g_expr.long_from16 = 0;
+}
+
+/* Is `n` an ==/!= comparison whose left operand is a directly-fetchable
+ * byte (char/uchar) identifier and whose right operand is either a small
+ * (0..255) integer constant or another directly-fetchable byte identifier?
+ * Equality doesn't care about a byte's signed interpretation - the bit
+ * pattern either matches or it doesn't - so this needs only the raw 8-bit
+ * value(s) and a `cp`, unlike a relational operator's sign-aware compare
+ * (which does need to know signedness, and has its own path via
+ * ast_byte_operand/ast_is_byte_cmp_cond - restricted to TYPE_UNSIGNED
+ * operands specifically because of that signedness dependency). Additive
+ * and narrower in shape (no reversed const-on-left form) but not
+ * restricted to unsigned, since none of that matters for ==/!=. Motivated
+ * by tchess.c's `p != EMPTY` and `p == a || p == b`, where p/a/b are all
+ * plain (signed) char - none of which is handled by any existing path. */
+int ast_is_byte_eq_cond(const struct AstNode *n, struct Sym **out_a,
+                               struct Sym **out_b, long *out_const)
+{
+    struct Sym *sa;
+    struct Sym *sb;
+
+    if (n == NULL || n->kind != AST_BINARY || (n->op != TOK_EQ && n->op != TOK_NE))
+        return 0;
+    if (n->a == NULL || n->b == NULL || n->a->kind != AST_IDENT)
+        return 0;
+
+    sa = find_sym(n->a->sval);
+    if (!sym_is_direct_byte_fetch(sa) || type_is_bool(sa->type))
+        return 0;
+
+    if (n->b->kind == AST_INT_LIT) {
+        if (n->b->ival < 0 || n->b->ival > 255)
+            return 0;
+        /* A raw-byte `cp` is only equality-correct when the operand's
+         * C-promoted value can actually equal the constant. A signed byte
+         * promotes to int with sign extension, so any value with the high
+         * bit set becomes negative and can never equal a positive constant
+         * in 128..255 - yet its raw byte might match it (e.g. signed char
+         * 0xC8 == -56, whose raw byte still equals the constant 200). Only
+         * constants in 0..127 are safe for a signed operand; the full
+         * 0..255 range is safe only when the operand is unsigned. */
+        if (n->b->ival > 127 && !(sa->type & TYPE_UNSIGNED))
+            return 0;
+        if (out_a) *out_a = sa;
+        if (out_b) *out_b = NULL;
+        if (out_const) *out_const = n->b->ival;
+        return 1;
+    }
+    if (n->b->kind == AST_IDENT) {
+        sb = find_sym(n->b->sval);
+        if (!sym_is_direct_byte_fetch(sb) || type_is_bool(sb->type))
+            return 0;
+        /* Raw-byte equality of two byte lvalues is only correct when both
+         * promote to int the same way. A signed/unsigned mix can share a
+         * raw byte yet differ as ints (signed 0xC8 == -56 vs unsigned
+         * 0xC8 == 200), so require matching signedness. */
+        if (((sa->type & TYPE_UNSIGNED) != 0) != ((sb->type & TYPE_UNSIGNED) != 0))
+            return 0;
+        if (out_a) *out_a = sa;
+        if (out_b) *out_b = sb;
+        return 1;
+    }
+    return 0;
+}
+
+/* Emitter for ast_is_byte_eq_cond: load the left operand into A, then
+ * compare directly against the right - a bare (ix+d) form via a single
+ * `cp (ix+d)` when possible (no register needed for it at all), otherwise
+ * fetched into B first. */
+void ast_gen_byte_eq_branch(const struct AstNode *n, int label,
+                                   int branch_when_true)
+{
+    struct Sym *sa;
+    struct Sym *sb;
+    long cval;
+    int branch_on_eq;
+
+    ast_is_byte_eq_cond(n, &sa, &sb, &cval);
+    emit_load_sym_byte_to_a(sa);
+    if (sb == NULL) {
+        fprintf(g_emit_sink.stream, "\tcp %ld\n", cval);
+    } else if (sym_can_ix_direct(sb)) {
+        fprintf(g_emit_sink.stream, "\tcp (ix%+d)\n", sb->offset);
+    } else {
+        /* Keep the first operand out of B/C and D/E while the second load may
+         * need those pairs for address formation. */
+        emit("\tpush af\n");
+        emit_load_sym_byte_to_a(sb);
+        emit("\tld l,a\n");
+        emit("\tpop af\n");
+        emit("\tcp l\n");
+    }
+    branch_on_eq = (n->op == TOK_EQ) ? branch_when_true : !branch_when_true;
+    emit_jp_label(branch_on_eq ? "jp z," : "jp nz,", label);
+}
+
+/* Is `n` an ==/!= comparison between a global char array element
+ * (`arr[idx]`) and either a small (0..255) integer constant or a
+ * directly-fetchable byte identifier (either operand order)? A char array
+ * read needs no int-promotion for an equality test either (same reasoning
+ * as ast_is_byte_eq_cond just above), but there was previously no fast
+ * path for this shape at all - only the truthiness test `if (arr[idx])`
+ * (ast_global_char_index_cond/ast_gen_global_char_index_branch, reused
+ * here for the "is idxn actually a global-char-array index expression"
+ * check) had one. Motivated by tchess.c's is_attacked:
+ * `board[sq - 7] == 'P'`, `board[sq + 9] == 'p'`, etc. (the constant
+ * form), and in_check's `board[i] == k` - k a plain (signed) char local,
+ * so even ast_byte_operand's existing array-vs-identifier path (which
+ * requires TYPE_UNSIGNED) declines it too (the ident form) - each
+ * currently a full int-promote-and-16-bit-compare of a value that only
+ * ever needs 8 bits either side. */
+int ast_is_global_char_index_eq_cond(const struct AstNode *n, struct Sym **out_arr,
+                                             const struct AstNode **out_idx,
+                                             struct Sym **out_other, long *out_const)
+{
+    const struct AstNode *idxn;
+    const struct AstNode *othern;
+    struct Sym *s;
+    struct Sym *os;
+
+    if (n == NULL || n->kind != AST_BINARY || (n->op != TOK_EQ && n->op != TOK_NE))
+        return 0;
+    if (n->a != NULL && n->a->kind == AST_INDEX) {
+        idxn = n->a;
+        othern = n->b;
+    } else if (n->b != NULL && n->b->kind == AST_INDEX) {
+        idxn = n->b;
+        othern = n->a;
+    } else {
+        return 0;
+    }
+    if (othern == NULL || !ast_global_char_index_cond(idxn, &s))
+        return 0;
+
+    if (othern->kind == AST_INT_LIT) {
+        if (othern->ival < 0 || othern->ival > 255)
+            return 0;
+        /* Same signedness restriction as ast_is_byte_eq_cond: a raw-byte
+         * `cp` against a constant in 128..255 is only equality-correct
+         * when the array element type is unsigned; a signed char element
+         * with that raw byte promotes to a negative int that can never
+         * equal the positive constant. */
+        if (othern->ival > 127 && !(s->type & TYPE_UNSIGNED))
+            return 0;
+        if (out_arr) *out_arr = s;
+        if (out_idx) *out_idx = idxn->b;
+        if (out_other) *out_other = NULL;
+        if (out_const) *out_const = othern->ival;
+        return 1;
+    }
+    if (othern->kind == AST_IDENT) {
+        os = find_sym(othern->sval);
+        if (!sym_is_direct_byte_fetch(os) || type_is_bool(os->type))
+            return 0;
+        /* Both byte lvalues must promote the same way - see the matching
+         * signedness guard in ast_is_byte_eq_cond. */
+        if (((s->type & TYPE_UNSIGNED) != 0) != ((os->type & TYPE_UNSIGNED) != 0))
+            return 0;
+        if (out_arr) *out_arr = s;
+        if (out_idx) *out_idx = idxn->b;
+        if (out_other) *out_other = os;
+        return 1;
+    }
+    return 0;
+}
+
+/* Emitter for ast_is_global_char_index_eq_cond: evaluate the index
+ * expression once, form the element address the same way
+ * ast_gen_global_char_index_branch does, load the byte straight into A,
+ * and compare directly against either the constant or the other
+ * identifier's byte - a bare (ix+d) via `cp (ix+d)` when possible (same
+ * trick as ast_gen_byte_eq_branch), otherwise via the same push-af/L/
+ * pop-af sequence ast_gen_byte_eq_branch's fallback uses - see its
+ * comment for why neither B/C nor D/E is safe scratch here. */
+void ast_gen_global_char_index_eq_branch(const struct AstNode *n, int label,
+                                                 int branch_when_true)
+{
+    struct Sym *s;
+    const struct AstNode *idx;
+    struct Sym *other;
+    long cval;
+    int saved_dead;
+    int branch_on_eq;
+
+    ast_is_global_char_index_eq_cond(n, &s, &idx, &other, &cval);
+    saved_dead = expr_result_dead;
+    expr_result_dead = 0;
+    ast_gen_expr(idx);
+    expr_result_dead = saved_dead;
+    emit_global_char_index_addr(s);
+    emit("\tld a,(hl)\n");
+    if (other == NULL) {
+        fprintf(g_emit_sink.stream, "\tcp %ld\n", cval);
+    } else if (sym_can_ix_direct(other)) {
+        fprintf(g_emit_sink.stream, "\tcp (ix%+d)\n", other->offset);
+    } else {
+        emit("\tpush af\n");
+        emit_load_sym_byte_to_a(other);
+        emit("\tld l,a\n");
+        emit("\tpop af\n");
+        emit("\tcp l\n");
+    }
+    branch_on_eq = (n->op == TOK_EQ) ? branch_when_true : !branch_when_true;
+    emit_jp_label(branch_on_eq ? "jp z," : "jp nz,", label);
 }
 
 /* Emitter for ast_is_direct_long_const_eq_cond: XOR each stored byte against
@@ -1574,9 +2065,9 @@ void ast_gen_direct_long_const_eq_branch(const struct AstNode *n, int label,
     branch_on_zero = (n->op == TOK_EQ) ? branch_when_true : !branch_when_true;
 
     for (i = 0; i < 4; ++i) {
-        fprintf(outf, "\tld a,(ix%+d)\n", s->offset + i);
+        fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset + i);
         if (kbyte[i] != 0)
-            fprintf(outf, "\txor %d\n", kbyte[i]);
+            fprintf(g_emit_sink.stream, "\txor %d\n", kbyte[i]);
         if (i > 0)
             emit("\tor c\n");
         if (i < 3)
@@ -1592,13 +2083,14 @@ void ast_gen_float_cmp_branch(const struct AstNode *n, int label,
                                      int branch_when_true)
 {
     ast_gen_expr(n->a);
-    if (!type_is_float(g_expr_type))
-        emit_convert_int_to_float(g_expr_type);
+    if (!type_is_float(g_expr.type))
+        emit_convert_int_to_float(g_expr.type);
     emit("\tpush de\n\tpush hl\n");
     ast_gen_expr(n->b);
-    if (!type_is_float(g_expr_type))
-        emit_convert_int_to_float(g_expr_type);
-    emit("\tpush de\n\tpush hl\n");
+    if (!type_is_float(g_expr.type))
+        emit_convert_int_to_float(g_expr.type);
+    /* n->b is still live in DE:HL right here - see the fastcall call
+     * site in gen_binary_ast for why this skips a second push. */
     emit_float_compare_call(n->op);
     emit_branch_on_bool_hl(label, branch_when_true);
 }
@@ -1610,6 +2102,36 @@ void ast_gen_long_cmp_branch(const struct AstNode *n, int label,
     emit_branch_on_bool_hl(label, branch_when_true);
 }
 
+/* True if `n` is side-effect-free and guaranteed to evaluate to exactly 0 or
+ * 1: a relational/equality comparison, a logical-not, or any combination of
+ * such joined by &&, ||, or bitwise & / | . This is what makes a bitwise &
+ * or | over comparisons (e.g. `x+i<8 & y+i<8`, written that way instead of
+ * `&&` - seen in practice in a hand-written 8-queens solver) safe to
+ * evaluate the same short-circuited way &&/|| already are: since both
+ * operands can only ever be exactly 0 or 1, `a&b`/`a|b` and `a&&b`/`a||b`
+ * compute the identical result, so nothing observable changes by skipping
+ * the right operand once the left has already decided the outcome. */
+static int ast_is_pure_bool_valued(const struct AstNode *n)
+{
+    if (n == NULL)
+        return 0;
+    switch (n->kind) {
+    case AST_BINARY:
+        if (is_cmp_op(n->op))
+            return !ast_expr_has_side_effects(n);
+        if (n->op == '&' || n->op == '|')
+            return ast_is_pure_bool_valued(n->a) && ast_is_pure_bool_valued(n->b);
+        return 0;
+    case AST_LOGAND:
+    case AST_LOGOR:
+        return ast_is_pure_bool_valued(n->a) && ast_is_pure_bool_valued(n->b);
+    case AST_UNARY:
+        return n->op == '!' && !ast_expr_has_side_effects(n);
+    default:
+        return 0;
+    }
+}
+
 /* Emit the controlling expression of an if/while/do-while as a branch to
  * `label` taken when the condition is true (branch_when_true=1) or false (0).
  * A simple relational comparison uses the direct compare/branch; everything
@@ -1618,6 +2140,17 @@ void ast_gen_cond_branch(const struct AstNode *n, int label,
                                 int branch_when_true)
 {
     long cv;
+    if (n != NULL && n->kind == AST_COMMA) {
+        /* Emit the left operand for its side effects (result discarded), then
+         * branch on the right operand - preserving left-to-right evaluation.
+         * Gated by ast_cond_generic's matching AST_COMMA case. */
+        int old_dead = expr_result_dead;
+        expr_result_dead = 1;
+        ast_gen_dead_expr(n->a);
+        expr_result_dead = old_dead;
+        ast_gen_cond_branch(n->b, label, branch_when_true);
+        return;
+    }
     if (ast_const_condition_fold(n, &cv)) {
         if ((cv != 0) == branch_when_true)
             emit_jp_label("jp", label);
@@ -1641,8 +2174,22 @@ void ast_gen_cond_branch(const struct AstNode *n, int label,
         }
         return;
     }
+    if (n != NULL && n->kind == AST_BINARY && (n->op == '&' || n->op == '|') &&
+        ast_is_pure_bool_valued(n->a) && ast_is_pure_bool_valued(n->b)) {
+        struct AstNode logical;
+        memset(&logical, 0, sizeof(logical));
+        logical.kind = (n->op == '&') ? AST_LOGAND : AST_LOGOR;
+        logical.a = (struct AstNode *)n->a;
+        logical.b = (struct AstNode *)n->b;
+        ast_gen_cond_branch(&logical, label, branch_when_true);
+        return;
+    }
     if (ast_is_range_check_cond(n, NULL, NULL, NULL)) {
         ast_gen_range_check_branch(n, label, branch_when_true);
+        return;
+    }
+    if (ast_is_byte_eq_cond(n, NULL, NULL, NULL)) {
+        ast_gen_byte_eq_branch(n, label, branch_when_true);
         return;
     }
     if (ast_is_const_cmp_cond(n)) {
@@ -1651,6 +2198,21 @@ void ast_gen_cond_branch(const struct AstNode *n, int label,
     }
     if (ast_is_byte_cmp_cond(n)) {
         ast_gen_byte_cmp_branch(n, label, branch_when_true);
+        return;
+    }
+    /* Checked only after ast_is_byte_cmp_cond declines: that existing,
+     * already-tuned path already covers `global_char_arr[ident_or_const]`
+     * (ast_byte_operand's kind==3) - including choosing which side loads
+     * into A - so this is only needed for its actual gap, an INDEX
+     * EXPRESSION more complex than a bare identifier/constant (e.g.
+     * tchess.c's `board[sq - 7]`). Checking this first regressed
+     * tests/ttt.c's `PieceBlank == g_board[p]` (p a bare identifier,
+     * already handled) by ~11% - this fast path's own addressing turned
+     * out no cheaper than ast_gen_byte_cmp_branch's for that shape, so
+     * preempting it was a pure loss, found only by re-measuring the whole
+     * suite rather than trusting the isolated wins in tchess.c alone. */
+    if (ast_is_global_char_index_eq_cond(n, NULL, NULL, NULL, NULL)) {
+        ast_gen_global_char_index_eq_branch(n, label, branch_when_true);
         return;
     }
     if (ast_is_direct_byte_bitand_cond(n)) {
@@ -1685,8 +2247,14 @@ void ast_gen_cond_branch(const struct AstNode *n, int label,
         ast_gen_cmp_branch(n, label, branch_when_true);
         return;
     }
+    if (ast_cond_not_indexed_array_row(n)) {
+        int row_type;
+        gen_index_addr_ast(n->a, &row_type);
+        emit_test_expr_nonzero(TYPE_INT | TYPE_PTR, label, !branch_when_true);
+        return;
+    }
     ast_gen_expr(n);
-    emit_test_expr_nonzero(g_expr_type, label, branch_when_true);
+    emit_test_expr_nonzero(g_expr.type, label, branch_when_true);
 }
 
 

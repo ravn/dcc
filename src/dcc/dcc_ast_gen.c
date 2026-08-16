@@ -15,7 +15,7 @@
  *   - dcc_ast_gen_support.c ast_gen_supported dispatch, call/struct gates, folds
  *   - dcc_ast_gen_expr.c    expression emitters (ast_gen_expr)
  *   - dcc_ast_gen_cond.c    statement-support gates, comparison/branch emitters
- *   - dcc_ast_gen_stmt.c    switch/for/statement emitters, ast_try_emit_statement
+ *   - dcc_ast_stmt_meta.c   statement parsing, sizing, and metadata analysis
  */
 #include "dcc.h"
 #include "dcc_ast.h"
@@ -103,11 +103,8 @@ int ast_ident_is_const(const char *name)
     return 0;
 }
 
-/* Switch codegen state (type/macro/externs declared in dcc_ast_gen_internal.h);
- * defined here, shared across the split AST codegen translation units. */
+/* Switch support-gate nesting. */
 int ast_switch_gate_depth;
-struct AstSwCtx ast_sw_ctx[AST_MAX_SW_NEST];
-int ast_sw_depth;
 
 /* Forward declaration: resolve 2-D array/field-array element type. */
 
@@ -225,12 +222,20 @@ int ast_value_is_plain_int(const struct AstNode *n)
         return ast_index_plain_int_read(n);
     case AST_MEMBER:
         return ast_member_plain_int_read(n) || ast_member_bitfield_read(n);
+    case AST_COMPOUND_LITERAL:
+        return ast_is_plain_int_type(n->type) && type_size(n->type) <= 2 &&
+               type_ptr_depth(n->type) == 0;
     case AST_CALL: {
         int rt;
         int callee_type;
         int no_deref;
-        if (ast_call_star_indirect_supported(n))
-            return 1;
+        if (ast_call_star_indirect_supported(n)) {
+            s = ast_indirect_call_proto_sym(n);
+            rt = s != NULL ? type_decay_ptr(s->type) : TYPE_INT;
+            return type_ptr_depth(rt) == 0 && !type_is_struct_object(rt) &&
+                   !type_is_long(rt) && !type_is_float(rt) &&
+                   ast_is_plain_int_type(rt);
+        }
         if (ast_call_indirect_supported(n) &&
             ast_pointer_expr_type(n->a, &callee_type, &no_deref)) {
             rt = type_decay_ptr(callee_type);
@@ -386,10 +391,41 @@ int ast_index_plain_int_read(const struct AstNode *n)
     return ast_index_subscript_supported(n->b);
 }
 
-int ast_index_long_read(const struct AstNode *n)
+/* Shared shape recogniser for a scalar (long/float) array-or-pointer element
+ * read: `ident[i]` where ident is a 1-D array or a single-level scalar
+ * pointer, or `obj.field[i]` where field is an array. On success sets
+ * *out_elem to the element type and returns 1. Factored out of
+ * ast_index_long_read and ast_index_float_read (the block was verbatim
+ * identical) so the two stay in lockstep on exactly which index shapes they
+ * recognise - only the element-type predicate they apply differs. */
+static int ast_index_scalar_array_elem_type(const struct AstNode *n, int *out_elem)
 {
     struct Sym *s;
     int decayed;
+
+    if (n->a->kind == AST_IDENT) {
+        s = find_sym(n->a->sval);
+        if (s == NULL || s->is_const_value || s->storage == SC_FUNC)
+            return 0;
+        if (s->is_array) {
+            if (s->dim_count > 1)
+                return 0;
+            decayed = type_add_ptr(s->type);
+        } else {
+            decayed = s->type;
+        }
+        if (type_ptr_depth(decayed) != 1)
+            return 0;
+        *out_elem = type_decay_ptr(decayed);
+        return 1;
+    }
+    if (n->a->kind == AST_MEMBER)
+        return ast_member_array_field_elem_type(n->a, out_elem);
+    return 0;
+}
+
+int ast_index_long_read(const struct AstNode *n)
+{
     int elem;
 
     if (n == NULL || n->kind != AST_INDEX || n->a == NULL)
@@ -398,59 +434,21 @@ int ast_index_long_read(const struct AstNode *n)
         return type_is_long(elem);
     if (ast_index_member_pointer_elem_type(n, &elem))
         return type_is_long(elem);
-    if (n->a->kind == AST_IDENT) {
-        s = find_sym(n->a->sval);
-        if (s == NULL || s->is_const_value || s->storage == SC_FUNC)
-            return 0;
-        if (s->is_array) {
-            if (s->dim_count > 1)
-                return 0;
-            decayed = type_add_ptr(s->type);
-        } else {
-            decayed = s->type;
-        }
-        if (type_ptr_depth(decayed) != 1)
-            return 0;
-        elem = type_decay_ptr(decayed);
-    } else if (n->a->kind == AST_MEMBER) {
-        if (!ast_member_array_field_elem_type(n->a, &elem))
-            return 0;
-    } else {
+    if (!ast_index_scalar_array_elem_type(n, &elem))
         return 0;
-    }
     return type_is_long(elem) && ast_index_subscript_supported(n->b);
 }
 
 int ast_index_float_read(const struct AstNode *n)
 {
-    struct Sym *s;
-    int decayed;
     int elem;
 
     if (n == NULL || n->kind != AST_INDEX || n->a == NULL)
         return 0;
     if (ast_index_composite_elem_type(n, &elem))
         return type_is_float(elem);
-    if (n->a->kind == AST_IDENT) {
-        s = find_sym(n->a->sval);
-        if (s == NULL || s->is_const_value || s->storage == SC_FUNC)
-            return 0;
-        if (s->is_array) {
-            if (s->dim_count > 1)
-                return 0;
-            decayed = type_add_ptr(s->type);
-        } else {
-            decayed = s->type;
-        }
-        if (type_ptr_depth(decayed) != 1)
-            return 0;
-        elem = type_decay_ptr(decayed);
-    } else if (n->a->kind == AST_MEMBER) {
-        if (!ast_member_array_field_elem_type(n->a, &elem))
-            return 0;
-    } else {
+    if (!ast_index_scalar_array_elem_type(n, &elem))
         return 0;
-    }
     return type_is_float(elem) && ast_index_subscript_supported(n->b);
 }
 
@@ -494,6 +492,14 @@ int ast_index_struct_object_type(const struct AstNode *n, int *out_type)
         return 0;
     if (n->a == NULL)
         return 0;
+    if (ast_index_deref_pointer_array_collect(n, &s, NULL, NULL, NULL,
+                                              &elem_type)) {
+        if (!type_is_struct_object(elem_type))
+            return 0;
+        if (out_type)
+            *out_type = elem_type;
+        return 1;
+    }
     if (ast_index_symbol_nd_elem_type(n, &elem_type)) {
         if (!type_is_struct_object(elem_type))
             return 0;
@@ -585,6 +591,9 @@ int ast_index_subscript_supported(const struct AstNode *idx)
         return ast_value_is_plain_int(idx);
     if (idx->kind == AST_SIZEOF_EXPR || idx->kind == AST_SIZEOF_TYPE)
         return ast_value_is_plain_int(idx);
+    if (idx->kind == AST_IDENT && ast_ident_is_const(idx->sval) &&
+        ast_value_is_plain_int(idx))
+        return 1;
     if (ast_index_subscript_binary_literal(idx))
         return 1;
     if (ast_const_plain_int_binary_supported(idx))
@@ -638,7 +647,7 @@ int ast_index_symbol_nd_collect(const struct AstNode *n, struct Sym **out_sym,
                                        const struct AstNode **idxs, int *out_count)
 {
     const struct AstNode *cur;
-    const struct AstNode *rev[8];
+    const struct AstNode *rev[MAX_INDEX_DEPTH];
     struct Sym *s;
     int count;
     int i;
@@ -646,7 +655,7 @@ int ast_index_symbol_nd_collect(const struct AstNode *n, struct Sym **out_sym,
     cur = n;
     count = 0;
     while (cur != NULL && cur->kind == AST_INDEX) {
-        if (count >= 8 || cur->b == NULL)
+        if (count >= MAX_INDEX_DEPTH || cur->b == NULL)
             return 0;
         rev[count++] = cur->b;
         cur = cur->a;
@@ -675,7 +684,7 @@ int ast_index_symbol_nd_collect(const struct AstNode *n, struct Sym **out_sym,
 
 int ast_index_symbol_nd_elem_type(const struct AstNode *n, int *out_type)
 {
-    const struct AstNode *idxs[8];
+    const struct AstNode *idxs[MAX_INDEX_DEPTH];
     struct Sym *s;
     int count;
 
@@ -698,7 +707,7 @@ int ast_index_deref_pointer_array_collect(const struct AstNode *n,
                                                  int *out_count,
                                                  int *out_type)
 {
-    const struct AstNode *rev[8];
+    const struct AstNode *rev[MAX_INDEX_DEPTH];
     const struct AstNode *root;
     const struct AstNode *base;
     struct Sym *s;
@@ -711,7 +720,7 @@ int ast_index_deref_pointer_array_collect(const struct AstNode *n,
     count = 0;
     root = n;
     while (root != NULL && root->kind == AST_INDEX) {
-        if (count >= 8 || root->b == NULL)
+        if (count >= MAX_INDEX_DEPTH || root->b == NULL)
             return 0;
         rev[count++] = root->b;
         root = root->a;
@@ -734,6 +743,168 @@ int ast_index_deref_pointer_array_collect(const struct AstNode *n,
         if (!ast_index_subscript_supported(rev[count - 1 - i]))
             return 0;
     }
+    if (out_sym != NULL)
+        *out_sym = s;
+    if (out_base != NULL)
+        *out_base = base;
+    if (out_count != NULL)
+        *out_count = count;
+    if (out_type != NULL)
+        *out_type = elem;
+    return 1;
+}
+
+/* Recognise `*P` where P is a bare pointer-to-array identifier such as
+ * `int (*P)[N]` or `int (*P)[A][B]`.  Dereferencing P yields the pointed-to
+ * array, which — used as an rvalue (a function argument or a pointer operand,
+ * as opposed to a `(*P)[i]` subscript) — decays to a pointer to that array's
+ * element.  The runtime value of that pointer is exactly P's own stored
+ * pointer, so no memory load is performed.  Returns the decayed element-pointer
+ * type in *out_type and, when the element is itself an array row (P has more
+ * than one dimension), the row stride in *out_stride (0 for a scalar element).
+ * Declining (0) is always safe. */
+int ast_deref_pointer_array_decay(const struct AstNode *n, int *out_type,
+                                  int *out_stride)
+{
+    struct Sym *s;
+    int base;
+
+    if (n == NULL || n->kind != AST_UNARY || n->op != '*' || n->a == NULL ||
+        n->a->kind != AST_IDENT)
+        return 0;
+    s = find_sym(n->a->sval);
+    if (s == NULL || s->is_const_value || s->storage == SC_FUNC || s->is_array)
+        return 0;
+    if (type_ptr_depth(s->type) <= 0 || s->dim_count <= 0)
+        return 0;
+    base = type_decay_ptr(s->type);
+    if ((base & 15) == TYPE_VOID)
+        base = TYPE_CHAR;
+    if (type_size(base) <= 0)
+        return 0;
+    if (out_type != NULL)
+        *out_type = type_add_ptr(base);
+    if (out_stride != NULL)
+        *out_stride = (s->dim_count > 1)
+            ? sym_pointer_array_index_elem_size(s, s->type, 1) : 0;
+    return 1;
+}
+
+/* Is `n` a bare identifier naming a pointer-to-array local/param (the base of
+ * a dereference chain)?  A pointer with one or more array dimensions
+ * (dim_count > 0) such as `int (*p)[3]` or `int (*p)[2][3]`. */
+static int ast_is_pointer_array_ident(const struct AstNode *n)
+{
+    struct Sym *s;
+
+    if (n == NULL || n->kind != AST_IDENT)
+        return 0;
+    s = find_sym(n->sval);
+    if (s == NULL || s->is_const_value || s->storage == SC_FUNC || s->is_array)
+        return 0;
+    return type_ptr_depth(s->type) > 0 && s->dim_count > 0;
+}
+
+/* Recognise an explicit pointer-to-array dereference chain that is the exact
+ * desugaring of a multidimensional subscript on a pointer-to-array:
+ *
+ *     *(*(p + i) + j)          <=> p[i][j]        (p is int (*)[C])
+ *     *(*(*(p + i) + j) + k)   <=> p[i][j][k]     (p is int (*)[B][C])
+ *
+ * Each `*( PTR + INDEX )` layer strips one dimension; the innermost PTR is the
+ * base pointer identifier and every outer PTR is the next inner layer.  A chain
+ * of `count` layers indexes a pointer whose element has `count - 1` array
+ * dimensions (the final `*` loads the scalar element).  Indices are returned in
+ * first-dimension-first order in idxs[] (caller supplies room for DCC_MAX_DEREF
+ * _CHAIN entries).  Declining (0) is always safe: the caller falls back to
+ * generic per-layer codegen. */
+int ast_deref_pointer_array_chain_collect(const struct AstNode *n,
+                                                 struct Sym **out_sym,
+                                                 const struct AstNode **out_base,
+                                                 const struct AstNode **idxs,
+                                                 int *out_count,
+                                                 int *out_type)
+{
+    const struct AstNode *rev[DCC_MAX_DEREF_CHAIN];
+    const struct AstNode *cur;
+    const struct AstNode *base;
+    struct Sym *s;
+    int count;
+    int elem;
+    int i;
+
+    count = 0;
+    base = NULL;
+    cur = n;
+
+    /* Peel `*( PTR + INDEX )` layers from the outside in. */
+    for (;;) {
+        const struct AstNode *add;
+        const struct AstNode *ptr_side;
+        const struct AstNode *idx_side;
+
+        if (cur == NULL || cur->kind != AST_UNARY || cur->op != '*' || cur->a == NULL)
+            return 0;
+        add = cur->a;
+        if (add->kind != AST_BINARY || add->op != '+' ||
+            add->a == NULL || add->b == NULL)
+            return 0;
+
+        /* The pointer operand is either the next inner deref layer (an
+         * AST_UNARY '*') or, at the innermost level, the base pointer-to-array
+         * identifier; the other operand is the subscript. */
+        if (add->a->kind == AST_UNARY && add->a->op == '*') {
+            ptr_side = add->a;
+            idx_side = add->b;
+        } else if (add->b->kind == AST_UNARY && add->b->op == '*') {
+            ptr_side = add->b;
+            idx_side = add->a;
+        } else if (ast_is_pointer_array_ident(add->a)) {
+            ptr_side = add->a;
+            idx_side = add->b;
+        } else if (ast_is_pointer_array_ident(add->b)) {
+            ptr_side = add->b;
+            idx_side = add->a;
+        } else {
+            return 0;
+        }
+
+        if (count >= DCC_MAX_DEREF_CHAIN)
+            return 0;
+        rev[count++] = idx_side;
+
+        if (ptr_side->kind == AST_IDENT) {
+            base = ptr_side;
+            break;
+        }
+        cur = ptr_side;
+    }
+
+    /* A single `*(p + i)` layer is an ordinary pointer read handled elsewhere;
+     * only genuine multidimensional chains (>= 2 layers) are claimed here. */
+    if (count < 2 || base == NULL)
+        return 0;
+
+    s = find_sym(base->sval);
+    if (s == NULL || s->is_const_value || s->storage == SC_FUNC || s->is_array)
+        return 0;
+    if (type_ptr_depth(s->type) <= 0 || s->dim_count != count - 1)
+        return 0;
+
+    elem = type_decay_ptr(s->type);
+    if ((elem & 15) == TYPE_VOID || type_size(elem) <= 0)
+        return 0;
+
+    /* rev[] holds indices outermost-first (last dimension first); reverse to
+     * first-dimension-first order and validate each subscript. */
+    for (i = 0; i < count; ++i) {
+        const struct AstNode *ix = rev[count - 1 - i];
+        if (!ast_index_subscript_supported(ix))
+            return 0;
+        if (idxs != NULL)
+            idxs[i] = ix;
+    }
+
     if (out_sym != NULL)
         *out_sym = s;
     if (out_base != NULL)
@@ -903,14 +1074,19 @@ int ast_index_reversed_pointer_expr_elem_type(const struct AstNode *n, int *out_
 
     if (n == NULL || n->kind != AST_INDEX || n->a == NULL || n->b == NULL)
         return 0;
-    if (!ast_index_subscript_supported(n->a))
-        return 0;
+    /* Check the (cheap) pointer operand first.  The subscript check on n->a can
+     * recurse through the whole index-support machinery, so for the common case
+     * where n->b is plainly not a pointer (e.g. an ordinary multidimensional
+     * array subscript arr[i][j]), bailing here avoids an exponential re-walk of
+     * a deeply nested index chain. */
     if (!ast_pointer_expr_type(n->b, &ptr_type, &no_deref) || no_deref)
         return 0;
     if (type_ptr_depth(ptr_type) <= 0)
         return 0;
     elem = type_decay_ptr(ptr_type);
     if ((elem & 15) == TYPE_VOID || type_size(elem) <= 0)
+        return 0;
+    if (!ast_index_subscript_supported(n->a))
         return 0;
     *out_type = elem;
     return 1;
@@ -926,7 +1102,7 @@ int ast_index_pointer_array_elem_type(const struct AstNode *n, int *out_type)
     if (n->a == NULL || n->a->kind != AST_IDENT)
         return 0;
     s = find_sym(n->a->sval);
-    if (s == NULL || s->is_const_value || s->storage == SC_FUNC || !s->is_array)
+    if (s == NULL || s->storage == SC_FUNC || !s->is_array)
         return 0;
     if (s->dim_count > 1)
         return 0;
@@ -935,15 +1111,8 @@ int ast_index_pointer_array_elem_type(const struct AstNode *n, int *out_type)
         return 0;
     if (n->b == NULL)
         return 0;
-    if (n->b->kind == AST_INT_LIT) {
-        if (!ast_value_is_plain_int(n->b))
-            return 0;
-    } else {
-        if (ast_node_is_const(n->b))
-            return 0;
-        if (!ast_gen_supported(n->b) || !ast_value_is_plain_int(n->b))
-            return 0;
-    }
+    if (!ast_value_is_plain_int(n->b))
+        return 0;
     *out_type = elem_type;
     return 1;
 }
@@ -1079,6 +1248,17 @@ int ast_pointer_expr_type(const struct AstNode *n, int *out_type,
         }
         if (n->op != '*')
             return 0;
+        {
+            int decay_type;
+            int decay_stride;
+            /* `*P` where P is a pointer-to-array (int (*P)[N]) decays, as an
+             * rvalue, to a pointer to the array element (value == P). */
+            if (ast_deref_pointer_array_decay(n, &decay_type, &decay_stride)) {
+                *out_type = decay_type;
+                *out_no_deref = (decay_stride > 0);
+                return 1;
+            }
+        }
         if (!ast_pointer_expr_type(n->a, &ptr_type, &no_deref))
             return 0;
         base = no_deref ? ptr_type : type_decay_ptr(ptr_type);
@@ -1140,6 +1320,12 @@ int ast_pointer_expr_type(const struct AstNode *n, int *out_type,
         return 1;
 
     case AST_INDEX:
+        if (ast_index_symbol_nd_elem_type(n, &member_type) &&
+            type_ptr_depth(member_type) > 0 && type_size(member_type) == 2) {
+            *out_type = member_type;
+            *out_no_deref = 0;
+            return 1;
+        }
         if (ast_index_array_row_ptr_type(n, &member_type)) {
             *out_type = member_type;
             *out_no_deref = 1;
@@ -1254,6 +1440,15 @@ int ast_deref_lvalue_plain_int_type(const struct AstNode *n, int *out_type)
 
     if (n == NULL || n->kind != AST_UNARY || n->op != '*')
         return 0;
+    if (ast_deref_pointer_array_chain_collect(n, NULL, NULL, NULL, NULL, &base)) {
+        if (!ast_is_plain_int_type(base))
+            return 0;
+        sz = type_size(base);
+        if (sz != 1 && sz != 2)
+            return 0;
+        *out_type = base;
+        return 1;
+    }
     if (n->a != NULL && n->a->kind == AST_POSTFIX &&
         (n->a->op == TOK_INC || n->a->op == TOK_DEC) &&
         n->a->a != NULL && n->a->a->kind == AST_IDENT) {
@@ -1296,6 +1491,10 @@ int ast_deref_lvalue_type(const struct AstNode *n, int *out_type)
 
     if (n == NULL || n->kind != AST_UNARY || n->op != '*')
         return 0;
+    if (ast_deref_pointer_array_chain_collect(n, NULL, NULL, NULL, NULL, &base)) {
+        *out_type = base;
+        return 1;
+    }
     if (n->a != NULL && n->a->kind == AST_POSTFIX &&
         (n->a->op == TOK_INC || n->a->op == TOK_DEC) &&
         n->a->a != NULL && n->a->a->kind == AST_IDENT) {
@@ -1337,6 +1536,20 @@ int ast_member_base_type(const struct AstNode *n, int *out_type)
         if (n->op == TOK_ARROW && ast_pointer_expr_type(n->a, out_type, &no_deref))
             return !no_deref;
         return ast_index_struct_object_type(n->a, out_type);
+    }
+    if (n->op == '.' && n->a->kind == AST_COMPOUND_LITERAL &&
+        type_is_struct_object(n->a->type)) {
+        *out_type = n->a->type;
+        return 1;
+    }
+    if (n->op == '.' && n->a->kind == AST_CALL && n->a->a != NULL &&
+        n->a->a->kind == AST_IDENT) {
+        s = find_global(n->a->a->sval);
+        if (s != NULL && s->storage == SC_FUNC && type_is_struct_object(s->type) &&
+            ast_call_named_args_supported(n->a)) {
+            *out_type = s->type;
+            return 1;
+        }
     }
     if (n->op == TOK_ARROW && ast_pointer_expr_type(n->a, out_type, &no_deref))
         return !no_deref;
@@ -1653,6 +1866,9 @@ int ast_deref_plain_int_read(const struct AstNode *n)
     if (ast_va_arg_deref_type(n, &base))
         return ast_is_plain_int_type(base) &&
                (type_size(base) == 1 || type_size(base) == 2);
+    if (ast_deref_pointer_array_chain_collect(n, NULL, NULL, NULL, NULL, &base))
+        return ast_is_plain_int_type(base) &&
+               (type_size(base) == 1 || type_size(base) == 2);
     if (n->a->kind != AST_IDENT) {
         if (!ast_pointer_expr_type(n->a, &ptr_type, &no_deref))
             return 0;
@@ -1705,7 +1921,7 @@ int ast_va_arg_deref_type(const struct AstNode *n, int *out_type)
         find_sym(call->list[0]->sval) == NULL)
         return 0;
     if (type_ptr_depth(cast->type) > 0 && type_size(cast->type) == 2)
-        val_type = cast->type & ~(TYPE_PTR | TYPE_PTR2);
+        val_type = type_decay_ptr(cast->type);
     else if (type_size(cast->type) == 4)
         val_type = cast->type;
     else if (call->list[1]->ival > 2)
@@ -1736,8 +1952,8 @@ void gen_va_arg_deref_ast(const struct AstNode *n, int val_type)
     emit_store_de_to_addr_hl(ap->type);
     emit("\tld h,b\n\tld l,c\n"); /* HL = old ap */
     emit_load_from_hl(val_type);
-    g_expr_type = val_type;
-    g_long_from16 = 0;
+    g_expr.type = val_type;
+    g_expr.long_from16 = 0;
 }
 
 int ast_long_va_arg_self_assign_supported(const struct AstNode *n,
@@ -1789,8 +2005,8 @@ void gen_long_va_arg_self_assign_ast(const struct AstNode *n)
     expr_result_dead = saved_dead;
     gen_binop32_typed('+', s->type);
     emit_store_hl_to_sym_direct(s);
-    g_expr_type = s->type;
-    g_long_from16 = 0;
+    g_expr.type = s->type;
+    g_expr.long_from16 = 0;
 }
 
 int ast_deref_pointer_word_read(const struct AstNode *n)
@@ -1868,7 +2084,8 @@ int ast_preincdec_plain_int(const struct AstNode *n)
         return sz == 1 || sz == 2;
     }
     if (n->a->kind == AST_MEMBER) {
-        if (!ast_member_lvalue_type(n->a, &val_type))
+        if (!ast_member_bitfield_lvalue_type(n->a, &val_type) &&
+            !ast_member_lvalue_type(n->a, &val_type))
             return 0;
         if (type_is_long(val_type))
             return 1;
@@ -1993,7 +2210,8 @@ int ast_postfix_plain_int(const struct AstNode *n)
         return sz == 1 || sz == 2;
     }
     if (n->a->kind == AST_MEMBER) {
-        if (!ast_member_lvalue_type(n->a, &val_type))
+        if (!ast_member_bitfield_lvalue_type(n->a, &val_type) &&
+            !ast_member_lvalue_type(n->a, &val_type))
             return 0;
         if (!ast_is_plain_int_type(val_type))
             return 0;
@@ -2016,7 +2234,13 @@ int ast_postfix_plain_int(const struct AstNode *n)
     sz = type_size(s->type);
     if (sz != 1 && sz != 2)
         return 0;
-    if (!sym_can_ix_direct(s) && !is_global_word_sym(s) && s->storage != SC_LOCAL)
+    /* Accept IX-direct locals/params, global/extern words, any SC_LOCAL, and
+     * global/extern BYTES.  A global byte is not is_global_word_sym (that is
+     * word-only), so it needs its own clause; gen_postfix_ast lowers it through
+     * emit_load_sym_addr + gen_post_update_from_addr, the same address path the
+     * SC_LOCAL byte case uses. */
+    if (!sym_can_ix_direct(s) && !is_global_word_sym(s) && s->storage != SC_LOCAL &&
+        !((s->storage == SC_GLOBAL || s->storage == SC_EXTERN) && sz == 1))
         return 0;
     return 1;
 }
@@ -2095,7 +2319,7 @@ int ast_cond_numeric_supported(const struct AstNode *n)
         return 0;
     if (!ast_gen_supported(n->a) ||
         (!ast_value_is_plain_int(n->a) && !ast_value_is_float_word(n->a) &&
-         !ast_value_is_pointer_word(n->a)))
+         !ast_value_is_pointer_word(n->a) && !ast_value_is_long_word(n->a)))
         return 0;
     if (!ast_gen_supported(n->b) || !ast_numeric_value_supported(n->b))
         return 0;
@@ -2137,7 +2361,7 @@ int ast_cond_void_supported(const struct AstNode *n)
         return 0;
     if (!ast_gen_supported(n->a) ||
         (!ast_value_is_plain_int(n->a) && !ast_value_is_float_word(n->a) &&
-         !ast_value_is_pointer_word(n->a)))
+         !ast_value_is_pointer_word(n->a) && !ast_value_is_long_word(n->a)))
         return 0;
     return ast_void_expr_supported(n->b) && ast_void_expr_supported(n->c);
 }
@@ -2173,8 +2397,7 @@ int ast_logical_operand_ok(const struct AstNode *n)
     if (n->kind == AST_LOGAND || n->kind == AST_LOGOR)
         return ast_logical_operand_ok(n->a) && ast_logical_operand_ok(n->b);
     if (n->kind == AST_BINARY && is_cmp_op(n->op))
-        return (ast_gen_supported(n) || ast_index_cmp_cond_supported(n)) &&
-               ast_value_is_plain_int(n);
+        return ast_cond_generic(n) && ast_value_is_plain_int(n);
     if (ast_gen_supported(n) &&
         (ast_value_is_plain_int(n) || ast_value_is_pointer_word(n) ||
          ast_value_is_float_word(n) || ast_value_is_long_word(n)))
@@ -2349,16 +2572,50 @@ int ast_struct_member_copy_assign_supported(const struct AstNode *n)
            same_struct_type(lhs_type, rhs->type);
 }
 
+/* A zero-argument call to a "simple" static inline function (one whose body
+ * is a single captured return-expression - see record_inline_function_if_simple)
+ * substitutes to that expression verbatim: no parameters means no argument
+ * substitution or hidden-temp side-effect bookkeeping is needed at all, so
+ * the callee's own body can stand in for the call node directly. Returns
+ * NULL if `n` isn't such a call. */
+const struct AstNode *ast_zero_arg_inline_body(const struct AstNode *n)
+{
+    struct Sym *fn;
+
+    /* Under -g, keep static inline functions as real out-of-line callables so
+     * breakpoints and stepping resolve to their bodies (same reason
+     * try_gen_inline_call_ast declines when opt_debug is set). Without this the
+     * byte-copy fast paths that look through a zero-arg inline call (see
+     * ast_is_byte_addr_lvalue / ast_is_byte_addr_copy_assign) would still
+     * substitute the body and drop the function from the debug info. */
+    if (opt_debug)
+        return NULL;
+    if (n == NULL || n->kind != AST_CALL || n->a == NULL ||
+        n->a->kind != AST_IDENT || n->list_len != 0)
+        return NULL;
+    fn = find_global(n->a->sval);
+    if (fn == NULL || !fn->is_static || !fn->is_inline ||
+        fn->proto_nargs != 0 || fn->inline_return_expr == NULL)
+        return NULL;
+    return fn->inline_return_expr;
+}
+
 /* Does `n` name an addressable byte lvalue (a struct/union member, an array
  * element, or a pointer dereference) of a plain 1-byte scalar type? Bitfields
  * are already excluded by ast_member_lvalue_type/ast_index_lvalue_elem_type
  * (both decline when the field has bit_width > 0). Pointers and _Bool are
  * excluded explicitly: a byte pointer element doesn't exist (pointers are
  * always 2 bytes), and _Bool's stored representation must stay normalized to
- * exactly 0/1, which this fast path deliberately does not handle. */
+ * exactly 0/1, which this fast path deliberately does not handle.
+ *
+ * Also looks through a zero-arg static inline call (e.g. `pop()`) to its
+ * substituted body, so a `dst = pop();`-shaped byte copy still gets the
+ * direct address-to-address fast path instead of falling back to the
+ * generic promote-through-a-register assignment path. */
 int ast_is_byte_addr_lvalue(const struct AstNode *n, int *out_type)
 {
     int t;
+    const struct AstNode *sub;
 
     if (n == NULL)
         return 0;
@@ -2372,7 +2629,10 @@ int ast_is_byte_addr_lvalue(const struct AstNode *n, int *out_type)
         if (!ast_deref_lvalue_type(n, &t))
             return 0;
     } else {
-        return 0;
+        sub = ast_zero_arg_inline_body(n);
+        if (sub == NULL)
+            return 0;
+        return ast_is_byte_addr_lvalue(sub, out_type);
     }
     if (type_size(t) != 1 || type_ptr_depth(t) > 0 || type_is_bool(t))
         return 0;
@@ -2440,6 +2700,15 @@ int ast_struct_addr_expr_supported(const struct AstNode *n, int *out_type)
         if (out_type)
             *out_type = t;
         return 1;
+    case AST_COMPOUND_LITERAL:
+        /* A struct-typed compound literal materializes into its backing local
+         * and yields that object's address - exactly what the struct-value
+         * contexts (by-value argument, copy-assignment) consume. */
+        if (!type_is_struct_object(n->type))
+            return 0;
+        if (out_type)
+            *out_type = n->type;
+        return 1;
     default:
         return 0;
     }
@@ -2456,6 +2725,25 @@ int ast_struct_copy_assign_supported(const struct AstNode *n)
         !ast_struct_addr_expr_supported(n->b, &rhs_type))
         return 0;
     return same_struct_type(lhs_type, rhs_type);
+}
+
+int ast_struct_chain_copy_assign_supported(const struct AstNode *n)
+{
+    int lhs_type;
+    int mid_type;
+    int rhs_type;
+    const struct AstNode *inner;
+
+    if (n == NULL || n->kind != AST_ASSIGN || n->op != '=' || !expr_result_dead)
+        return 0;
+    if (n->b == NULL || n->b->kind != AST_ASSIGN || n->b->op != '=')
+        return 0;
+    inner = n->b;
+    if (!ast_struct_addr_expr_supported(n->a, &lhs_type) ||
+        !ast_struct_addr_expr_supported(inner->a, &mid_type) ||
+        !ast_struct_addr_expr_supported(inner->b, &rhs_type))
+        return 0;
+    return same_struct_type(lhs_type, mid_type) && same_struct_type(mid_type, rhs_type);
 }
 
 int ast_is_const_zero_condition(const struct AstNode *n)

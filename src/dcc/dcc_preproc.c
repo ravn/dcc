@@ -2,16 +2,17 @@
  * dcc_preproc.c - preprocessor, macro engine, and lexer.
  *
  * Handles #define/#undef/#if/#ifdef directives, object- and function-like
- * macro expansion (including # stringize and ## paste), the recursive-descent
- * #if constant-expression evaluator, and the main tokenizer next_token() that
- * feeds the parser. The #if-expression cursor globals (pp_expr_p/pp_expr_depth)
- * are kept module-local here rather than in dcc_state.c.
+ * macro expansion (including # stringize and ## paste), conditional-directive
+ * handling, and the main tokenizer next_token() that feeds the parser. The
+ * #if expression evaluator lives in dcc_pp_expr.c.
  *
- * MODULE: compiled as its own translation unit; shared declarations are in dcc.h.
+ * MODULE: compiled as its own translation unit; macro-table entry points shared
+ * with the driver/evaluator are declared in dcc_preproc_internal.h.
  * Source provenance: monolith src/ddc.c lines 692-2871.
  */
 
 #include "dcc.h"
+#include "dcc_preproc_internal.h"
 
 #define MACRO_PLACEMARKER '\002'
 
@@ -101,463 +102,6 @@ void add_define(const char *name, const char *value)
     add_define_ex(name, value, 0, 0, dummy);
 }
 
-static const char *pp_expr_p;
-static int pp_expr_depth;
-
-void pp_expr_skip_ws(void)
-{
-    while (*pp_expr_p && isspace((unsigned char)*pp_expr_p))
-        pp_expr_p++;
-}
-
-int pp_expr_match_word(const char *w)
-{
-    int n;
-    n = (int)strlen(w);
-    pp_expr_skip_ws();
-    if (strncmp(pp_expr_p, w, n) != 0)
-        return 0;
-    if (is_ident_char((unsigned char)pp_expr_p[n]))
-        return 0;
-    pp_expr_p += n;
-    return 1;
-}
-
-long pp_expr_number(void)
-{
-    unsigned long v;
-    int base;
-
-    pp_expr_skip_ws();
-
-    v = 0;
-    base = 10;
-    if (pp_expr_p[0] == '0') {
-        if (pp_expr_p[1] == 'x' || pp_expr_p[1] == 'X') {
-            base = 16;
-            pp_expr_p += 2;
-        } else {
-            base = 8;
-            pp_expr_p++;
-        }
-    }
-
-    if (base == 16) {
-        while (isxdigit((unsigned char)*pp_expr_p)) {
-            v *= 16;
-            if (*pp_expr_p >= '0' && *pp_expr_p <= '9') v += *pp_expr_p - '0';
-            else if (*pp_expr_p >= 'a' && *pp_expr_p <= 'f') v += *pp_expr_p - 'a' + 10;
-            else v += *pp_expr_p - 'A' + 10;
-            pp_expr_p++;
-        }
-    } else {
-        while (*pp_expr_p >= '0' && *pp_expr_p <= (base == 8 ? '7' : '9')) {
-            v = v * (unsigned long)base + (unsigned long)(*pp_expr_p - '0');
-            pp_expr_p++;
-        }
-    }
-
-    while (*pp_expr_p == 'u' || *pp_expr_p == 'U' ||
-           *pp_expr_p == 'l' || *pp_expr_p == 'L')
-        pp_expr_p++;
-
-    return (long)v;
-}
-
-long pp_expr_charlit(void)
-{
-    int c;
-    long v;
-
-    pp_expr_skip_ws();
-    if (*pp_expr_p != '\'')
-        return 0;
-    pp_expr_p++;
-
-    if (*pp_expr_p == '\\') {
-        pp_expr_p++;
-        c = (unsigned char)*pp_expr_p;
-        if (c == 'n') v = '\n';
-        else if (c == 'r') v = '\r';
-        else if (c == 't') v = '\t';
-        else if (c == '0') v = 0;
-        else v = c;
-        if (*pp_expr_p)
-            pp_expr_p++;
-    } else {
-        v = (unsigned char)*pp_expr_p;
-        if (*pp_expr_p)
-            pp_expr_p++;
-    }
-
-    while (*pp_expr_p && *pp_expr_p != '\'')
-        pp_expr_p++;
-    if (*pp_expr_p == '\'')
-        pp_expr_p++;
-
-    return v;
-}
-
-long pp_expr_primary(void);
-long pp_expr_unary(void);
-long pp_expr_mul(void);
-long pp_expr_add(void);
-long pp_expr_shift(void);
-long pp_expr_rel(void);
-long pp_expr_eq(void);
-long pp_expr_bitand(void);
-long pp_expr_bitxor(void);
-long pp_expr_bitor(void);
-long pp_expr_andand(void);
-long pp_expr_oror(void);
-long pp_expr_cond(void);
-
-long pp_expr_defined(void)
-{
-    char name[64];
-    int i;
-
-    if (!pp_expr_match_word("defined"))
-        return 0;
-
-    pp_expr_skip_ws();
-    if (*pp_expr_p == '(') {
-        pp_expr_p++;
-        pp_expr_skip_ws();
-        i = 0;
-        while (is_ident_char((unsigned char)*pp_expr_p) && i < 63)
-            name[i++] = *pp_expr_p++;
-        name[i] = 0;
-        pp_expr_skip_ws();
-        if (*pp_expr_p == ')')
-            pp_expr_p++;
-    } else {
-        i = 0;
-        while (is_ident_char((unsigned char)*pp_expr_p) && i < 63)
-            name[i++] = *pp_expr_p++;
-        name[i] = 0;
-    }
-
-    return name[0] && find_define(name) >= 0;
-}
-
-long pp_expr_primary(void)
-{
-    char name[64];
-    int i;
-    long v;
-
-    pp_expr_skip_ws();
-
-    if (!strncmp(pp_expr_p, "defined", 7) &&
-        !is_ident_char((unsigned char)pp_expr_p[7]))
-        return pp_expr_defined();
-
-    if (*pp_expr_p == '(') {
-        pp_expr_p++;
-        v = pp_expr_cond();
-        pp_expr_skip_ws();
-        if (*pp_expr_p == ')')
-            pp_expr_p++;
-        return v;
-    }
-
-    if (*pp_expr_p == '\'')
-        return pp_expr_charlit();
-
-    if (isdigit((unsigned char)*pp_expr_p))
-        return pp_expr_number();
-
-    if (is_ident_start((unsigned char)*pp_expr_p)) {
-        int di;
-        const char *savep;
-
-        i = 0;
-        while (is_ident_char((unsigned char)*pp_expr_p) && i < 63)
-            name[i++] = *pp_expr_p++;
-        name[i] = 0;
-
-        if (!strcmp(name, "__LINE__"))
-            return line_no;
-
-        di = find_define(name);
-        if (di >= 0 && !defs[di].is_func && pp_expr_depth < 16) {
-            savep = pp_expr_p;
-            pp_expr_p = defs[di].value;
-            pp_expr_depth++;
-            v = pp_expr_cond();
-            pp_expr_depth--;
-            pp_expr_p = savep;
-            return v;
-        }
-
-        return 0;
-    }
-
-    return 0;
-}
-
-long pp_expr_unary(void)
-{
-    pp_expr_skip_ws();
-    if (*pp_expr_p == '!') {
-        pp_expr_p++;
-        return !pp_expr_unary();
-    }
-    if (*pp_expr_p == '~') {
-        pp_expr_p++;
-        return ~pp_expr_unary();
-    }
-    if (*pp_expr_p == '+') {
-        pp_expr_p++;
-        return pp_expr_unary();
-    }
-    if (*pp_expr_p == '-') {
-        pp_expr_p++;
-        return -pp_expr_unary();
-    }
-    return pp_expr_primary();
-}
-
-long pp_expr_mul(void)
-{
-    long v;
-    long r;
-
-    v = pp_expr_unary();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (*pp_expr_p == '*') {
-            pp_expr_p++;
-            v = v * pp_expr_unary();
-        } else if (*pp_expr_p == '/') {
-            pp_expr_p++;
-            r = pp_expr_unary();
-            v = r ? (v / r) : 0;
-        } else if (*pp_expr_p == '%') {
-            pp_expr_p++;
-            r = pp_expr_unary();
-            v = r ? (v % r) : 0;
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_add(void)
-{
-    long v;
-
-    v = pp_expr_mul();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (*pp_expr_p == '+') {
-            pp_expr_p++;
-            v = v + pp_expr_mul();
-        } else if (*pp_expr_p == '-') {
-            pp_expr_p++;
-            v = v - pp_expr_mul();
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_shift(void)
-{
-    long v;
-    long r;
-
-    v = pp_expr_add();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (pp_expr_p[0] == '<' && pp_expr_p[1] == '<') {
-            pp_expr_p += 2;
-            r = pp_expr_add();
-            if (r < 0 || r >= 32)
-                v = 0;
-            else
-                v = v << (int)r;
-        } else if (pp_expr_p[0] == '>' && pp_expr_p[1] == '>') {
-            pp_expr_p += 2;
-            r = pp_expr_add();
-            if (r < 0 || r >= 32)
-                v = 0;
-            else
-                v = v >> (int)r;
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_rel(void)
-{
-    long v;
-    long r;
-
-    v = pp_expr_shift();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (pp_expr_p[0] == '<' && pp_expr_p[1] == '=') {
-            pp_expr_p += 2;
-            r = pp_expr_shift();
-            v = (v <= r);
-        } else if (pp_expr_p[0] == '>' && pp_expr_p[1] == '=') {
-            pp_expr_p += 2;
-            r = pp_expr_shift();
-            v = (v >= r);
-        } else if (*pp_expr_p == '<') {
-            pp_expr_p++;
-            r = pp_expr_shift();
-            v = (v < r);
-        } else if (*pp_expr_p == '>') {
-            pp_expr_p++;
-            r = pp_expr_shift();
-            v = (v > r);
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_eq(void)
-{
-    long v;
-    long r;
-
-    v = pp_expr_rel();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (pp_expr_p[0] == '=' && pp_expr_p[1] == '=') {
-            pp_expr_p += 2;
-            r = pp_expr_rel();
-            v = (v == r);
-        } else if (pp_expr_p[0] == '!' && pp_expr_p[1] == '=') {
-            pp_expr_p += 2;
-            r = pp_expr_rel();
-            v = (v != r);
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_bitand(void)
-{
-    long v;
-
-    v = pp_expr_eq();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (*pp_expr_p == '&' && pp_expr_p[1] != '&') {
-            pp_expr_p++;
-            v = v & pp_expr_eq();
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_bitxor(void)
-{
-    long v;
-
-    v = pp_expr_bitand();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (*pp_expr_p == '^') {
-            pp_expr_p++;
-            v = v ^ pp_expr_bitand();
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_bitor(void)
-{
-    long v;
-
-    v = pp_expr_bitxor();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (*pp_expr_p == '|' && pp_expr_p[1] != '|') {
-            pp_expr_p++;
-            v = v | pp_expr_bitxor();
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_andand(void)
-{
-    long v;
-    v = pp_expr_bitor();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (pp_expr_p[0] == '&' && pp_expr_p[1] == '&') {
-            pp_expr_p += 2;
-            v = (pp_expr_bitor() && v);
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_oror(void)
-{
-    long v;
-    v = pp_expr_andand();
-    for (;;) {
-        pp_expr_skip_ws();
-        if (pp_expr_p[0] == '|' && pp_expr_p[1] == '|') {
-            pp_expr_p += 2;
-            v = (pp_expr_andand() || v);
-        } else {
-            break;
-        }
-    }
-    return v;
-}
-
-long pp_expr_cond(void)
-{
-    long v;
-    long t;
-    long f;
-
-    v = pp_expr_oror();
-    pp_expr_skip_ws();
-    if (*pp_expr_p == '?') {
-        pp_expr_p++;
-        t = pp_expr_cond();
-        pp_expr_skip_ws();
-        if (*pp_expr_p == ':')
-            pp_expr_p++;
-        f = pp_expr_cond();
-        v = v ? t : f;
-    }
-    return v;
-}
-
-int pp_eval_simple_expr(const char *s)
-{
-    pp_expr_p = s;
-    pp_expr_depth = 0;
-    return pp_expr_cond() != 0;
-}
-
 void remove_define(const char *name)
 {
     int i;
@@ -601,6 +145,39 @@ static int parse_pragma_macro_name(const char *line, const char *op, char *name,
     while (*line && isspace((unsigned char)*line))
         line++;
     return name[0] && *line == ')';
+}
+
+static int parse_pragma_stack_check(const char *line, int *enabled)
+{
+    const char *op;
+
+    while (*line && isspace((unsigned char)*line))
+        line++;
+    op = "stack_check";
+    while (*op) {
+        if (*line++ != *op++)
+            return 0;
+    }
+    while (*line && isspace((unsigned char)*line))
+        line++;
+    if (*line++ != '(')
+        return 0;
+    while (*line && isspace((unsigned char)*line))
+        line++;
+
+    if (!strncmp(line, "on", 2) && !is_ident_char((unsigned char)line[2])) {
+        line += 2;
+        *enabled = 1;
+    } else if (!strncmp(line, "off", 3) && !is_ident_char((unsigned char)line[3])) {
+        line += 3;
+        *enabled = 0;
+    } else {
+        return 0;
+    }
+
+    while (*line && isspace((unsigned char)*line))
+        line++;
+    return *line == ')';
 }
 
 static void pp_push_macro(const char *name)
@@ -663,6 +240,7 @@ static void pp_pop_macro(const char *name)
 static void handle_pragma_line(const char *line)
 {
     char name[64];
+    int stack_check_enabled;
 
     if (parse_pragma_macro_name(line, "push_macro", name, sizeof(name))) {
         pp_push_macro(name);
@@ -670,6 +248,10 @@ static void handle_pragma_line(const char *line)
     }
     if (parse_pragma_macro_name(line, "pop_macro", name, sizeof(name))) {
         pp_pop_macro(name);
+        return;
+    }
+    if (parse_pragma_stack_check(line, &stack_check_enabled)) {
+        opt_stack_check = stack_check_enabled;
         return;
     }
 }
@@ -707,7 +289,7 @@ void parse_preprocessor_line(void)
      * always a hard error, even inside an inactive #if block. */
     if (word[0] == 0 && peekc() == '#') {
         dcc_error_at(current_file_name[0] ? current_file_name : (input_name ? input_name : "<input>"),
-                 line_no, tok_start_pos, "'##' is not a valid preprocessor directive", NULL);
+                 g_lex.line_no, g_lex.tok_start_pos, "'##' is not a valid preprocessor directive", NULL);
         while (peekc() && peekc() != '\n') getc_src();
         return;
     }
@@ -721,7 +303,7 @@ void parse_preprocessor_line(void)
 
         if (if_sp >= MAX_IFSTACK) {
             dcc_error_at(current_file_name[0] ? current_file_name : (input_name ? input_name : "<input>"),
-                         line_no, tok_start_pos, "too many nested #if", NULL);
+                         g_lex.line_no, g_lex.tok_start_pos, "too many nested #if", NULL);
             while (peekc() && peekc() != '\n') getc_src();
             return;
         }
@@ -745,7 +327,7 @@ void parse_preprocessor_line(void)
 
         if (if_sp >= MAX_IFSTACK) {
             dcc_error_at(current_file_name[0] ? current_file_name : (input_name ? input_name : "<input>"),
-                         line_no, tok_start_pos, "too many nested #if", NULL);
+                         g_lex.line_no, g_lex.tok_start_pos, "too many nested #if", NULL);
             while (peekc() && peekc() != '\n') getc_src();
             return;
         }
@@ -763,7 +345,7 @@ void parse_preprocessor_line(void)
     } else if (!strcmp(word, "elif")) {
         if (if_sp <= 0) {
             dcc_error_at(current_file_name[0] ? current_file_name : (input_name ? input_name : "<input>"),
-                         line_no, tok_start_pos, "#elif without matching #if", NULL);
+                         g_lex.line_no, g_lex.tok_start_pos, "#elif without matching #if", NULL);
         } else {
             i = if_sp - 1;
             if (if_seen_else[i]) {
@@ -788,7 +370,7 @@ void parse_preprocessor_line(void)
     } else if (!strcmp(word, "else")) {
         if (if_sp <= 0) {
             dcc_error_at(current_file_name[0] ? current_file_name : (input_name ? input_name : "<input>"),
-                         line_no, tok_start_pos, "#else without matching #if", NULL);
+                         g_lex.line_no, g_lex.tok_start_pos, "#else without matching #if", NULL);
         } else {
             i = if_sp - 1;
             if (!if_seen_else[i]) {
@@ -803,7 +385,7 @@ void parse_preprocessor_line(void)
             if_sp--;
         else
             dcc_error_at(current_file_name[0] ? current_file_name : (input_name ? input_name : "<input>"),
-                         line_no, tok_start_pos, "#endif without matching #if", NULL);
+                         g_lex.line_no, g_lex.tok_start_pos, "#endif without matching #if", NULL);
         pp_recompute_active();
     } else if (!strcmp(word, "line")) {
         int lno;
@@ -829,7 +411,7 @@ void parse_preprocessor_line(void)
             lno = lno * 10 + *lp++ - '0';
 
         if (lno > 0)
-            line_no = lno - 1;
+            g_lex.line_no = lno - 1;
 
         while (*lp && isspace((unsigned char)*lp))
             lp++;
@@ -865,7 +447,7 @@ void parse_preprocessor_line(void)
                 char msg[MAX_MACRO_TEXT + 16];
                 sprintf(msg, "#error %s", val);
                 dcc_error_at(current_file_name[0] ? current_file_name : (input_name ? input_name : "<input>"),
-                             line_no, tok_start_pos, msg, NULL);
+                             g_lex.line_no, g_lex.tok_start_pos, msg, NULL);
             }
         }
     } else if (!strcmp(word, "define")) {
@@ -903,8 +485,8 @@ void parse_preprocessor_line(void)
                      * Bind the trailing arguments to the implicit name
                      * __VA_ARGS__, which the rest of the macro engine then
                      * treats as an ordinary parameter. */
-                    if (peekc() == '.' && posi + 2 < src_len &&
-                        src[posi + 1] == '.' && src[posi + 2] == '.') {
+                    if (peekc() == '.' && g_lex.posi + 2 < src_len &&
+                        src[g_lex.posi + 1] == '.' && src[g_lex.posi + 2] == '.') {
                         getc_src();
                         getc_src();
                         getc_src();
@@ -950,7 +532,7 @@ void parse_preprocessor_line(void)
                 val[i] = 0;
                 strip_macro_replacement_comments(val);
 
-                if (name[0]) add_define_ex(name, val[0] ? val : "1", 1, nargs, params);
+                if (name[0]) add_define_ex(name, val, 1, nargs, params);
                 (void)pi;
             } else {
                 while (isspace((unsigned char)peekc()) && peekc() != '\n') getc_src();
@@ -961,7 +543,7 @@ void parse_preprocessor_line(void)
                 val[i] = 0;
                 strip_macro_replacement_comments(val);
 
-                if (name[0]) add_define(name, val[0] ? val : "1");
+                if (name[0]) add_define(name, val);
             }
         }
     } else if (!strcmp(word, "__asm_line")) {
@@ -971,7 +553,7 @@ void parse_preprocessor_line(void)
          * Buffer into pending_asm_buf rather than writing directly: the
          * tokenizer may re-visit this position during scan_function_body()
          * pre-passes (which save/restore posi).  flush_pending_asm() is
-         * called from emit_function_epilogue() and emit_data() to emit the
+         * called from finish_function_mir() and emit_data() to emit the
          * content exactly once at the correct output position. */
         char line[512]; int li = 0; int ch;
         if (peekc() == '\001') getc_src();
@@ -980,10 +562,10 @@ void parse_preprocessor_line(void)
             getc_src();
         }
         line[li] = 0;
-        if (!scan_mode && asm_suppress_depth == 0 && !asm_line_was_seen(posi)) {
+        if (!scan_mode && asm_suppress_depth == 0 && !asm_line_was_seen(g_lex.posi)) {
             /* Record the position before buffering so the dedup bookkeeping
              * never depends on whether the pending buffer had room. */
-            mark_asm_line_seen(posi);
+            mark_asm_line_seen(g_lex.posi);
             if (pending_asm_len + li + 2 >= (int)sizeof(pending_asm_buf))
                 fatal("#asm block too large for pending buffer");
             memcpy(pending_asm_buf + pending_asm_len, line, (size_t)li);
@@ -1025,7 +607,7 @@ void parse_preprocessor_line(void)
             val[i] = 0;
             fprintf(stderr, "%s:%d: warning: #warning %s\n",
                     current_file_name[0] ? current_file_name : (input_name ? input_name : "<input>"),
-                    line_no, val);
+                    g_lex.line_no, val);
         }
     } else if (!strcmp(word, "pragma")) {
         if (pp_active) {
@@ -1045,7 +627,7 @@ void parse_preprocessor_line(void)
             char msg[96];
             sprintf(msg, "unknown preprocessor directive '#%s'", word);
             dcc_error_at(current_file_name[0] ? current_file_name : (input_name ? input_name : "<input>"),
-                         line_no, tok_start_pos, msg, NULL);
+                         g_lex.line_no, g_lex.tok_start_pos, msg, NULL);
         }
     }
 
@@ -1064,16 +646,16 @@ void skip_ws_and_comments(void)
             c = peekc();
         }
 
-        if (c == '/' && posi + 1 < src_len && src[posi + 1] == '/') {
+        if (c == '/' && g_lex.posi + 1 < src_len && src[g_lex.posi + 1] == '/') {
             while (peekc() && peekc() != '\n') getc_src();
             continue;
         }
 
-        if (c == '/' && posi + 1 < src_len && src[posi + 1] == '*') {
-            posi += 2;
+        if (c == '/' && g_lex.posi + 1 < src_len && src[g_lex.posi + 1] == '*') {
+            g_lex.posi += 2;
             while (peekc()) {
-                if (peekc() == '*' && posi + 1 < src_len && src[posi + 1] == '/') {
-                    posi += 2;
+                if (peekc() == '*' && g_lex.posi + 1 < src_len && src[g_lex.posi + 1] == '/') {
+                    g_lex.posi += 2;
                     break;
                 }
                 getc_src();
@@ -1104,6 +686,8 @@ int keyword_kind(const char *s)
     if (!strcmp(s, "long")) return TOK_LONG;
     if (!strcmp(s, "float")) return TOK_FLOAT;
     if (!strcmp(s, "_Bool")) return TOK_BOOL;
+    if (!strcmp(s, "_Static_assert")) return TOK_STATIC_ASSERT;
+    if (!strcmp(s, "_Noreturn")) return TOK_NORETURN;
     if (!strcmp(s, "char")) return TOK_CHAR;
     if (!strcmp(s, "void")) return TOK_VOID;
     if (!strcmp(s, "unsigned")) return TOK_UNSIGNED;
@@ -1222,6 +806,8 @@ int read_escape(void)
 long parse_number_string(const char *s)
 {
     long v;
+    int base;
+    int digit;
     int i;
     int neg;
 
@@ -1229,25 +815,33 @@ long parse_number_string(const char *s)
     i = 0;
     neg = 0;
 
-    if (s[i] == '-') {
-        neg = 1;
+    if (s[i] == '-' || s[i] == '+') {
+        neg = s[i] == '-';
         i++;
     }
 
     if (s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        base = 16;
         i += 2;
-        while (isxdigit((unsigned char)s[i])) {
-            v *= 16;
-            if (s[i] >= '0' && s[i] <= '9') v += s[i] - '0';
-            else if (s[i] >= 'a' && s[i] <= 'f') v += s[i] - 'a' + 10;
-            else v += s[i] - 'A' + 10;
-            i++;
-        }
+    } else if (s[i] == '0' && isdigit((unsigned char)s[i + 1])) {
+        base = 8;
     } else {
-        while (isdigit((unsigned char)s[i])) {
-            v = v * 10 + s[i] - '0';
-            i++;
-        }
+        base = 10;
+    }
+
+    while (s[i]) {
+        if (s[i] >= '0' && s[i] <= '9')
+            digit = s[i] - '0';
+        else if (s[i] >= 'a' && s[i] <= 'f')
+            digit = s[i] - 'a' + 10;
+        else if (s[i] >= 'A' && s[i] <= 'F')
+            digit = s[i] - 'A' + 10;
+        else
+            break;
+        if (digit >= base)
+            break;
+        v = v * base + digit;
+        i++;
     }
 
     while (s[i] == 'u' || s[i] == 'U' || s[i] == 'l' || s[i] == 'L')
@@ -1423,6 +1017,36 @@ void reset_preproc_scan_state(void)
     nmacro_push_stack = 0;
 }
 
+/* disabled_macro_start/end (see above) are absolute positions into `src`,
+ * recorded when some earlier, still-in-progress expansion spliced its
+ * replacement text in. Every later splice - including one nested inside
+ * that earlier replacement, e.g. `G` expanding inside `#define words
+ * G->words`'s own "G->words" output - shifts everything at or after its
+ * start point, which silently invalidates any disabled range recorded
+ * before it: the range's end no longer lines up with the text it was meant
+ * to cover, so a rescan can walk right back onto the protected macro name
+ * and expand it again, unbounded (reproduced with a 1-field minimal case:
+ * struct S{int a;}; static struct S Gst; #define G (&Gst); #define a G->a;
+ * a=1; - OOMs the compiler). Shift every recorded range by this splice's
+ * length delta before applying it: ranges entirely at/after the splice
+ * move by the full delta, and a range the splice point falls inside grows
+ * or shrinks by delta at its end (its start can't be after the splice
+ * point - ranges are always recorded for text already scanned, so a new
+ * splice can only ever start at or after a standing range's start). */
+static void shift_disabled_ranges(long start, long end, long delta)
+{
+    int i;
+
+    for (i = 0; i < ndisabled_macro_ranges; i++) {
+        if (disabled_macro_start[i] >= end) {
+            disabled_macro_start[i] += delta;
+            disabled_macro_end[i] += delta;
+        } else if (disabled_macro_end[i] > start) {
+            disabled_macro_end[i] += delta;
+        }
+    }
+}
+
 void replace_source_range(long start, long end, const char *text)
 {
     long n;
@@ -1434,6 +1058,7 @@ void replace_source_range(long start, long end, const char *text)
     if (end > src_len) end = src_len;
 
     n = (long)strlen(text);
+    shift_disabled_ranges(start, end, n - (end - start));
     rest = src_len - end;
     nsrc = (char *)xmalloc((size_t)(start + n + rest + 1));
     memcpy(nsrc, src, (size_t)start);
@@ -1442,7 +1067,8 @@ void replace_source_range(long start, long end, const char *text)
     nsrc[start + n + rest] = 0;
     src = nsrc;
     src_len = start + n + rest;
-    posi = start;
+    g_src_generation++;
+    g_lex.posi = start;
 }
 
 static void replace_source_range_disabled(long start, long end, const char *text, const char *macro_name)
@@ -1539,8 +1165,17 @@ void strip_macro_replacement_comments(char *s)
 }
 
 static int macro_call_args_too_many;
+static int macro_call_arg_overflow;
 
-int read_macro_call_args(char args[8][128], int *nargs, int variadic_named_count)
+static void append_macro_call_arg_char(char args[MAX_MACRO_ARGS][MAX_MACRO_ARG_LEN], int ai, int *ap, int c)
+{
+    if (*ap < MAX_MACRO_ARG_LEN - 1)
+        args[ai][(*ap)++] = (char)c;
+    else
+        macro_call_arg_overflow = 1;
+}
+
+int read_macro_call_args(char args[MAX_MACRO_ARGS][MAX_MACRO_ARG_LEN], int *nargs, int variadic_named_count)
 {
     int c;
     int depth;
@@ -1558,7 +1193,8 @@ int read_macro_call_args(char args[8][128], int *nargs, int variadic_named_count
     ap = 0;
     depth = 0;
     macro_call_args_too_many = 0;
-    memset(args, 0, 8 * 128);
+    macro_call_arg_overflow = 0;
+    memset(args, 0, MAX_MACRO_ARGS * MAX_MACRO_ARG_LEN);
 
     for (;;) {
         c = getc_src();
@@ -1566,13 +1202,13 @@ int read_macro_call_args(char args[8][128], int *nargs, int variadic_named_count
             return 0;
 
         if (c == '"') {
-            if (ap < 127) args[ai][ap++] = (char)c;
+            append_macro_call_arg_char(args, ai, &ap, c);
             while ((c = getc_src()) != 0) {
-                if (ap < 127) args[ai][ap++] = (char)c;
+                append_macro_call_arg_char(args, ai, &ap, c);
                 if (c == '\\') {
                     c = getc_src();
                     if (c == 0) return 0;
-                    if (ap < 127) args[ai][ap++] = (char)c;
+                    append_macro_call_arg_char(args, ai, &ap, c);
                 } else if (c == '"') {
                     break;
                 }
@@ -1581,13 +1217,13 @@ int read_macro_call_args(char args[8][128], int *nargs, int variadic_named_count
         }
 
         if (c == '\'') {
-            if (ap < 127) args[ai][ap++] = (char)c;
+            append_macro_call_arg_char(args, ai, &ap, c);
             while ((c = getc_src()) != 0) {
-                if (ap < 127) args[ai][ap++] = (char)c;
+                append_macro_call_arg_char(args, ai, &ap, c);
                 if (c == '\\') {
                     c = getc_src();
                     if (c == 0) return 0;
-                    if (ap < 127) args[ai][ap++] = (char)c;
+                    append_macro_call_arg_char(args, ai, &ap, c);
                 } else if (c == '\'') {
                     break;
                 }
@@ -1597,7 +1233,7 @@ int read_macro_call_args(char args[8][128], int *nargs, int variadic_named_count
 
         if (c == '(' || c == '[' || c == '{') {
             depth++;
-            if (ap < 127) args[ai][ap++] = (char)c;
+            append_macro_call_arg_char(args, ai, &ap, c);
             continue;
         }
 
@@ -1610,7 +1246,7 @@ int read_macro_call_args(char args[8][128], int *nargs, int variadic_named_count
 
         if (c == ')' || c == ']' || c == '}') {
             depth--;
-            if (ap < 127) args[ai][ap++] = (char)c;
+            append_macro_call_arg_char(args, ai, &ap, c);
             continue;
         }
 
@@ -1618,13 +1254,13 @@ int read_macro_call_args(char args[8][128], int *nargs, int variadic_named_count
             if (variadic_named_count >= 0 && ai >= variadic_named_count) {
                 /* Inside the variadic tail: this comma belongs to the
                  * __VA_ARGS__ text itself, not an argument separator. */
-                if (ap < 127) args[ai][ap++] = (char)c;
+                append_macro_call_arg_char(args, ai, &ap, c);
                 continue;
             }
             args[ai][ap] = 0;
             trim_arg(args[ai]);
             ai++;
-            if (ai >= 8) {
+            if (ai >= MAX_MACRO_ARGS) {
                 macro_call_args_too_many = 1;
                 while ((c = getc_src()) != 0) {
                     if (c == '(' || c == '[' || c == '{')
@@ -1641,8 +1277,7 @@ int read_macro_call_args(char args[8][128], int *nargs, int variadic_named_count
             continue;
         }
 
-        if (ap < 127)
-            args[ai][ap++] = (char)c;
+        append_macro_call_arg_char(args, ai, &ap, c);
     }
 
     if (variadic_named_count < 0 && ai == 1 && args[0][0] == 0)
@@ -1720,7 +1355,7 @@ int macro_param_index(int di, const char *ident)
 }
 
 
-void expand_function_macro(int di, char args[8][128], char *out, int outsz);
+void expand_function_macro(int di, char args[MAX_MACRO_ARGS][MAX_MACRO_ARG_LEN], char *out, int outsz);
 
 /* variadic_named_count: -1 for an ordinary macro (every top-level comma
  * starts a new argument, as before); for a variadic macro, the count of
@@ -1730,7 +1365,7 @@ void expand_function_macro(int di, char args[8][128], char *out, int outsz);
  * `#define FOO(x, ...)` yields args = { "a", "b, c" } - the source's own
  * comma/space formatting flows through unchanged since nothing is
  * synthesized here, matching how the C99 __VA_ARGS__ argument reads. */
-int read_macro_call_args_text(const char **pp, char args[8][128], int *nargs,
+int read_macro_call_args_text(const char **pp, char args[MAX_MACRO_ARGS][MAX_MACRO_ARG_LEN], int *nargs,
                                      int variadic_named_count)
 {
     const char *p;
@@ -1750,7 +1385,8 @@ int read_macro_call_args_text(const char **pp, char args[8][128], int *nargs,
     ai = 0;
     ap = 0;
     depth = 0;
-    memset(args, 0, 8 * 128);
+    macro_call_arg_overflow = 0;
+    memset(args, 0, MAX_MACRO_ARGS * MAX_MACRO_ARG_LEN);
 
     for (;;) {
         c = (unsigned char)*p++;
@@ -1758,13 +1394,13 @@ int read_macro_call_args_text(const char **pp, char args[8][128], int *nargs,
             return 0;
 
         if (c == '"') {
-            if (ap < 127) args[ai][ap++] = (char)c;
+            append_macro_call_arg_char(args, ai, &ap, c);
             while ((c = (unsigned char)*p++) != 0) {
-                if (ap < 127) args[ai][ap++] = (char)c;
+                append_macro_call_arg_char(args, ai, &ap, c);
                 if (c == '\\') {
                     c = (unsigned char)*p++;
                     if (c == 0) return 0;
-                    if (ap < 127) args[ai][ap++] = (char)c;
+                    append_macro_call_arg_char(args, ai, &ap, c);
                 } else if (c == '"') {
                     break;
                 }
@@ -1773,13 +1409,13 @@ int read_macro_call_args_text(const char **pp, char args[8][128], int *nargs,
         }
 
         if (c == '\'') {
-            if (ap < 127) args[ai][ap++] = (char)c;
+            append_macro_call_arg_char(args, ai, &ap, c);
             while ((c = (unsigned char)*p++) != 0) {
-                if (ap < 127) args[ai][ap++] = (char)c;
+                append_macro_call_arg_char(args, ai, &ap, c);
                 if (c == '\\') {
                     c = (unsigned char)*p++;
                     if (c == 0) return 0;
-                    if (ap < 127) args[ai][ap++] = (char)c;
+                    append_macro_call_arg_char(args, ai, &ap, c);
                 } else if (c == '\'') {
                     break;
                 }
@@ -1789,7 +1425,7 @@ int read_macro_call_args_text(const char **pp, char args[8][128], int *nargs,
 
         if (c == '(' || c == '[' || c == '{') {
             depth++;
-            if (ap < 127) args[ai][ap++] = (char)c;
+            append_macro_call_arg_char(args, ai, &ap, c);
             continue;
         }
 
@@ -1802,7 +1438,7 @@ int read_macro_call_args_text(const char **pp, char args[8][128], int *nargs,
 
         if (c == ')' || c == ']' || c == '}') {
             depth--;
-            if (ap < 127) args[ai][ap++] = (char)c;
+            append_macro_call_arg_char(args, ai, &ap, c);
             continue;
         }
 
@@ -1810,20 +1446,19 @@ int read_macro_call_args_text(const char **pp, char args[8][128], int *nargs,
             if (variadic_named_count >= 0 && ai >= variadic_named_count) {
                 /* Inside the variadic tail: this comma belongs to the
                  * __VA_ARGS__ text itself, not an argument separator. */
-                if (ap < 127) args[ai][ap++] = (char)c;
+                append_macro_call_arg_char(args, ai, &ap, c);
                 continue;
             }
             args[ai][ap] = 0;
             trim_arg(args[ai]);
             ai++;
-            if (ai >= 8)
+            if (ai >= MAX_MACRO_ARGS)
                 fatal("too many macro arguments");
             ap = 0;
             continue;
         }
 
-        if (ap < 127)
-            args[ai][ap++] = (char)c;
+        append_macro_call_arg_char(args, ai, &ap, c);
     }
 
     if (variadic_named_count < 0 && ai == 1 && args[0][0] == 0)
@@ -1901,7 +1536,7 @@ void macro_expand_argument_text(const char *in, char *out, int outsz, int depth)
 
             if (!strcmp(ident, "__LINE__")) {
                 char numbuf[32];
-                sprintf(numbuf, "%d", line_no);
+                sprintf(numbuf, "%d", g_lex.line_no);
                 for (ii = 0; numbuf[ii] && oi < outsz - 1; ++ii)
                     out[oi++] = numbuf[ii];
                 continue;
@@ -1910,7 +1545,7 @@ void macro_expand_argument_text(const char *in, char *out, int outsz, int depth)
                 char filebuf[320];
                 const char *fp0;
                 int fj;
-                fp0 = tok.file[0] ? tok.file : (input_name ? input_name : "<input>");
+                fp0 = g_lex.tok.file[0] ? g_lex.tok.file : (input_name ? input_name : "<input>");
                 fj = 0;
                 filebuf[fj++] = '"';
                 while (*fp0 && fj < (int)sizeof(filebuf) - 2) {
@@ -1929,7 +1564,7 @@ void macro_expand_argument_text(const char *in, char *out, int outsz, int depth)
             if (di >= 0) {
                 if (defs[di].is_func) {
                     const char *after_ident;
-                    char args[8][128];
+                    char args[MAX_MACRO_ARGS][MAX_MACRO_ARG_LEN];
                     int nargs;
 
                     after_ident = p;
@@ -1937,6 +1572,8 @@ void macro_expand_argument_text(const char *in, char *out, int outsz, int depth)
                             defs[di].is_variadic ? defs[di].nargs - 1 : -1)) {
                         char tmp[MAX_MACRO_TEXT];
                         char tmp2[MAX_MACRO_TEXT];
+                        if (macro_call_arg_overflow)
+                            fatal("macro argument too long in function-like macro invocation");
                         if (nargs != defs[di].nargs)
                             fatal("wrong number of macro arguments");
                         expand_function_macro(di, args, tmp, sizeof(tmp));
@@ -2036,7 +1673,7 @@ int replacement_param_raw_context(const char *start, const char *param_start, co
     return 0;
 }
 
-void expand_function_macro(int di, char args[8][128], char *out, int outsz)
+void expand_function_macro(int di, char args[MAX_MACRO_ARGS][MAX_MACRO_ARG_LEN], char *out, int outsz)
 {
     const char *v;
     int oi;
@@ -2044,11 +1681,11 @@ void expand_function_macro(int di, char args[8][128], char *out, int outsz)
     int j;
     char ident[64];
     int matched;
-    char expanded_args[8][MAX_MACRO_TEXT];
+    char expanded_args[MAX_MACRO_ARGS][MAX_MACRO_TEXT];
 
-    for (i = 0; i < 8; ++i)
+    for (i = 0; i < MAX_MACRO_ARGS; ++i)
         expanded_args[i][0] = 0;
-    for (i = 0; i < defs[di].nargs && i < 8; ++i)
+    for (i = 0; i < defs[di].nargs && i < MAX_MACRO_ARGS; ++i)
         macro_expand_argument_text(args[i], expanded_args[i], sizeof(expanded_args[i]), 0);
 
     v = defs[di].value;
@@ -2250,11 +1887,8 @@ int macro_number_should_expand_textually(const char *s)
      */
     if (*p == 'l' || *p == 'L')
         return 1;
-    if (*p == 'u' || *p == 'U') {
-        p++;
-        if (*p == 'l' || *p == 'L')
-            return 1;
-    }
+    if (*p == 'u' || *p == 'U')
+        return 1;
 
     v = strtoul(s, NULL, 0);
     return v > 0xffffUL || (is_nondecimal && v > 32767UL);
@@ -2343,23 +1977,37 @@ int define_number_value(const char *name, long *out, int depth)
     return 0;
 }
 
+/* Snapshot the live lexer cursor. The integer-suffix flags
+ * (g_tok_long_suffix/g_tok_unsigned_suffix) are deliberately NOT part of the
+ * cursor; callers that need them save/restore those two flags separately. */
+LexState lex_save(void)
+{
+    return g_lex;
+}
+
+/* Restore the live lexer cursor from a snapshot. */
+void lex_restore(const LexState *s)
+{
+    g_lex = *s;
+}
+
 void next_token(void)
 {
     int c, d, i, di;
     long start_line;
 
     skip_ws_and_comments();
-    memset(&tok, 0, sizeof(tok));
+    memset(&g_lex.tok, 0, sizeof(g_lex.tok));
 
-    start_line = line_no;
+    start_line = g_lex.line_no;
     c = getc_src();
-    tok_start_pos = posi - 1;
-    source_location_at(tok_start_pos, tok.file, sizeof(tok.file), &tok_line);
+    g_lex.tok_start_pos = g_lex.posi - 1;
+    source_location_at(g_lex.tok_start_pos, g_lex.tok.file, sizeof(g_lex.tok.file), &g_lex.tok_line);
     (void)start_line;
 
     if (!c) {
-        tok.kind = TOK_EOF;
-        strcpy(tok.text, "<eof>");
+        g_lex.tok.kind = TOK_EOF;
+        strcpy(g_lex.tok.text, "<eof>");
         return;
     }
 
@@ -2367,13 +2015,13 @@ void next_token(void)
         getc_src();     /* consume opening quote */
         if (peekc() == '\\') {
             getc_src();
-            tok.val = read_escape();
+            g_lex.tok.val = read_escape();
         } else {
-            tok.val = getc_src();
+            g_lex.tok.val = getc_src();
         }
         if (peekc() == '\'') getc_src();
-        tok.kind = TOK_NUM;
-        sprintf(tok.text, "%ld", tok.val & 0xffffL);
+        g_lex.tok.kind = TOK_NUM;
+        sprintf(g_lex.tok.text, "%ld", g_lex.tok.val & 0xffffL);
         return;
     }
 
@@ -2383,12 +2031,12 @@ void next_token(void)
         while (peekc() && peekc() != '"' && i < MAX_TOK_TEXT - 1) {
             if (peekc() == '\\') {
                 getc_src();
-                tok.text[i++] = (char)read_escape();
+                g_lex.tok.text[i++] = (char)read_escape();
             } else {
-                tok.text[i++] = (char)getc_src();
+                g_lex.tok.text[i++] = (char)getc_src();
             }
         }
-        tok.text[i] = 0;
+        g_lex.tok.text[i] = 0;
         /* Drain an over-long wide literal up to the closing quote (see the
          * narrow-string case below) so the lexer stays synchronized. */
         if (peekc() && peekc() != '"') {
@@ -2403,18 +2051,19 @@ void next_token(void)
             }
         }
         if (peekc() == '"') getc_src();
-        tok.kind = TOK_WSTR;
+        g_lex.tok.kind = TOK_WSTR;
+        g_lex.tok.text_len = i;
         return;
     }
 
     if (is_ident_start(c)) {
         i = 0;
-        tok.text[i++] = (char)c;
+        g_lex.tok.text[i++] = (char)c;
         while (is_ident_char(peekc()) && i < MAX_TOK_TEXT - 1)
-            tok.text[i++] = (char)getc_src();
-        tok.text[i] = 0;
+            g_lex.tok.text[i++] = (char)getc_src();
+        g_lex.tok.text[i] = 0;
 
-        if (!strcmp(tok.text, "__attribute__")) {
+        if (!strcmp(g_lex.tok.text, "__attribute__")) {
             skip_gnu_attribute();
             next_token();
             return;
@@ -2423,39 +2072,42 @@ void next_token(void)
         /* C89 predefined macros.  These are handled by the lexer so
          * __FILE__ and __LINE__ reflect the logical source location after
          * include/#line processing. */
-        if (!strcmp(tok.text, "__DATE__")) {
-            tok.kind = TOK_STR;
-            strncpy(tok.text, predefined_date_text, sizeof(tok.text) - 1);
-            tok.text[sizeof(tok.text) - 1] = 0;
+        if (!strcmp(g_lex.tok.text, "__DATE__")) {
+            g_lex.tok.kind = TOK_STR;
+            strncpy(g_lex.tok.text, predefined_date_text, sizeof(g_lex.tok.text) - 1);
+            g_lex.tok.text[sizeof(g_lex.tok.text) - 1] = 0;
+            g_lex.tok.text_len = (int)strlen(g_lex.tok.text);
             return;
         }
-        if (!strcmp(tok.text, "__TIME__")) {
-            tok.kind = TOK_STR;
-            strncpy(tok.text, predefined_time_text, sizeof(tok.text) - 1);
-            tok.text[sizeof(tok.text) - 1] = 0;
+        if (!strcmp(g_lex.tok.text, "__TIME__")) {
+            g_lex.tok.kind = TOK_STR;
+            strncpy(g_lex.tok.text, predefined_time_text, sizeof(g_lex.tok.text) - 1);
+            g_lex.tok.text[sizeof(g_lex.tok.text) - 1] = 0;
+            g_lex.tok.text_len = (int)strlen(g_lex.tok.text);
             return;
         }
-        if (!strcmp(tok.text, "__FILE__")) {
-            tok.kind = TOK_STR;
-            strncpy(tok.text, tok.file, sizeof(tok.text) - 1);
-            tok.text[sizeof(tok.text) - 1] = 0;
+        if (!strcmp(g_lex.tok.text, "__FILE__")) {
+            g_lex.tok.kind = TOK_STR;
+            strncpy(g_lex.tok.text, g_lex.tok.file, sizeof(g_lex.tok.text) - 1);
+            g_lex.tok.text[sizeof(g_lex.tok.text) - 1] = 0;
+            g_lex.tok.text_len = (int)strlen(g_lex.tok.text);
             return;
         }
-        if (!strcmp(tok.text, "__LINE__")) {
-            tok.kind = TOK_NUM;
-            tok.val = tok_line;
-            sprintf(tok.text, "%d", tok_line);
+        if (!strcmp(g_lex.tok.text, "__LINE__")) {
+            g_lex.tok.kind = TOK_NUM;
+            g_lex.tok.val = g_lex.tok_line;
+            sprintf(g_lex.tok.text, "%d", g_lex.tok_line);
             return;
         }
-        if (!strcmp(tok.text, "__STDC__")) {
-            tok.kind = TOK_NUM;
-            tok.val = 1;
-            strcpy(tok.text, "1");
+        if (!strcmp(g_lex.tok.text, "__STDC__")) {
+            g_lex.tok.kind = TOK_NUM;
+            g_lex.tok.val = 1;
+            strcpy(g_lex.tok.text, "1");
             return;
         }
 
-        di = find_define(tok.text);
-        if (di >= 0 && macro_disabled_here(tok.text, tok_start_pos))
+        di = find_define(g_lex.tok.text);
+        if (di >= 0 && macro_disabled_here(g_lex.tok.text, g_lex.tok_start_pos))
             di = -1;
         if (di >= 0) {
             long dv;
@@ -2464,28 +2116,34 @@ void next_token(void)
 
             if (defs[di].is_func) {
                 long save_pos;
-                char args[8][128];
+                char args[MAX_MACRO_ARGS][MAX_MACRO_ARG_LEN];
                 int nargs;
-                char expbuf[512];
+                char expbuf[MAX_MACRO_TEXT];
 
-                save_pos = posi;
+                save_pos = g_lex.posi;
                 if (read_macro_call_args(args, &nargs,
                         defs[di].is_variadic ? defs[di].nargs - 1 : -1)) {
+                    if (macro_call_arg_overflow) {
+                        error_here("macro argument too long in function-like macro invocation");
+                        replace_source_range(g_lex.tok_start_pos, g_lex.posi, "0");
+                        next_token();
+                        return;
+                    }
                     if (nargs != defs[di].nargs) {
                         error_here(macro_call_args_too_many ?
                                    "too many arguments provided to function-like macro invocation" :
                                    "too few arguments provided to function-like macro invocation");
-                        replace_source_range(tok_start_pos, posi, "0");
+                        replace_source_range(g_lex.tok_start_pos, g_lex.posi, "0");
                         next_token();
                         return;
                     }
                     expand_function_macro(di, args, expbuf, sizeof(expbuf));
-                    replace_source_range(tok_start_pos, posi, expbuf);
+                    replace_source_range(g_lex.tok_start_pos, g_lex.posi, expbuf);
                     next_token();
                     return;
                 }
-                posi = save_pos;
-                tok.kind = TOK_ID;
+                g_lex.posi = save_pos;
+                g_lex.tok.kind = TOK_ID;
             } else {
                 const char *rv_base;
                 rv = defs[di].value;
@@ -2494,21 +2152,34 @@ void next_token(void)
                 rv_base = rv;
 
                 if (macro_value_is_float_literal(rv)) {
-                    replace_source_range(tok_start_pos, posi, rv);
+                    replace_source_range(g_lex.tok_start_pos, g_lex.posi, rv);
                     next_token();
                     return;
                 }
 
                 if (macro_number_should_expand_textually(rv)) {
-                    replace_source_range(tok_start_pos, posi, rv);
+                    replace_source_range(g_lex.tok_start_pos, g_lex.posi, rv);
                     next_token();
                     return;
                 }
 
-                if (define_number_value(tok.text, &dv, 0)) {
-                    tok.kind = TOK_NUM;
-                    tok.val = dv;
-                    sprintf(tok.text, "%ld", dv);
+                if (define_number_value(g_lex.tok.text, &dv, 0)) {
+                    g_lex.tok.kind = TOK_NUM;
+                    g_lex.tok.val = dv;
+                    sprintf(g_lex.tok.text, "%ld", dv);
+                    /*
+                     * This fast path bypasses the normal integer-literal
+                     * lexer, so it must re-establish the literal-type flags
+                     * itself; otherwise the previous token's L/U suffix leaks
+                     * onto this macro value (e.g. `1L << S` where `#define S
+                     * 16` would treat 16 as a long).  Classify the C89 decimal
+                     * type of the value: int in signed-16-bit range, otherwise
+                     * long.
+                     */
+                    g_tok_long_suffix = 0;
+                    g_tok_unsigned_suffix = 0;
+                    if (dv > 32767L || dv < -32768L)
+                        g_tok_long_suffix = 1;
                     return;
                 }
 
@@ -2528,7 +2199,7 @@ void next_token(void)
                          * chained macros and keyword-like macros go back through
                          * the normal lexer instead of becoming a dead identifier.
                          */
-                        replace_source_range_disabled(tok_start_pos, posi, rv0, defs[di].name);
+                        replace_source_range_disabled(g_lex.tok_start_pos, g_lex.posi, rv0, defs[di].name);
                         next_token();
                         return;
                     }
@@ -2545,12 +2216,12 @@ void next_token(void)
                  * were left as undefined identifiers.  Reinsert the replacement
                  * text and lex it normally.
                  */
-                replace_source_range_disabled(tok_start_pos, posi, rv_base, defs[di].name);
+                replace_source_range_disabled(g_lex.tok_start_pos, g_lex.posi, rv_base, defs[di].name);
                 next_token();
                 return;
             }
         } else {
-            tok.kind = keyword_kind(tok.text);
+            g_lex.tok.kind = keyword_kind(g_lex.tok.text);
         }
         return;
     }
@@ -2595,12 +2266,12 @@ void next_token(void)
                 while (peekc() == 'f' || peekc() == 'F' ||
                        peekc() == 'l' || peekc() == 'L')
                     getc_src();
-                tok.kind = TOK_FLOATLIT;
-                flen = (int)(posi - tok_start_pos);
+                g_lex.tok.kind = TOK_FLOATLIT;
+                flen = (int)(g_lex.posi - g_lex.tok_start_pos);
                 if (flen >= MAX_TOK_TEXT) flen = MAX_TOK_TEXT - 1;
-                memcpy(tok.text, src + tok_start_pos, (size_t)flen);
-                tok.text[flen] = 0;
-                tok.val = (long)(parse_float_literal_bits(tok.text) & 0xffffffffUL);
+                memcpy(g_lex.tok.text, src + g_lex.tok_start_pos, (size_t)flen);
+                g_lex.tok.text[flen] = 0;
+                g_lex.tok.val = (long)(parse_float_literal_bits(g_lex.tok.text) & 0xffffffffUL);
                 return;
             }
         }
@@ -2662,14 +2333,14 @@ void next_token(void)
             }
         }
 
-        tok.kind = TOK_NUM;
-        tok.val = (long)(v & 0xffffffffUL);
+        g_lex.tok.kind = TOK_NUM;
+        g_lex.tok.val = (long)(v & 0xffffffffUL);
         {
             int flen;
-            flen = (int)(posi - tok_start_pos);
+            flen = (int)(g_lex.posi - g_lex.tok_start_pos);
             if (flen >= MAX_TOK_TEXT) flen = MAX_TOK_TEXT - 1;
-            memcpy(tok.text, src + tok_start_pos, (size_t)flen);
-            tok.text[flen] = 0;
+            memcpy(g_lex.tok.text, src + g_lex.tok_start_pos, (size_t)flen);
+            g_lex.tok.text[flen] = 0;
         }
         return;
     }
@@ -2679,12 +2350,12 @@ void next_token(void)
         while (peekc() && peekc() != '"' && i < MAX_TOK_TEXT - 1) {
             if (peekc() == '\\') {
                 getc_src();
-                tok.text[i++] = (char)read_escape();
+                g_lex.tok.text[i++] = (char)read_escape();
             } else {
-                tok.text[i++] = (char)getc_src();
+                g_lex.tok.text[i++] = (char)getc_src();
             }
         }
-        tok.text[i] = 0;
+        g_lex.tok.text[i] = 0;
         /*
          * Over-long literal: drain the remainder up to the closing quote so
          * the lexer stays in sync.  Previously the scan stopped here, leaving
@@ -2703,30 +2374,31 @@ void next_token(void)
             }
         }
         if (peekc() == '"') getc_src();
-        tok.kind = TOK_STR;
+        g_lex.tok.kind = TOK_STR;
+        g_lex.tok.text_len = i;
         return;
     }
 
     if (c == '\'') {
         if (peekc() == '\\') {
             getc_src();
-            tok.val = read_escape();
+            g_lex.tok.val = read_escape();
         } else {
-            tok.val = getc_src();
+            g_lex.tok.val = getc_src();
         }
         if (peekc() == '\'') getc_src();
-        tok.kind = TOK_CHARLIT;
-        strcpy(tok.text, "charlit");
+        g_lex.tok.kind = TOK_CHARLIT;
+        strcpy(g_lex.tok.text, "charlit");
         return;
     }
 
     d = peekc();
 
-    if (c == '.' && d == '.' && posi + 1 < src_len && src[posi + 1] == '.') {
+    if (c == '.' && d == '.' && g_lex.posi + 1 < src_len && src[g_lex.posi + 1] == '.') {
         getc_src();
         getc_src();
-        tok.kind = TOK_ELLIPSIS;
-        strcpy(tok.text, "...");
+        g_lex.tok.kind = TOK_ELLIPSIS;
+        strcpy(g_lex.tok.text, "...");
         return;
     }
 
@@ -2741,61 +2413,61 @@ void next_token(void)
         while (peekc() == 'f' || peekc() == 'F' ||
                peekc() == 'l' || peekc() == 'L')
             getc_src();
-        tok.kind = TOK_FLOATLIT;
-        flen = (int)(posi - tok_start_pos);
+        g_lex.tok.kind = TOK_FLOATLIT;
+        flen = (int)(g_lex.posi - g_lex.tok_start_pos);
         if (flen >= MAX_TOK_TEXT) flen = MAX_TOK_TEXT - 1;
-        memcpy(tok.text, src + tok_start_pos, (size_t)flen);
-        tok.text[flen] = 0;
-        tok.val = (long)(parse_float_literal_bits(tok.text) & 0xffffffffUL);
+        memcpy(g_lex.tok.text, src + g_lex.tok_start_pos, (size_t)flen);
+        g_lex.tok.text[flen] = 0;
+        g_lex.tok.val = (long)(parse_float_literal_bits(g_lex.tok.text) & 0xffffffffUL);
         return;
     }
 
     if (c == '=') {
-        if (d == '=') { getc_src(); tok.kind = TOK_EQ; strcpy(tok.text, "=="); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_EQ; strcpy(g_lex.tok.text, "=="); return; }
     } else if (c == '!') {
-        if (d == '=') { getc_src(); tok.kind = TOK_NE; strcpy(tok.text, "!="); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_NE; strcpy(g_lex.tok.text, "!="); return; }
     } else if (c == '<') {
-        if (d == '=') { getc_src(); tok.kind = TOK_LE; strcpy(tok.text, "<="); return; }
-        if (d == '<') { getc_src(); if (peekc() == '=') { getc_src(); tok.kind = TOK_SHLEQ; strcpy(tok.text, "<<="); return; } tok.kind = TOK_SHL; strcpy(tok.text, "<<"); return; }
-        if (d == '%') { getc_src(); tok.kind = '{'; strcpy(tok.text, "<%"); return; }
-        if (d == ':') { getc_src(); tok.kind = '['; strcpy(tok.text, "<:"); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_LE; strcpy(g_lex.tok.text, "<="); return; }
+        if (d == '<') { getc_src(); if (peekc() == '=') { getc_src(); g_lex.tok.kind = TOK_SHLEQ; strcpy(g_lex.tok.text, "<<="); return; } g_lex.tok.kind = TOK_SHL; strcpy(g_lex.tok.text, "<<"); return; }
+        if (d == '%') { getc_src(); g_lex.tok.kind = '{'; strcpy(g_lex.tok.text, "<%"); return; }
+        if (d == ':') { getc_src(); g_lex.tok.kind = '['; strcpy(g_lex.tok.text, "<:"); return; }
     } else if (c == '>') {
-        if (d == '=') { getc_src(); tok.kind = TOK_GE; strcpy(tok.text, ">="); return; }
-        if (d == '>') { getc_src(); if (peekc() == '=') { getc_src(); tok.kind = TOK_SHREQ; strcpy(tok.text, ">>="); return; } tok.kind = TOK_SHR; strcpy(tok.text, ">>"); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_GE; strcpy(g_lex.tok.text, ">="); return; }
+        if (d == '>') { getc_src(); if (peekc() == '=') { getc_src(); g_lex.tok.kind = TOK_SHREQ; strcpy(g_lex.tok.text, ">>="); return; } g_lex.tok.kind = TOK_SHR; strcpy(g_lex.tok.text, ">>"); return; }
     } else if (c == '&') {
-        if (d == '&') { getc_src(); tok.kind = TOK_ANDAND; strcpy(tok.text, "&&"); return; }
-        if (d == '=') { getc_src(); tok.kind = TOK_ANDEQ; strcpy(tok.text, "&="); return; }
+        if (d == '&') { getc_src(); g_lex.tok.kind = TOK_ANDAND; strcpy(g_lex.tok.text, "&&"); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_ANDEQ; strcpy(g_lex.tok.text, "&="); return; }
     } else if (c == '|') {
-        if (d == '|') { getc_src(); tok.kind = TOK_OROR; strcpy(tok.text, "||"); return; }
-        if (d == '=') { getc_src(); tok.kind = TOK_OREQ; strcpy(tok.text, "|="); return; }
+        if (d == '|') { getc_src(); g_lex.tok.kind = TOK_OROR; strcpy(g_lex.tok.text, "||"); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_OREQ; strcpy(g_lex.tok.text, "|="); return; }
     } else if (c == '+') {
-        if (d == '+') { getc_src(); tok.kind = TOK_INC; strcpy(tok.text, "++"); return; }
-        if (d == '=') { getc_src(); tok.kind = TOK_ADDEQ; strcpy(tok.text, "+="); return; }
+        if (d == '+') { getc_src(); g_lex.tok.kind = TOK_INC; strcpy(g_lex.tok.text, "++"); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_ADDEQ; strcpy(g_lex.tok.text, "+="); return; }
     } else if (c == '-') {
-        if (d == '-') { getc_src(); tok.kind = TOK_DEC; strcpy(tok.text, "--"); return; }
-        if (d == '=') { getc_src(); tok.kind = TOK_SUBEQ; strcpy(tok.text, "-="); return; }
-        if (d == '>') { getc_src(); tok.kind = TOK_ARROW; strcpy(tok.text, "->"); return; }
+        if (d == '-') { getc_src(); g_lex.tok.kind = TOK_DEC; strcpy(g_lex.tok.text, "--"); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_SUBEQ; strcpy(g_lex.tok.text, "-="); return; }
+        if (d == '>') { getc_src(); g_lex.tok.kind = TOK_ARROW; strcpy(g_lex.tok.text, "->"); return; }
     } else if (c == '*') {
-        if (d == '=') { getc_src(); tok.kind = TOK_MULEQ; strcpy(tok.text, "*="); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_MULEQ; strcpy(g_lex.tok.text, "*="); return; }
     } else if (c == '/') {
-        if (d == '=') { getc_src(); tok.kind = TOK_DIVEQ; strcpy(tok.text, "/="); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_DIVEQ; strcpy(g_lex.tok.text, "/="); return; }
     } else if (c == '%') {
-        if (d == '=') { getc_src(); tok.kind = TOK_MODEQ; strcpy(tok.text, "%="); return; }
-        if (d == '>') { getc_src(); tok.kind = '}'; strcpy(tok.text, "%>"); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_MODEQ; strcpy(g_lex.tok.text, "%="); return; }
+        if (d == '>') { getc_src(); g_lex.tok.kind = '}'; strcpy(g_lex.tok.text, "%>"); return; }
     } else if (c == ':') {
-        if (d == '>') { getc_src(); tok.kind = ']'; strcpy(tok.text, ":>"); return; }
+        if (d == '>') { getc_src(); g_lex.tok.kind = ']'; strcpy(g_lex.tok.text, ":>"); return; }
     } else if (c == '^') {
-        if (d == '=') { getc_src(); tok.kind = TOK_XOREQ; strcpy(tok.text, "^="); return; }
+        if (d == '=') { getc_src(); g_lex.tok.kind = TOK_XOREQ; strcpy(g_lex.tok.text, "^="); return; }
     }
 
-    tok.kind = c;
-    tok.text[0] = (char)c;
-    tok.text[1] = 0;
+    g_lex.tok.kind = c;
+    g_lex.tok.text[0] = (char)c;
+    g_lex.tok.text[1] = 0;
 }
 
 int accept(int k)
 {
-    if (tok.kind == k) {
+    if (g_lex.tok.kind == k) {
         next_token();
         return 1;
     }
@@ -2836,6 +2508,8 @@ static const char *expected_token_name(int k, char *buf)
         case TOK_LONG:     return "long";
         case TOK_FLOAT:    return "float";
         case TOK_BOOL:     return "_Bool";
+        case TOK_STATIC_ASSERT: return "_Static_assert";
+        case TOK_NORETURN: return "_Noreturn";
         case TOK_EQ:       return "==";
         case TOK_NE:       return "!=";
         case TOK_LE:       return "<=";
@@ -2860,7 +2534,7 @@ static const char *expected_token_name(int k, char *buf)
 
 void expect(int k)
 {
-    if (tok.kind != k) {
+    if (g_lex.tok.kind != k) {
         char namebuf[32];
         char msg[80];
 
@@ -2870,4 +2544,3 @@ void expect(int k)
     }
     next_token();
 }
-

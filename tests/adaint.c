@@ -2,10 +2,33 @@
  * Compile-then-run VM, supports enough Ada for SIEVE.ADA, E.ADA, TTT.ADA.
  * Builtins for Put, New_Line, Command_Line, Str_To_Int are internal.
  */
+
+#ifdef SDCC
+#define ZCC
+/*
+ * z88dk newlib malloc configuration.
+ *
+ * A negative CLIB_MALLOC_HEAP_SIZE tells the CP/M CRT to initialize the
+ * standard malloc heap with all free memory between the end of BSS and the
+ * reserved stack area.  Without this, the default configuration used by some
+ * recent z88dk builds may leave only a small fixed heap.
+ *
+ * CRT_STACK_SIZE is the amount excluded from the top of memory for stack use.
+ * pint's C stack use is modest; the Pascal VM stacks and frames are allocated
+ * separately by init_run_storage().
+ */
+#pragma output CLIB_MALLOC_HEAP_SIZE = -1
+#pragma output CRT_STACK_SIZE = 512
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+
+#ifdef ZCC
+#include <malloc.h>
+#endif
 
 #define MAXSRC 9000L
 #define MAXTOK 80
@@ -118,12 +141,13 @@ struct State {
     unsigned char *flp;
     int *st;
     int *stp;
-    int *fret;
+    struct Ins **fret;
     int cp;
     int nsym;
     int nfunc;
     int nstr;
     int gtop;
+    int gmem_cap;
     int curfunc;
     int fp;
     int frame_size;
@@ -141,8 +165,14 @@ static void add_var_name(const char *name, int sc, int esz, int count);
 
 static void die(const char *s)
 {
-    fprintf(stderr, "adaint:%d: %s near '%s'\n", G ? G->line : 0, s,
-            G ? G->text : "");
+    /* Not "G ? G->text : """ - G->text (char[]) and the "" literal
+     * (read-only in zsdcc's model) unify to a non-const type in a
+     * ternary, which zsdcc flags as losing the literal's const
+     * qualifier. Assigning through a const char* instead avoids the
+     * ternary/literal mix. */
+    const char *t = "";
+    if (G) t = G->text;
+    fprintf(stderr, "adaint:%d: %s near '%s'\n", G ? G->line : 0, s, t);
     exit(1);
 }
 
@@ -161,15 +191,6 @@ static char *xstrdup2(const char *s)
     if (!p) die("oom");
     strcpy(p, s);
     return p;
-}
-
-static int streqi(const char *a, const char *b)
-{
-    while (*a && *b) {
-        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
-        a++; b++;
-    }
-    return *a == 0 && *b == 0;
 }
 
 static void lower_copy(char *d, const char *s)
@@ -226,7 +247,7 @@ static void mark_set(struct Mark *m)
 
 static int isword(const char *s)
 {
-    return G->tok == T_ID && streqi(G->text, s);
+    return G->tok == T_ID && stricmp(G->text, s) == 0;
 }
 
 static void skip_ws(void)
@@ -272,8 +293,8 @@ static void next(void)
             else break;
         }
         G->text[i] = 0;
-        if (streqi(G->text, "true")) { G->tok = T_NUM; G->ival = 1; return; }
-        if (streqi(G->text, "false")) { G->tok = T_NUM; G->ival = 0; return; }
+        if (stricmp(G->text, "true") == 0) { G->tok = T_NUM; G->ival = 1; return; }
+        if (stricmp(G->text, "false") == 0) { G->tok = T_NUM; G->ival = 0; return; }
         G->tok = T_ID;
         return;
     }
@@ -410,12 +431,28 @@ static int add_func(const char *n)
     return i;
 }
 
+/* gmem grows on demand instead of eagerly reserving the full MAXMEM ceiling
+ * up front: that ceiling exists for the rare program with a large array
+ * (e.g. sieve.ada's Flags, OCCURS-equivalent 8191 elements), but most
+ * programs (e.g. ttt.ada) use only a few dozen bytes of global storage -
+ * paying the worst case unconditionally left too little heap for anything
+ * else. Growing in small chunks costs a handful of reallocs, all at
+ * compile time, never on the interpreter's hot execution path. */
 static int alloc_global(int bytes)
 {
-    int b;
+    int b, newtop, newcap;
     b = G->gtop;
-    G->gtop += bytes;
-    if (G->gtop >= MAXMEM) die("global memory full");
+    newtop = G->gtop + bytes;
+    if (newtop >= MAXMEM) die("global memory full");
+    if (newtop > G->gmem_cap) {
+        newcap = newtop + 64;
+        if (newcap >= MAXMEM) newcap = MAXMEM;
+        G->gmem = (unsigned char *)realloc(G->gmem, (unsigned int)newcap);
+        if (!G->gmem) die("oom");
+        memset(G->gmem + G->gmem_cap, 0, (unsigned int)(newcap - G->gmem_cap));
+        G->gmem_cap = newcap;
+    }
+    G->gtop = newtop;
     return b;
 }
 
@@ -452,7 +489,9 @@ static int store_op(int sc, int esz, int arr)
 
 static int parse_const_expr(void)
 {
-    int v, op;
+    int v = 0, op;   /* die() calls exit(1); this init only silences host
+                       * compilers that don't know that (v is genuinely
+                       * unreachable-uninitialized here) */
     if (G->tok == '-') { next(); return -parse_const_expr(); }
     if (G->tok == T_NUM) { v = G->ival; next(); }
     else if (G->tok == T_ID) { v = G->sym[find_sym(G->text)].val; next(); }
@@ -526,11 +565,11 @@ static void primary(void)
                 emit(OP_CALL, fi, argc);
                 return;
             }
-            if (streqi(name, "command_line")) {
+            if (stricmp(name, "command_line") == 0) {
                 if (G->tok != ')') die("command line args");
                 need(')'); emit(OP_PUSH, 0, 0); return;
             }
-            if (streqi(name, "str_to_int")) {
+            if (stricmp(name, "str_to_int") == 0) {
                 if (G->tok != ')') { parse_expr(); emit(OP_POP, 0, 0); }
                 need(')'); emit(OP_PUSH, 0, 0); return;
             }
@@ -628,10 +667,10 @@ static void simple_call_or_assign(void)
     if (G->tok != T_ID) die("statement");
     strcpy(name, G->text);
     next();
-    if (streqi(name, "put")) {
+    if (stricmp(name, "put") == 0) {
         need('('); parse_put_call(); need(')'); need(';'); return;
     }
-    if (streqi(name, "new_line")) {
+    if (stricmp(name, "new_line") == 0) {
         if (acc('(')) need(')');
         emit(OP_NL, 0, 0); need(';'); return;
     }
@@ -695,7 +734,7 @@ static void while_stmt(void)
 static void for_stmt(void)
 {
     char name[MAXNAME];
-    int si, top, jz, start, endv;
+    int si, top, jz, endv;
     next();
     if (G->tok != T_ID) die("for var");
     strcpy(name, G->text); next();
@@ -726,7 +765,6 @@ static void for_stmt(void)
     emit_store_lvalue(si, 0);
     emit(OP_JMP, top, 0);
     patch(jz, G->cp);
-    (void)start;
 }
 
 static void return_stmt(void)
@@ -924,24 +962,49 @@ static void parse_package(void)
     emit(OP_HALT, 0, 0);
 }
 
-static inline int mem_get(int base, int esz, int idx, unsigned char *m)
+/* Split into word/byte variants instead of a single function taking a
+ * runtime esz parameter: esz is always a compile-time literal (1 or INTB)
+ * at every real call site, but a reproducible dcc quirk means having both
+ * mem_get and mem_set inlined together in the same function (as run()
+ * does, many times over) defeats constant-folding of esz through the
+ * substituted parameter for *both* of them - each call ends up paying a
+ * genuine runtime __mulu for idx * esz instead of the compile-time-
+ * constant shift it should fold to. Baking the size into which function
+ * is called instead of passing it sidesteps the interaction entirely
+ * (verified: neither function alone triggers it, only using both
+ * together in one function does) - see the identical fix in cint.c. */
+static inline int mem_get_word(int base, int idx, unsigned char *m)
 {
-    if (esz == 1) return m[base + idx * esz];
-    return (short)(m[base + idx * esz] | (m[base + idx * esz + 1] << 8));
+    return (short)(m[base + idx * INTB] | (m[base + idx * INTB + 1] << 8));
 }
 
-static inline void mem_set(int base, int esz, int idx, unsigned char *m, int v)
+static inline int mem_get_byte(int base, int idx, unsigned char *m)
 {
-    if (esz == 1) { m[base + idx * esz] = (unsigned char)v; }
-    else {
-        m[base + idx * esz] = (unsigned char)(v & 255);
-        m[base + idx * esz + 1] = (unsigned char)((v >> 8) & 255);
-    }
+    return m[base + idx];
 }
 
-static void call_func(int fi, int retpc, int argc)
+static inline void mem_set_word(int base, int idx, unsigned char *m, int v)
+{
+    m[base + idx * INTB] = (unsigned char)(v & 255);
+    m[base + idx * INTB + 1] = (unsigned char)((v >> 8) & 255);
+}
+
+static inline void mem_set_byte(int base, int idx, unsigned char *m, int v)
+{
+    m[base + idx] = (unsigned char)v;
+}
+
+/* Returns fnp->entry directly - run()'s OP_CALL case needs the callee's
+ * entry point right after this returns to jump there, and used to
+ * re-resolve &G->func[in->a] from scratch for that (in->a == fi here) even
+ * though this function had already resolved the identical address moments
+ * earlier for its own use. Same fix as this file's other repeated-same-
+ * index-subscript cases, just spanning a function-call boundary instead of
+ * a single case body. */
+static int call_func(int fi, struct Ins *retpc, int argc)
 {
     int i, v;
+    struct Func *fnp = &G->func[fi];
     if (G->fp + 1 >= MAXFRAME) die("frame full");
     G->fp++;
     G->flp = G->floc + G->fp * G->frame_size;
@@ -949,41 +1012,45 @@ static void call_func(int fi, int retpc, int argc)
     G->fret[G->fp] = retpc;
     for (i = argc - 1; i >= 0; i--) {
         v = popv();
-        if (i < G->func[fi].nparam)
-            mem_set(G->func[fi].pofs[i], G->func[fi].pesz[i], 0, G->flp, v);
+        if (i < fnp->nparam) {
+            if (fnp->pesz[i] == 1)
+                mem_set_byte(fnp->pofs[i], 0, G->flp, v);
+            else
+                mem_set_word(fnp->pofs[i], 0, G->flp, v);
+        }
     }
+    return fnp->entry;
 }
 
 static void run(void)
 {
-    int pc, a, b, v, argc, i;
+    int a, b, v;
     struct Ins *in;
     G->stp = G->st;
     G->fp = 0;
     G->flp = G->floc;
     memset(G->floc, 0, (unsigned int)(MAXFRAME * G->frame_size));
-    pc = G->main_entry;
+    in = &G->code[G->main_entry];
     for (;;) {
-        in = &G->code[pc++];
         switch (in->op) {
         case OP_HALT: return;
         case OP_PUSH: pushv(in->a); break;
-        case OP_LDG: pushv(mem_get(in->a, INTB, 0, G->gmem)); break;
-        case OP_STG: mem_set(in->a, INTB, 0, G->gmem, popv()); break;
-        case OP_LDL: pushv(mem_get(in->a, INTB, 0, G->flp)); break;
-        case OP_STL: mem_set(in->a, INTB, 0, G->flp, popv()); break;
-        case OP_LDGB: pushv(mem_get(in->a, 1, 0, G->gmem)); break;
-        case OP_STGB: mem_set(in->a, 1, 0, G->gmem, popv()); break;
-        case OP_LDLB: pushv(mem_get(in->a, 1, 0, G->flp)); break;
-        case OP_STLB: mem_set(in->a, 1, 0, G->flp, popv()); break;
-        case OP_LDGA: a=popv(); pushv(mem_get(in->a, INTB, a, G->gmem)); break;
-        case OP_STGA: v=popv(); a=popv(); mem_set(in->a, INTB, a, G->gmem, v); break;
-        case OP_LDLA: a=popv(); pushv(mem_get(in->a, INTB, a, G->flp)); break;
-        case OP_STLA: v=popv(); a=popv(); mem_set(in->a, INTB, a, G->flp, v); break;
-        case OP_LDGAB: a=popv(); pushv(mem_get(in->a, 1, a, G->gmem)); break;
-        case OP_STGAB: v=popv(); a=popv(); mem_set(in->a, 1, a, G->gmem, v); break;
-        case OP_LDLAB: a=popv(); pushv(mem_get(in->a, 1, a, G->flp)); break;
-        case OP_STLAB: v=popv(); a=popv(); mem_set(in->a, 1, a, G->flp, v); break;
+        case OP_LDG: pushv(mem_get_word(in->a, 0, G->gmem)); break;
+        case OP_STG: mem_set_word(in->a, 0, G->gmem, popv()); break;
+        case OP_LDL: pushv(mem_get_word(in->a, 0, G->flp)); break;
+        case OP_STL: mem_set_word(in->a, 0, G->flp, popv()); break;
+        case OP_LDGB: pushv(mem_get_byte(in->a, 0, G->gmem)); break;
+        case OP_STGB: mem_set_byte(in->a, 0, G->gmem, popv()); break;
+        case OP_LDLB: pushv(mem_get_byte(in->a, 0, G->flp)); break;
+        case OP_STLB: mem_set_byte(in->a, 0, G->flp, popv()); break;
+        case OP_LDGA: a=popv(); pushv(mem_get_word(in->a, a, G->gmem)); break;
+        case OP_STGA: v=popv(); a=popv(); mem_set_word(in->a, a, G->gmem, v); break;
+        case OP_LDLA: a=popv(); pushv(mem_get_word(in->a, a, G->flp)); break;
+        case OP_STLA: v=popv(); a=popv(); mem_set_word(in->a, a, G->flp, v); break;
+        case OP_LDGAB: a=popv(); pushv(mem_get_byte(in->a, a, G->gmem)); break;
+        case OP_STGAB: v=popv(); a=popv(); mem_set_byte(in->a, a, G->gmem, v); break;
+        case OP_LDLAB: a=popv(); pushv(mem_get_byte(in->a, a, G->flp)); break;
+        case OP_STLAB: v=popv(); a=popv(); mem_set_byte(in->a, a, G->flp, v); break;
         case OP_ADD: b=popv(); a=popv(); pushv(a+b); break;
         case OP_SUB: b=popv(); a=popv(); pushv(a-b); break;
         case OP_MUL: b=popv(); a=popv(); pushv(a*b); break;
@@ -999,19 +1066,20 @@ static void run(void)
         case OP_GE: b=popv(); a=popv(); pushv(a>=b); break;
         case OP_AND: b=popv(); a=popv(); pushv(a&&b); break;
         case OP_OR: b=popv(); a=popv(); pushv(a||b); break;
-        case OP_JMP: pc = in->a; break;
-        case OP_JZ: a=popv(); if(!a) pc=in->a; break;
-        case OP_CALL: call_func(in->a, pc, in->b); pc = G->func[in->a].entry; break;
+        case OP_JMP: in = &G->code[in->a]; continue;
+        case OP_JZ: a=popv(); if(!a) { in = &G->code[in->a]; continue; } break;
+        case OP_CALL:
+            in = &G->code[call_func(in->a, in + 1, in->b)]; continue;
         case OP_RET:
-            v=popv(); pc=G->fret[G->fp]; G->fp--;
-            G->flp = G->floc + G->fp * G->frame_size; pushv(v); break;
+            v=popv(); in=G->fret[G->fp]; G->fp--;
+            G->flp = G->floc + G->fp * G->frame_size; pushv(v); continue;
         case OP_POP: (void)popv(); break;
         case OP_PUTI: printf("%d", popv()); break;
         case OP_PUTS: printf("%s", G->strs[in->a]); break;
         case OP_NL: printf("\n"); break;
         default: die("bad op");
         }
-        (void)argc; (void)i;
+        in++;
     }
 }
 
@@ -1072,13 +1140,12 @@ static void init_compile_storage(void)
     G->sym = (struct Sym *)xcalloc(MAXSYM, sizeof(struct Sym));
     G->func = (struct Func *)xcalloc(MAXFUNC, sizeof(struct Func));
     G->strs = (char **)xcalloc(MAXSTR, sizeof(char *));
-    G->gmem = (unsigned char *)xcalloc(MAXMEM, 1);
 }
 
 static void init_run_storage(void)
 {
     G->st = (int *)xcalloc(MAXSTACK, sizeof(int));
-    G->fret = (int *)xcalloc(MAXFRAME, sizeof(int));
+    G->fret = (struct Ins **)xcalloc(MAXFRAME, sizeof(struct Ins *));
     G->floc = (unsigned char *)xcalloc((unsigned int)(MAXFRAME * G->frame_size), 1);
 }
 
@@ -1100,7 +1167,7 @@ int main(int argc, char **argv)
     run();
     if (G->verbose) {
         fprintf(stderr, "\nADAINT usage summary\n");
-        fprintf(stderr, "  Source bytes: %ld / %ld\n", G->slen, MAXSRC);
+        fprintf(stderr, "  Source bytes: %u / %u\n", (unsigned)G->slen, (unsigned)MAXSRC);
         fprintf(stderr, "  Code:         %d / %d\n", G->cp, MAXCODE);
         fprintf(stderr, "  Symbols:      %d / %d\n", G->nsym, MAXSYM);
         fprintf(stderr, "  Functions:    %d / %d\n", G->nfunc, MAXFUNC);

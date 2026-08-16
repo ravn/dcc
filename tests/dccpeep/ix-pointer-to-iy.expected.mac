@@ -1,0 +1,86 @@
+; static function decline
+_ZD:
+	push ix
+	ld ix,0
+	add ix,sp
+	ld hl,100
+	ld (ix-2),l
+	ld (ix-1),h
+	ld a,(hl)
+	call _external
+	ld l,(ix-2)
+	ld h,(ix-1)
+	ld a,(hl)
+	call _external
+	ld l,(ix-2)
+	ld h,(ix-1)
+	ld a,(hl)
+	call _external
+	ld l,(ix-2)
+	ld h,(ix-1)
+	ld a,(hl)
+	ld a,(ix-2)
+	add a,1
+	ld (ix-2),a
+	jr nc,LDS
+	inc (ix-1)
+LDS:
+	ld sp,ix
+	pop ix
+	ret
+; static function accept
+_ZA:
+	ld hl,100
+	push hl ; peep: ix_pointer_to_iy
+	pop iy
+	push iy ; peep: ix_pointer_to_iy
+	pop hl
+	ld a,(hl)
+	call __safe
+	push iy ; peep: ix_pointer_to_iy
+	pop hl
+	ld a,(hl)
+	call __safe
+	push iy ; peep: ix_pointer_to_iy
+	pop de
+	ex de,hl
+	ld a,(hl)
+	inc iy ; peep: ix_pointer_to_iy
+	inc iy ; peep: ix_pointer_to_iy
+	or a
+	ret
+; static function counted
+_ZC:
+	push ix
+	ld ix,0
+	add ix,sp
+	push iy ; peep: mutable_ix_pointer_to_iy
+	pop de
+	ld (ix-2),e
+	ld (ix-1),d
+	dec sp ; peep: local_alloc_wide
+	dec sp ; peep: local_alloc_wide
+	dec sp ; peep: local_alloc_wide
+	ld hl,200
+	push hl ; peep: mutable_ix_pointer_to_iy
+	pop iy
+	ld (ix-3),8
+LC:
+	push iy ; peep: mutable_ix_pointer_to_iy
+	pop hl
+	ld a,(hl)
+	inc hl
+	ld b,(hl)
+	inc hl
+	push hl ; peep: mutable_ix_pointer_to_iy
+	pop iy
+	dec (ix-3)
+	jr nz,LC ; peep: jp_to_jr
+	ld e,(ix-2)
+	ld d,(ix-1)
+	push de
+	pop iy ; peep: mutable_ix_pointer_to_iy
+	ld sp,ix
+	pop ix
+	ret
+	end

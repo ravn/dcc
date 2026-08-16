@@ -302,8 +302,9 @@ Common options:
 | --- | --- |
 | `-o file` | Write M80 assembly to `file`; default is `out.mac`, `-` is stdout. |
 | `-c`, `-module` | Emit a separately compilable module, not a final program translation unit. |
-| `-f`, `-ffloatio` | Enable `%f` formatting for `printf`. |
-| `-fl`, `-flongio` | Enable 32-bit `long` `printf`-family format specifiers (`%ld`, `%lu`, `%lx`, `%lX`, `%ls`). |
+| `-f`, `-ffloatio` | Force `%f` support on every `printf`-family call. |
+| `-fl`, `-flongio` | Force 32-bit `long` formats on every `printf`-family call. |
+| `-fno-floatio`, `-fno-longio` | Force the corresponding format paths off, overriding automatic detection. |
 | `-fstack-check` | Emit a lightweight stack-overflow guard in each function prologue. |
 | `-s bytes`, `-stack bytes`, `--stack bytes` | Reserve stack bytes; default is 512. |
 | `-s=bytes`, `-stack=bytes`, `--stack=bytes` | Equivalent attached forms for the stack size. |
@@ -315,15 +316,21 @@ Common options:
 
 ## Options that affect the runtime
 
-- **`-f` / `-ffloatio`** — link floating-point `%f` support for `printf`.
-    You **must** pass this if a `printf` format string uses `%f`; otherwise float
-    formatting is not linked in. This does not enable floating-point `scanf`
-    input, and it does not enable `%f` for `sprintf`, `fprintf`, or the `v...`
-    variants. This is also the single biggest code-size lever — see the
-    [appendix](appendix/01-dccrtlstrip.md).
-- **`-fl` / `-flongio`** — enable 32-bit `long` `printf`-family format
-    specifiers (`%ld`, `%lu`, `%lx`, `%lX`, `%ls`). Use this when formatting
-    `long` values; without it, long formatting support is not linked.
+For each `printf`-family call with a compile-time literal format, dcc detects
+`%f`, long, hexadecimal, and octal conversions and selects the smallest matching
+runtime entry automatically. Calls with non-literal formats conservatively
+include all of those conversion paths.
+
+- **`-f` / `-ffloatio`** — force floating-point `%f` support on every
+    `printf`-family call, including calls whose literal format does not use it.
+    This is normally useful only when forcing a whole-program policy; non-literal
+    formats already use a conservative fallback.
+- **`-fl` / `-flongio`** — similarly force 32-bit `long` formats (`%ld`, `%lu`,
+    `%lx`, `%lX`, `%ls`) on every `printf`-family call.
+- **`-fno-floatio` / `-fno-longio`** — force the corresponding support off,
+    even for a literal that uses it or a non-literal fallback. Use these
+    size-oriented overrides only when no affected conversion can reach any call.
+    None of these options adds floating-point `scanf` input.
 - **`-s` / `-stack` / `--stack`** — reserve stack space (default 512; accepted
   range 0..32767). The heap used by `malloc` lives between the end of BSS and
   the bottom of the stack, so growing the stack shrinks the heap and vice versa.
@@ -336,7 +343,10 @@ Common options:
   return code `0FFh` instead of silently corrupting memory. The guard costs a
   few bytes and one call per function, so it is **off by default**; turn it on
     while developing or for deeply recursive code. The `stacksize` utility
-  (below) uses this guard to measure the minimum `-stack` reserve an app needs.
+    (below) uses this guard to measure the minimum `-stack` reserve an app needs.
+    This option sets the initial state for the translation unit; source can then
+    use [`#pragma stack_check(on)` / `#pragma stack_check(off)`](03-types-and-conventions.md#supported-pragmas)
+    to control guard emission in source order.
 - **`-Dname[=value]`** — predefine a macro. `_DCC_=1` is always defined.
 
 ### Measuring the stack an app needs
@@ -409,6 +419,63 @@ Include the standard headers as usual:
 #include <stdlib.h>
 #include <string.h>
 ```
+
+## Multi-module symbol names
+
+M80 and L80 only keep the **first 6 characters** of a public (external) symbol.
+DCC C Compiler emits each external C identifier as `_` followed by the name, so the leading
+underscore consumes one of those six characters. The practical rule for any
+program built from more than one `.c` file is:
+
+> **Every non-`static` function and non-`static` file-scope variable must be
+> unique within its first 5 characters across all linked modules.**
+
+Names that only differ after the fifth character collapse to the same public
+symbol. For example `i_idxins`, `i_idxbld`, and `i_idxlookup` all become
+`_I_IDX` and are indistinguishable to the linker.
+
+Anything used in only one translation unit should be declared `static`. A
+`static` symbol has internal linkage, so DCC C Compiler gives it a private, generated
+assembler name and the 6-character rule does not apply to it.
+
+### How a collision shows up
+
+- **Within one file**, DCC C Compiler catches it at compile time and stops with an error
+  naming both symbols, for example:
+
+    ```text
+    global names 'i_idxins' and 'i_idxbld' are not distinguishable in M80's
+    6 significant character public symbols (both become '_I_IDX'); rename one
+    ```
+
+- **Across different files**, DCC C Compiler cannot see the clash. L80 may report
+  `%Mult. Def. Global`, or — worse — silently bind a call to the wrong
+  definition, so the program links but misbehaves at runtime.
+
+### Fixing collisions
+
+- Rename the offending identifiers so they differ within the first 5
+  characters (put the distinguishing letters early: `ixins`, `ixbld`,
+  `ixlook` rather than a shared `i_idx…` prefix).
+- Or make single-file helpers `static`.
+
+Struct, union, and enum tags, `typedef` names, struct members, macros, enum
+constants, and local variables never become public symbols, so they are exempt.
+
+### Detecting collisions
+
+After a build, scan the emitted `.MAC` modules for external names that share a
+6-character prefix:
+
+```sh
+grep -rhiE '^[[:space:]]*public ' build/*.MAC \
+  | awk '{print $2}' | sort -u \
+  | awk '{k=toupper(substr($0,1,6));
+          if (seen[k]) print "COLLISION " k ": " first[k] " <> " $0;
+          else { seen[k]=1; first[k]=$0 }}'
+```
+
+Any line printed is a pair you must rename or make `static`.
 
 ## Memory layout
 

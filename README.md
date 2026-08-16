@@ -7,7 +7,7 @@ C compiler targeting CP/M 2.2 on a Z80
 The [dcc documentation](https://davidly.github.io/dcc/) covers all features, usage, and API reference.
 
 ## What dcc is
-dcc has a C89 core plus target-appropriate C99/C11 front-end support. For every source file it accepts, dcc generates a .MAC assembly file that can be assembled by M80 and linked by L80 to produce CP/M .COM files.
+DCC C Compiler is an open source C compiler for CP/M 2.2 on the Z80. It supports C89 plus CP/M-relevant C99/C11 features. For every source file it accepts, dcc generates a .MAC assembly file that can be assembled by M80 and linked by L80 to produce CP/M .COM files.
 
 A separate app dccpeep.c is a peephole optimizer that rewrites portions of .MAC files so apps run faster. It's not necessary to use dccpeep; apps will work just fine without it. But if you need your app to be both smaller and faster it's worth running.
 
@@ -17,12 +17,27 @@ dccrtlstrip.c is an app that examines the code of your .c file and strips portio
 
 The 3 compiler apps dcc, dccpeep, and dccrtlstrip all build and run on Windows, Linux, and MacOS. They are too big to run on CP/M. Use m.bat, m.sh, mmacos.sh to build these apps using msvc (Windows), gcc (Linux), or clang (MacOS) respectively. You may need to chmod 777 *.sh on Linux and MacOS prior to running dcc's scripts.
 
+Dcc has been built and had regression tests run on AMD64 (Linux and Windows), Arm64(Linux, Windows, MacOS), Arm32 (Linux), and RISC-V 64 (Linux).
+
+The binaries dcc produces have been tested in ntvcm (across many platforms), tnylpo (on Linux + AMD64), altair 8800 simulator (on Windows), cpm.exe (on Windows), cpmemu (on Linux), and on a physical Z80 with the Z80-MBC2 SBC. 
+
+The Z80-MBC2 SBC has a TPA of just 55,558 bytes, significantly less than most emulators. Most of the test apps work, but some require more TPA than that. For example, running the Pascal interpreter pint.com with ttt.pas runs out of memory. But smaller test apps like e.pas work fine in pint.com.
+
+When apps built by dcc exit back to the OS on CP/M they do so using the warm boot vector. The CCP is overwritten with the app's stack and heap, so it must be automatically reloaded by CP/M on warm boot. No attempt is made to detect RAM required by an app and preserve the CCP. Reloading the CCP generally takes a couple seconds on physical hardware.
+
 ## Documentation
 
 Two reference documents in the [docs](docs) directory cover the runtime in depth:
 
   - [docs/dcc-c89-reference-guide.md](docs/dcc-c89-reference-guide.md): a practical guide to the C89 language features dcc accepts and the C runtime library implemented in DCCRTL.MAC. It documents type sizes and conventions, the recognized keywords and operators, every standard-header function that is actually linkable (stdio, stdlib, string, ctype, math, setjmp, stdarg, and the CP/M extensions), the supported printf/scanf conversions, and the limitations to keep in mind (no double, 16-bit int, integer-only `%`, etc.). Start here to learn what you can call and how.
   - [docs/dccrtlstrip-inclusion-table.md](docs/dccrtlstrip-inclusion-table.md): an internals reference explaining how dccrtlstrip decides which blocks of DCCRTL.MAC are linked into a program. It maps each C-level construct to the runtime block it pulls in and gives the transitive dependency closures and the marginal .COM size cost of each function. Use it when optimizing binary size or to understand exactly what a given call drags into the link.
+
+## Development machine for modifying dcc
+DCC is intended to be updated by app-writers to better optimize their apps. Typically a dev would point an AI at the code for their app and the code for dcc then ask the AI to profile the app and change dcc to generate better code for the app's scenario.
+
+The inner loop of iterating on improving performance is governed by the speed of your dev machine. Running the full regression suite to ensure nothing was broken can take seconds or minuted depending on your hardware and OS choice. Not surprisingly, more cores really help. And using Linux instead of Windows (which has slower process creation times, anti-virus scanning, indexing, and more) works much better.
+
+<img alt="table" src="images/tests.jpg" />
 
 ## Agent skills
 
@@ -98,19 +113,63 @@ By default dcc assumes apps have one .c file. You can #include .c files into you
 
 ## Emulators
 
-I use my [ntvcm](https://github.com/davidly/ntvcm) CP/M 2.2 emulator to run m80.com, l80.com, and apps built with dcc. The widely-used CPM emulator works equally well; all tests build and pass with that emulator. I haven't run other emulators but I suspect they'll all just work. The compiler and runtime don't push emulator compatibility limits. Only CP/M 2.2 bdos functions are used (and no BIOS functions). One exception: app exit codes (returned from main() or passed to exit()) are set using CP/M 3.0 BDOS call 108. Some emulators like ntvcm reflect that value in their exit code.
+I use my [ntvcm](https://github.com/davidly/ntvcm) CP/M 2.2 emulator to run m80.com, l80.com, and apps built with dcc; the regression suite is baselined against it. The compiler and runtime don't push emulator compatibility limits: only CP/M 2.2 BDOS functions are used (and no BIOS functions), with one exception - app exit codes (returned from main() or passed to exit()) are set using CP/M 3.0 BDOS call 108. Some emulators, ntvcm included, reflect that value in their own process exit code.
+
+### Other CP/M emulators
+
+I've since run dcc-built apps under several other emulators to see how portable they actually are, beyond ntvcm. Short version: the compiler and runtime themselves are fine everywhere - every gap found below is either a one-time invocation quirk (a command-line flag or how the emulator is set up) or a genuine bug in that specific emulator, not something dcc does differently per emulator. If you hit something not covered here, please open an issue.
+
+| Emulator | Platform | Works out of the box? | Notes |
+| --- | --- | --- | --- |
+| [ntvcm](https://github.com/davidly/ntvcm) | Windows, Linux, macOS | Yes | Reference emulator; the regression suite is baselined against it. |
+| cpm.exe (Takeda Toshiya's "[CP/M Player for Win32](http://takeda-toshiya.my.coocan.jp/cpm/index.html)") | Windows | Yes, on a build from `http://takeda-toshiya.my.coocan.jp/cpm/` dated 2024/10 or later | On BDOS 23 (rename), it rejects renaming onto an already-existing destination name (`rename()` returns nonzero, the old name and its content survive untouched) rather than silently overwriting - same behavior as tnylpo, opposite of ntvcm/cpmemu/zxcc/z88dk's cpm/RunCPM, all of which allow the overwrite (see the permanent cross-emulator differences below the table). It appears to shell out to `cmd.exe` for at least that call - running a rename from a UNC-style path (e.g. a WSL `\\wsl.localhost\...` mount) prints a `UNC paths are not supported. Defaulting to Windows directory.` warning to stdout before the real output, worth filtering out of captured baselines if you drive it from such a path. Everything else tested is byte-for-byte identical to ntvcm. |
+| [tnylpo](https://gitlab.com/gbrein/tnylpo) | Linux | Yes | Takes the CP/M command file as a literal, case-sensitive host filename (e.g. `tnylpo e.com`, not `tnylpo E.COM`) - unlike the others here, it doesn't uppercase/normalize what you pass it. Also rejects BDOS 23 (rename) onto an already-existing destination name, matching cpm.exe and unlike ntvcm/cpmemu/zxcc/z88dk's cpm/RunCPM. |
+| [iz-cpm](https://github.com/ivanizag/iz-cpm) | Windows, Linux, macOS | Needs `--cpm3` | Its default CP/M 2.2 mode doesn't implement BDOS 108 (`P_CODE`), and prints `BDOS command 108 not implemented.` to stdout instead of silently ignoring it - since DCCRTL always calls BDOS 108 on exit (see above), this shows up at the end of every app's output unless you pass `--cpm3`. Separately, and not worked around by that flag: a file written and closed can read back as 0 bytes on reopen - a real iz-cpm limitation. The project's own README describes it as "a very basic implementation, mostly for educational purposes." |
+| [zxcc](https://github.com/agn453/zxcc) | Windows, Linux, macOS | Needs a `-` prefix on each argument | Being primarily a Hi-Tech-C-compiler wrapper, zxcc treats a bare command-line argument as a *host filename to translate* into CP/M form unless it's prefixed with `-` (e.g. `zxcc TTT.COM -10`, not `zxcc TTT.COM 10`) - without the prefix the app sees a mangled argument instead of the literal text. It also lowercases CP/M filenames when mapping to the host filesystem, so a fixture file staged with an uppercase name (as CP/M convention and this repo's own test harness both do) won't be found on a case-*sensitive* host (Linux); this doesn't come up on a case-insensitive host (Windows, default macOS). Separately: `unlink()` on a nonexistent file returns success instead of `ENOENT`, and its `FIND_FIRST`/`FIND_NEXT` (BDOS 17/18) never returns the currently-*executing* `.COM` file itself from a wildcard search, even though it plainly exists. |
+| [RunCPM](https://github.com/MockbaTheBorg/RunCPM) | Windows, Linux, macOS | Needs setup, then yes | RunCPM boots to an interactive CCP prompt rather than taking a `.com` file on its own command line, and produces no output at all unless given a real PTY (nothing over a plain pipe). To drive it non-interactively: build with `globals.h`'s `BOOTONLY` set to `TRUE` so its `AUTOEXEC.TXT` auto-run mechanism fires once instead of looping forever, then run it under something that allocates a PTY (e.g. `script -qec "./RunCPM" logfile`) with the command written to `AUTOEXEC.TXT` beforehand. Once set up, its behavior matches ntvcm closely (e.g. console echo of redirected/piped stdin behaves the same, unlike cpm.exe). |
+| [z88dk/cpm](https://github.com/z88dk/cpm) (a fork of jhallen/cpm, adopted by the z88dk project) | Linux, Cygwin | Needs patches, a PTY, and a generous TPA | Same PTY requirement as RunCPM (nothing over a plain pipe). Treats **any** unrecognized BDOS call as fatal, hard-crashing with a register dump rather than ignoring or reporting it - this includes BDOS 108 (exit code, which DCCRTL always calls) and BDOS 105 (`time()`'s clock, see "Time functions" below), so a one-line no-op `case` needs adding to `bdos.c` for each before a dcc-built program can even exit cleanly, let alone use a real clock. Separately: BDOS 35 (compute file size) requires the FCB to already be open (`getfp()` in `bdos.c`), which the CP/M 2.2 spec doesn't actually require - it just queries the directory - so a correct program calling F_SIZE on an unopened FCB (e.g. `cpmenumd.c`) crashes the same way. Its default-build TPA is also only ~56 KB, smaller than every other emulator here (in the same range as the physical Z80-MBC2 noted above), so the bigger test apps (`pint.com` + `ttt.pas`/`ttt.ada`) can run out of memory - a TPA limitation, not a bug. |
+| [cpmemu](https://github.com/avwohl/cpmemu) | Linux | Yes | The cleanest of the non-reference emulators tried here: no PTY, no argument-prefix or case-folding quirks, and it already sends its own diagnostics (including an `Unimplemented BDOS function 108` notice - non-fatal, unlike z88dk/cpm) to stderr rather than stdout, so a plain `2>/dev/null` wrapper is enough for dcc's test harness (which merges stdout+stderr when capturing an emulator's output). Same stdin-echo difference as cpm.exe: doesn't echo redirected/piped input as it's consumed via BDOS console input, so `tscanin`/`tkbd` differ from the ntvcm baseline the same way. `tkbd` specifically (a console-status poll loop) runs dramatically longer than on any other emulator here before it resolves - a behavioral quirk in how cpmemu handles polling on redirected stdin, worth knowing about if you use it for anything console-poll-heavy. cpmemu's BDOS 19 (delete) doesn't honor `?` wildcards at all, even for a single-character pattern (see `tests/twild.c`) - a genuine cpmemu BDOS-conformance gap, not something DCCRTL can work around. |
+
+`tbdos.c`/`tbios.c` in the test suite are written with this in mind: they avoid asserting any emulator-specific value (an exact CP/M version byte, a raw BIOS jump-table address, whether a console character happens to be "pending" under a non-interactive run) and instead check internal consistency - e.g. that dcc's `bdos()`/`bdoshl()`/function-pointer call paths all agree with each other - which is genuinely portable across every emulator above.
+
+A few DCCRTL behaviors are permanent, deliberate characteristics rather than bugs to fix - either because the underlying CP/M 2.2 BDOS spec itself is silent or ambiguous on the point, or because the split across emulators can't be resolved without picking a side host filesystems won't support:
+
+  - **`fread()`/`ftell()` can disagree on file length.** A partial-record write into virgin territory pads the untouched rest of that 128-byte record with Ctrl-Z (0x1A), since CP/M has no concept of a partial record. That padding is genuine, readable, on-disk data - `fread()` isn't bounded by the length `ftell()` reports, so a big-enough `fread()` on a short file returns the padding along with the real bytes. Confirmed identical across every tested emulator - a genuine CP/M/DCCRTL characteristic, not something DCCRTL can trim away without risking silently discarding real trailing data a program deliberately wrote (e.g. a file that's an exact multiple of 65536 records, or one that legitimately ends in `^Z`). See `tests/tpadread.c`.
+  - **Renaming onto an existing destination name is a genuine, permanent cross-emulator split.** Real CP/M 2.2 BDOS doesn't check whether the destination already exists at all - it just overwrites the matched entry's name bytes, which on real hardware leaves two directory entries sharing one name (undefined which one `open()` later finds). Every emulator here is forced to pick a single winner, since host filesystems don't allow two entries with one name: ntvcm, cpmemu, zxcc, z88dk's cpm, and RunCPM overwrite the destination; tnylpo and cpm.exe reject the rename (nonzero return, old name/content untouched). If your app cares which way this goes, check the return value and/or delete the destination first. See `tests/trenamex.c`.
+  - **Open (BDOS 15) with an ambiguous (wildcard) FCB is a similar 3-way split.** The Interface Guide is silent on whether open supports wildcards at all, so nothing here is a documented guarantee either way. ntvcm, cpmemu, and zxcc reject an ambiguous open (`NULL`); tnylpo and cpm.exe silently open whatever the first matching directory entry happens to be. See `tests/tfopenw.c`.
+
+BDOS 105 ("Get Date and Time", introduced in CP/M 3.0) - the real clock behind `time()`/`gmtime()`/`asctime()`/etc., see "Time functions" below - is a CP/M 3.0+ call, so support among CP/M 2.2-era emulators varies. DCCRTL calls it unconditionally, with no BDOS-12 version check first, specifically because ntvcm and RunCPM both answer it correctly while still reporting themselves as CP/M 2.2 - gating on the reported version would disable the real clock on exactly the two emulators that matter most here. Confirmed working with a real clock: ntvcm, RunCPM (default build, still reporting 2.2), zxcc (which does report itself as 3.1), tnylpo, and cpm.exe. Confirmed absent but handled gracefully - no crash, `time()` correctly falls back to `(time_t)-1` via its own sentinel check - on iz-cpm (consistent with it being "a very basic implementation" per its own README, see above), cpmemu (which reports the gap itself: `Unimplemented BDOS function 105` on stderr), and z88dk's cpm once patched to no-op BDOS 105 the same way BDOS 108 already needs to be (see the table above) - unpatched, it hard-crashes on 105 just like it does on any other unrecognized call. `tests/ttime.c` checks both outcomes without hardcoding which one to expect, so it passes either way - confirmed on every emulator above.
+
+Building `tests/ttime.c` yourself outside the regression suite? Build it with peephole optimization off (`dccmake ... dcc-peep=false`, or omit `-Ot`/whatever flag enables it in your own build script). The suite's own `_test_overrides.json` already does this for its own runs, working around a known `dccpeep` bug (see the `KNOWN BUG` comment on `try_subtract_one_at` in `src/dccpeep/peep_pass_once.c`) that can otherwise make one of the `mktime()` checks report `FAIL` - on any emulator, not something specific to whichever one you're building for.
 
 ## M80 and L80
 
 m80.com and l80.com are part of the M80 Assembler product from Microsoft. I didn't write them. They are included in this repo to ease development, but they can be found in dozens of locations on the internet.
 
-## C89+ language 
-
-The compiler accepts some syntax from later C standards including declaring variables where you like and initializing them with complex expressions. Only 4-byte floats are supported; 8-byte doubles are not. I'm certain more arcane C89 expressions/features aren't implemented (yet), but the test cases have pretty good coverage. Only a small subset of the C runtime is implemented in DCCRTL.MAC, but the samples implement a bunch more that you can copy/paste where needed. The register, volatile, and const keywords are ignored aside from constant folding for const variables.
+By default, dccmake/ma.sh/ma.ps1 assemble with `m80c`, a from-scratch, conservative
+clone of M80 (see `src/m80c/m80c.c`) that runs natively on the host instead of
+under CP/M emulation - no ntvcm involved for that step. L80 is still real M80
+Assembler-product software and still runs under ntvcm, since only the assembler
+was reimplemented. Pass `dcc-use-emulated-m80=true` to dccmake, `-femulated-m80`
+directly to dccmake, `--emulated-m80`/`-EmulatedM80` to ma.sh/ma.ps1, or
+`-UseEmulatedM80` to runall.ps1/runall-extended.ps1, to assemble with the real
+M80.COM under ntvcm instead (e.g. to cross-check output, or if m80c hasn't been
+built locally).
 
 ## Memory layout
 
 Memory layout is what you would expect; CP/M loads .COM files in just one way. BSS begins just after the loaded image. The app assumes sp is set to the highest free byte by the loader. dcc sets a default stack size of 512 bytes but you can use the -stack argument to change that. dcc will quietly increase your stack size if it detects large frames. See ma.bat for an example. The heap used by malloc() uses RAM between the end of BSS and the bottom of the stack. If you need to adjust the heap and stack sizes you can change dcc's -stack argument to slide the barrier. There are no runtime checks that prevent the stack from smashing the heap. You can implement your own stack checks if you want; see spsmash.c for an example of how to do this.
+
+## Time functions
+
+`time()`, `difftime()`, `mktime()`, `asctime()`, `ctime()`, `gmtime()`, and `localtime()` are fully implemented (see `time.h`). `clock()` and `strftime()` remain stubs - `clock()` always returns `(clock_t)-1`, and `strftime()` always writes nothing and returns 0.
+
+A few characteristics worth knowing about before relying on the implemented ones:
+
+- **`time()` is the only one that can fail; the rest are pure calendar arithmetic.** `gmtime()`, `localtime()`, `asctime()`, `ctime()`, `mktime()`, and `difftime()` all operate purely on `time_t`/`struct tm` values you already have - they always work, with or without a real clock. Only `time()` itself depends on the underlying BDOS actually having a clock to read (see below); it returns `(time_t)-1` when it doesn't, the same "no clock" value every one of these functions returned before this support existed.
+- **Seconds resolution only.** The underlying BDOS call reports whole seconds, with no sub-second component - anything needing finer timing (benchmarking, frame pacing) needs its own mechanism, not these functions.
+- **No timezone concept.** CP/M has no timezone database, so `localtime()` is simply `gmtime()` under another name, and the `time_t` `time()` returns is exactly the BDOS clock's raw wall-clock reading with no UTC offset applied in either direction. In practice, the "UTC" `time_t` this runtime produces is really just the host/emulator's local wall clock, relabeled - if your app genuinely needs UTC, correct for the local offset yourself.
+- **Availability depends on the specific emulator/BIOS, not the CP/M version it reports.** `time()` calls BDOS function 105 ("Get Date and Time", introduced in CP/M 3.0) unconditionally, with no BDOS-12 version check first - deliberately, since ntvcm and RunCPM both answer it correctly while still reporting themselves as CP/M 2.2 (a version check would just disable the real clock on the two emulators that matter most here). When the underlying BDOS genuinely doesn't implement the call, `time()` detects that (a sentinel byte written before the call, checked after) and returns `(time_t)-1` rather than a fabricated-looking but wrong timestamp. See the "Other CP/M emulators" section above for which ones were actually confirmed to support this, and `tests/ttime.c` for the regression coverage (its expected output doesn't depend on which case a given run hits).
 
 ## Benchmarks
 
@@ -127,6 +186,7 @@ Generally, dcc compares very well with all other compilers that target CP/M, esp
   - pihex.c: Computes PI in base 16. This is C-only and some of the compilers can't build or run it due to a variety of bugs. It measures unsigned long mod and floating point performance. I spent 90 minutes trying to get the two forms of ZCC to build and run it, ran into many compiler and C runtime bugs, and gave up. HiSoft v4.11 has a C runtime bug where if you cast 3.963512 to an int it gives you 4. After I worked around that and other bugs, code from that compiler ran really well -- faster than dcc.
   - mm.c: Another BYTE magazine classic from October 1982. Measures floating point initialization, addition, and multiplication performance.
   - tstring.c: Measures performance of strlen, strchr, strrchr, strstr, memcmp, memcpy, memset, memchr, rand, and integer modulus. Most compilers don't implement all of these and need them supplied.
+  - tbig.c: Test sequential and random file i/o on the biggest file size CP/M 2.2 supports: 8MB. 
 
 Benchmark times are in milliseconds on a 4Mhz Z80. CP/M file sizes are rounded up to the next multiple of 128 bytes due to how the file system works.
 
@@ -165,7 +225,7 @@ dcc compiles on Windows, Linux, and macOS. The build scripts are in the root dir
 chmod +x mmacos.sh
 ./mmacos.sh
 ```
-This produces `dcc`, `dccpeep`, and `dccrtlstrip` in the dcc directory.
+This produces `dcc`, `dccpeep`, `dccrtlstrip`, `dccmake`, and `m80c` in the dcc directory.
 Requires the clang compiler from the Xcode Command Line Tools (install with `xcode-select --install`).
 
 **Linux:**
@@ -212,7 +272,9 @@ Once both projects are built, set up your environment as shown in the next secti
 The build scripts (`ma.sh`, `ma.bat`, `runall.sh`, `runall.bat`) resolve each
 tool the same way: they use an environment variable if you set one, otherwise
 they look for the tool on your `PATH`. The relevant tools are `dcc`, `dccpeep`,
-`dccrtlstrip`, `ntvcm`, and the `m80`/`l80` assembler/linker.
+`dccrtlstrip`, `m80c`, `ntvcm`, and the `l80` linker (and `m80`, only if you
+pass `-UseEmulatedM80`/`dcc-use-emulated-m80=true` to assemble with the real
+M80.COM instead of native `m80c`).
 
 The simplest setup, especially when building C apps in a project *outside* the
 dcc repo, is to add the directories containing the built `dcc` and `ntvcm`
@@ -225,7 +287,7 @@ Add this to your shell profile (e.g., `~/.zshrc`, `~/.bash_profile`, or
 
 ```bash
 # Add the directories that contain the built dcc and ntvcm binaries to PATH.
-# dcc's directory also provides dccpeep, dccrtlstrip, m80.com, l80.com, and DCCRTL.MAC.
+# dcc's directory also provides dccpeep, dccrtlstrip, m80c, m80.com, l80.com, and DCCRTL.MAC.
 export PATH="$PATH:/path/to/dcc:/path/to/ntvcm"
 ```
 

@@ -1,9 +1,25 @@
 /* tc99init.c - C99 designated initializers and compound literals. */
 #include <stdio.h>
 
+#ifdef _DCC_
+#define TEST_UINT32_MAX 0xffffffffUL
+#else
+#define TEST_UINT32_MAX 0xffffffffU
+#endif
+
 struct Pair {
     int a;
     int b;
+};
+
+struct Rect {
+    int w;
+    int h;
+};
+
+struct Grid {
+    int n;
+    struct Rect cells[3];
 };
 
 struct Holder {
@@ -17,7 +33,7 @@ static int target = 27;
 
 static struct Pair reordered = { .b = 20, .a = 10 };
 static struct Pair *literal_pair = &(struct Pair){ .b = 4, .a = 3 };
-static struct Pair pairs[2] = { [1] = { .b = 8, .a = 7 }, [0] = { 5, 6 } };
+static struct Pair pairs[2] = { [TEST_UINT32_MAX + 2] = { .b = 8, .a = 7 }, [0] = { 5, 6 } };
 static struct Holder holder = {
     .values = { [2] = 12, [0] = 10, 11 },
     .ptr = &reordered,
@@ -51,7 +67,16 @@ static void check_local_designators(void)
 {
     struct Pair local_pair = { .b = 22, .a = 21 };
     struct Pair local_pairs[2] = { [1] = { .b = 42, .a = 41 }, [0] = { 39, 40 } };
-    int local_values[4] = { [2] = 32, [0] = 30, 31, [3] = 33 };
+    int local_values[4] = { [TEST_UINT32_MAX + 3] = 32, [0] = 30, 31, [3] = 33 };
+    struct Grid local_grid = {
+        .n = 3,
+        .cells[1] = { 2, 9 },
+        .cells[0].w = 1
+    };
+    static const struct Pair static_pairs[] = {
+        { .b = 52, .a = 51 },
+        { .b = 54, .a = 53 }
+    };
 
     check_int(local_pair.a, 21, "local_pair.a");
     check_int(local_pair.b, 22, "local_pair.b");
@@ -63,6 +88,16 @@ static void check_local_designators(void)
     check_int(local_values[1], 31, "local_values[1]");
     check_int(local_values[2], 32, "local_values[2]");
     check_int(local_values[3], 33, "local_values[3]");
+    check_int(local_grid.n, 3, "local_grid.n");
+    check_int(local_grid.cells[0].w, 1, "local_grid.cells[0].w");
+    check_int(local_grid.cells[0].h, 0, "local_grid.cells[0].h");
+    check_int(local_grid.cells[1].w, 2, "local_grid.cells[1].w");
+    check_int(local_grid.cells[1].h, 9, "local_grid.cells[1].h");
+    check_int(local_grid.cells[2].w, 0, "local_grid.cells[2].w");
+    check_int(static_pairs[0].a, 51, "static_pairs[0].a");
+    check_int(static_pairs[0].b, 52, "static_pairs[0].b");
+    check_int(static_pairs[1].a, 53, "static_pairs[1].a");
+    check_int(static_pairs[1].b, 54, "static_pairs[1].b");
 }
 
 int main(void)

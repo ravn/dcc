@@ -2,15 +2,17 @@
  * dcc_diag_emit.c - diagnostics, allocation, and low-level emit primitives.
  *
  * The compiler's "plumbing": fatal()/error_here() error reporting,
- * source_location_at() for #line-aware positions, xmalloc/xstrdup2, label
- * allocation, the emit()/emit_label()/emit_jp_label() assembly-output
- * primitives, and the raw source character readers (peekc/getc_src).
+ * source_location_at() for #line-aware positions, allocation and checked
+ * stream-reading helpers, EmitSink switching, assembly-output primitives, and
+ * raw source character readers (peekc/getc_src).
  *
- * MODULE: compiled as its own translation unit; shared declarations are in dcc.h.
+ * MODULE: compiled as its own translation unit; macro helpers used for source
+ * rendering are declared in dcc_preproc_internal.h.
  * Source provenance: monolith src/ddc.c lines 495-691.
  */
 
 #include "dcc.h"
+#include "dcc_preproc_internal.h"
 
 void dcc_copy_str(char *dst, size_t dstsz, const char *src)
 {
@@ -46,6 +48,7 @@ const char *dcc_diag_code_for_message(const char *msg)
     if (dcc_msg_has(msg, "expected \"FILENAME\" or <FILENAME>")) return "DCC-E0301";
     if (dcc_msg_has(msg, "include name too long")) return "DCC-E0302";
     if (dcc_msg_has(msg, "unterminated include name")) return "DCC-E0303";
+    if (dcc_msg_has(msg, "cannot open include file")) return "DCC-E0304";
     if (dcc_msg_has(msg, "not a valid preprocessor directive")) return "DCC-E0310";
     if (dcc_msg_has(msg, "unknown preprocessor directive")) return "DCC-E0310";
     if (dcc_msg_has(msg, "too many nested #if")) return "DCC-E0311";
@@ -53,11 +56,17 @@ const char *dcc_diag_code_for_message(const char *msg)
     if (dcc_msg_has(msg, "#elif without matching #if")) return "DCC-E0313";
     if (dcc_msg_has(msg, "#else without matching #if")) return "DCC-E0314";
     if (dcc_msg_has(msg, "#endif without matching #if")) return "DCC-E0315";
+    if (dcc_msg_has(msg, "#else after #else")) return "DCC-E0316";
+    if (dcc_msg_has(msg, "#if with no matching #endif")) return "DCC-E0317";
     if (dcc_msg_has(msg, "too many arguments provided to function-like macro invocation")) return "DCC-E0320";
     if (dcc_msg_has(msg, "too few arguments provided to function-like macro invocation")) return "DCC-E0321";
+    if (dcc_msg_has(msg, "macro argument too long in function-like macro invocation")) return "DCC-E0322";
     if (dcc_msg_has(msg, "constant integer expression expected")) return "DCC-E0401";
+    if (dcc_msg_has(msg, "integer constant expression out of range")) return "DCC-E0401";
     if (dcc_msg_has(msg, "division by zero in constant expression")) return "DCC-E0402";
     if (dcc_msg_has(msg, "expected an expression")) return "DCC-E0403";
+    if (dcc_msg_has(msg, "static assertion failed")) return "DCC-E0404";
+    if (dcc_msg_has(msg, "static assertion")) return "DCC-E0405";
     if (dcc_msg_has(msg, "expected a field designator")) return "DCC-E0501";
     if (dcc_msg_has(msg, "unknown field initializer designator")) return "DCC-E0502";
     if (dcc_msg_has(msg, "field name expected in offsetof")) return "DCC-E0503";
@@ -71,11 +80,16 @@ const char *dcc_diag_code_for_message(const char *msg)
     if (dcc_msg_has(msg, "invalid bitfield width")) return "DCC-E0511";
     if (dcc_msg_has(msg, "duplicate enum constant")) return "DCC-E0520";
     if (dcc_msg_has(msg, "enum constant name expected")) return "DCC-E0521";
+    if (dcc_msg_has(msg, "enumerator value is not representable as 16-bit int")) return "DCC-E0522";
     if (dcc_msg_has(msg, "struct/union name or '{' expected")) return "DCC-E0530";
     if (dcc_msg_has(msg, "type expected")) return "DCC-E0531";
     if (dcc_msg_has(msg, "multiple storage classes in declaration")) return "DCC-E0540";
     if (dcc_msg_has(msg, "variable length arrays are not supported")) return "DCC-E0601";
+    if (dcc_msg_has(msg, "variable inner dimensions in variable-length arrays are not supported")) return "DCC-E0601";
     if (dcc_msg_has(msg, "subscripted value is not an array or pointer")) return "DCC-E0602";
+    if (dcc_msg_has(msg, "too many array dimensions")) return "DCC-E0603";
+    if (dcc_msg_has(msg, "invalid array bound for 16-bit target")) return "DCC-E0604";
+    if (dcc_msg_has(msg, "object size exceeds 16-bit address space")) return "DCC-E0605";
     if (dcc_msg_has(msg, "break statement outside loop or switch")) return "DCC-E0701";
     if (dcc_msg_has(msg, "continue statement outside loop")) return "DCC-E0702";
     if (dcc_msg_has(msg, "case label outside switch")) return "DCC-E0703";
@@ -101,9 +115,11 @@ const char *dcc_diag_code_for_message(const char *msg)
     if (dcc_msg_has(msg, "too many union initializer elements")) return "DCC-E0911";
     if (dcc_msg_has(msg, "float initializer must be constant")) return "DCC-E0912";
     if (dcc_msg_has(msg, "negative array initializer designator")) return "DCC-E0913";
+    if (dcc_msg_has(msg, "array initializer designator out of range")) return "DCC-E0916";
     if (dcc_msg_has(msg, "wide string cannot initialize char array")) return "DCC-E0914";
     if (dcc_msg_has(msg, "bitfield initializer must be constant integer")) return "DCC-E0915";
     if (dcc_msg_has(msg, "incompatible integer to pointer assignment")) return "DCC-E0920";
+    if (dcc_msg_has(msg, "cannot take address of register object")) return "DCC-E0921";
     if (dcc_msg_has(msg, "unsupported sizeof expression")) return "DCC-E1001";
     if (dcc_msg_has(msg, "unsupported")) return "DCC-E1002";
     if (dcc_msg_has(msg, "malformed")) return "DCC-E1003";
@@ -173,84 +189,159 @@ void init_predefined_macro_texts(void)
     }
 }
 
-void source_location_at(long ofs, char *filebuf, int filebufsz, int *linep)
-{
-    long p;
-    long line_start;
-    long line_end;
+/* source_location_at is called once per token (next_token, dcc_preproc.c),
+ * so a #line-directive scan restarting from byte 0 of the source buffer on
+ * every call is O(tokens * average position) - quadratic in file size, and
+ * the dominant cost of compiling a large source (profiled: >95% of dcc's
+ * own runtime on tests/cobint.c, the largest generated .mac in the suite).
+ *
+ * Fix: precompute a table with one entry per source line (offset -> the
+ * effective line number/filename after applying any #line directive up to
+ * and including that line), built by a single linear scan, and answer each
+ * query with a binary search over it - O(nlines) once plus O(log nlines)
+ * per call, instead of O(ofs) every call.
+ *
+ * `src` isn't static for the whole compile, though: replace_source_range
+ * (dcc_preproc.c) rewrites it in place for every macro expansion, and
+ * dcc_global_scan.c's whole-file pre-pass saves/restores it around its own
+ * scan. A naive "cache the last position and resume forward" scheme was
+ * tried first and measured almost no improvement, because that isn't
+ * occasional - the compiler's speculative-parse machinery (narrowing,
+ * inlining, register allocation, the frame-sizing pre-pass) constantly
+ * saves lexer state and re-lexes from an earlier position, so >90% of
+ * calls turned out to be "rewinds" that a forward-only cache can't help.
+ * A table keyed to the buffer's actual content order doesn't care what
+ * order it's queried in, so it isn't defeated by that access pattern - it
+ * only needs to know when to rebuild. g_src_generation (bumped at every
+ * one of those `src` reassignments) is the invalidation signal: if it
+ * doesn't match the generation the table was built for, rebuild before
+ * answering. */
+struct SrcLineEntry {
+    long ofs;
     int line;
-    const char *fname;
+    char file[256];
+};
 
-    fname = input_name ? input_name : "<input>";
+static struct SrcLineEntry *g_srcline_table;
+static long g_srcline_count;
+static long g_srcline_built_for_generation = -1;
+
+static void build_srcline_table(void)
+{
+    long p, line_start, line_end;
+    long i;
+    int line;
+    char curfile[256];
+
+    free(g_srcline_table);
+    g_srcline_count = 1;
+    for (i = 0; i < src_len; ++i)
+        if (src[i] == '\n')
+            g_srcline_count++;
+    g_srcline_table = (struct SrcLineEntry *)xmalloc((size_t)g_srcline_count * sizeof(struct SrcLineEntry));
+
+    strncpy(curfile, input_name ? input_name : "<input>", sizeof(curfile) - 1);
+    curfile[sizeof(curfile) - 1] = 0;
     line = 1;
-    if (filebufsz > 0) {
-        strncpy(filebuf, fname, (size_t)filebufsz - 1);
-        filebuf[filebufsz - 1] = 0;
-    }
-
-    if (ofs < 0)
-        ofs = 0;
-    if (ofs > src_len)
-        ofs = src_len;
+    g_srcline_count = 0;
 
     p = 0;
-    while (p < ofs) {
-        int i;
+    for (;;) {
+        int j;
 
         line_start = p;
         while (p < src_len && src[p] != '\n')
             p++;
         line_end = p;
 
-        i = (int)line_start;
-        while (i < line_end && (src[i] == ' ' || src[i] == '\t'))
-            i++;
+        j = (int)line_start;
+        while (j < line_end && (src[j] == ' ' || src[j] == '\t'))
+            j++;
 
-        if (i + 5 <= line_end && src[i] == '#' &&
-            src[i + 1] == 'l' && src[i + 2] == 'i' &&
-            src[i + 3] == 'n' && src[i + 4] == 'e' &&
-            (i + 5 == line_end || src[i + 5] == ' ' || src[i + 5] == '\t')) {
-            int n;
-            int qi;
+        if (j + 5 <= line_end && src[j] == '#' &&
+            src[j + 1] == 'l' && src[j + 2] == 'i' &&
+            src[j + 3] == 'n' && src[j + 4] == 'e' &&
+            (j + 5 == line_end || src[j + 5] == ' ' || src[j + 5] == '\t')) {
+            int n, qi;
 
-            i += 5;
-            while (i < line_end && (src[i] == ' ' || src[i] == '\t'))
-                i++;
+            j += 5;
+            while (j < line_end && (src[j] == ' ' || src[j] == '\t'))
+                j++;
             n = 0;
-            while (i < line_end && src[i] >= '0' && src[i] <= '9') {
-                n = n * 10 + src[i] - '0';
-                i++;
+            while (j < line_end && src[j] >= '0' && src[j] <= '9') {
+                n = n * 10 + src[j] - '0';
+                j++;
             }
             if (n > 0)
                 line = n - 1;
 
-            while (i < line_end && (src[i] == ' ' || src[i] == '\t'))
-                i++;
-            if (i < line_end && src[i] == '"') {
-                i++;
+            while (j < line_end && (src[j] == ' ' || src[j] == '\t'))
+                j++;
+            if (j < line_end && src[j] == '"') {
+                j++;
                 qi = 0;
-                while (i < line_end && src[i] != '"' && qi < filebufsz - 1)
-                    filebuf[qi++] = src[i++];
-                if (filebufsz > 0)
-                    filebuf[qi] = 0;
+                while (j < line_end && src[j] != '"' && qi < (int)sizeof(curfile) - 1)
+                    curfile[qi++] = src[j++];
+                curfile[qi] = 0;
             }
         }
 
-        if (p >= ofs)
+        g_srcline_table[g_srcline_count].ofs = line_start;
+        g_srcline_table[g_srcline_count].line = line;
+        strcpy(g_srcline_table[g_srcline_count].file, curfile);
+        g_srcline_count++;
+
+        if (p >= src_len)
             break;
-        if (p < src_len && src[p] == '\n') {
-            p++;
-            line++;
+        line++;
+        p++; /* skip the newline */
+    }
+
+    g_srcline_built_for_generation = g_src_generation;
+}
+
+void source_location_at(long ofs, char *filebuf, int filebufsz, int *linep)
+{
+    long lo, hi, mid, best;
+
+    if (ofs < 0)
+        ofs = 0;
+    if (ofs > src_len)
+        ofs = src_len;
+
+    if (g_srcline_built_for_generation != g_src_generation)
+        build_srcline_table();
+
+    lo = 0;
+    hi = g_srcline_count - 1;
+    best = 0;
+    while (lo <= hi) {
+        mid = (lo + hi) / 2;
+        if (g_srcline_table[mid].ofs <= ofs) {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
         }
     }
 
-    linep[0] = line;
+    linep[0] = g_srcline_table[best].line;
+    if (filebufsz > 0) {
+        strncpy(filebuf, g_srcline_table[best].file, (size_t)filebufsz - 1);
+        filebuf[filebufsz - 1] = 0;
+    }
 }
 
 void dcc_error_at(const char *file, int line, long ofs, const char *msg, const char *near_text)
 {
     const char *fn;
     const char *code;
+
+    /* Counted unconditionally, even while suppressed below, so structural
+     * parser probes and constant-expression attempts can detect that their
+     * tentative parse diagnosed an error without printing it. MIR emission
+     * also refuses to commit after any real diagnostic. */
+    g_diag_error_count++;
 
     /* asm_suppress_depth marks source text being parsed for its structural
      * side effects only (dead code kept in sync for frame layout, a real
@@ -278,8 +369,36 @@ void error_here(const char *msg)
 {
     const char *fn;
 
-    fn = tok.file[0] ? tok.file : (input_name ? input_name : "<input>");
-    dcc_error_at(fn, tok_line, tok_start_pos, msg, tok.text);
+    fn = g_lex.tok.file[0] ? g_lex.tok.file : (input_name ? input_name : "<input>");
+    dcc_error_at(fn, g_lex.tok_line, g_lex.tok_start_pos, msg, g_lex.tok.text);
+}
+
+int warnings = 0;
+
+/* Non-fatal diagnostic: doesn't touch `errors` or exit(), so a warning never
+ * changes whether the compile succeeds. Suppressed under asm_suppress_depth
+ * for the same reason dcc_error_at is (see its comment): narrowing and
+ * inline-candidate probes must not print a diagnostic from a structural
+ * parse whose output is never committed.
+ *
+ * Also suppressed once a real error has already been reported anywhere in
+ * the compile: a missing/malformed return expression already produces its
+ * own error at the return statement itself (e.g. "unsupported return
+ * expression"), and the control-flow analysis this feeds (does the
+ * function's body provably return a value on every path) is only
+ * meaningful for a function that actually parsed - once something upstream
+ * is already broken, "control reaches end of non-void function" is
+ * cascaded noise on top of a diagnostic the user already has, not a
+ * separate real finding. */
+void warn_at(const char *file, int line, const char *msg)
+{
+    const char *fn;
+
+    if (asm_suppress_depth > 0 || errors > 0)
+        return;
+    fn = file && file[0] ? file : (input_name ? input_name : "<input>");
+    fprintf(stderr, "%s:%d: warning: %s\n", fn, line, msg);
+    warnings++;
 }
 
 void *xmalloc(size_t n)
@@ -298,6 +417,27 @@ char *xstrdup2(const char *s)
     return p;
 }
 
+/* Returns a NUL-terminated copy and leaves stream at EOF. Callers that need to
+ * read the stream again must rewind it. */
+char *dcc_read_stream_text(FILE *stream, long *size_out, const char *error_msg)
+{
+    long size;
+    char *buf;
+
+    if (fseek(stream, 0, SEEK_END) != 0)
+        fatal(error_msg);
+    size = ftell(stream);
+    if (size < 0 || fseek(stream, 0, SEEK_SET) != 0)
+        fatal(error_msg);
+
+    buf = (char *)xmalloc((size_t)size + 1);
+    if (size > 0 && fread(buf, 1, (size_t)size, stream) != (size_t)size)
+        fatal(error_msg);
+    buf[size] = 0;
+    *size_out = size;
+    return buf;
+}
+
 int new_label(void)
 {
     return ++label_id;
@@ -305,8 +445,14 @@ int new_label(void)
 
 void flush_pending_asm(void)
 {
-    if (pending_asm_len > 0 && outf) {
-        fwrite(pending_asm_buf, 1, (size_t)pending_asm_len, outf);
+    /* Never flush during a suppressed sizing/metadata pass. Leave the buffer
+     * intact for the next real output point. */
+    if (asm_suppress_depth > 0)
+        return;
+    if (pending_asm_len > 0 && g_emit_sink.stream) {
+        fputs("\t; dcc user asm begin\n", g_emit_sink.stream);
+        fwrite(pending_asm_buf, 1, (size_t)pending_asm_len, g_emit_sink.stream);
+        fputs("\t; dcc user asm end\n", g_emit_sink.stream);
         pending_asm_len = 0;
     }
 }
@@ -316,7 +462,7 @@ void emit(const char *s);
 void emit_ld_de_const(long v)
 {
     if (!scan_mode)
-        fprintf(outf, "\tld de,%ld\n", v & 0xffffL);
+        fprintf(g_emit_sink.stream, "\tld de,%ld\n", v & 0xffffL);
 }
 
 void emit_add_const_to_hl(long v)
@@ -331,19 +477,19 @@ void emit_add_const_to_hl(long v)
 void emit(const char *s)
 {
     if (!scan_mode)
-        fputs(s, outf);
+        fputs(s, g_emit_sink.stream);
 }
 
 void emit_label(int n)
 {
     if (!scan_mode)
-        fprintf(outf, "L%d:\n", n);
+        fprintf(g_emit_sink.stream, "L%d:\n", n);
 }
 
 void emit_jp_label(const char *op, int n)
 {
     if (!scan_mode)
-        fprintf(outf, "\t%s L%d\n", op, n);
+        fprintf(g_emit_sink.stream, "\t%s L%d\n", op, n);
 }
 
 int is_ident_start(int c)
@@ -375,23 +521,23 @@ static int trigraph_xlat(int third)
 int peekc(void)
 {
     int t;
-    if (posi >= src_len) return 0;
-    if ((unsigned char)src[posi] == '?' && posi + 2 < src_len &&
-            (unsigned char)src[posi + 1] == '?' &&
-            (t = trigraph_xlat((unsigned char)src[posi + 2])) != 0)
+    if (g_lex.posi >= src_len) return 0;
+    if ((unsigned char)src[g_lex.posi] == '?' && g_lex.posi + 2 < src_len &&
+            (unsigned char)src[g_lex.posi + 1] == '?' &&
+            (t = trigraph_xlat((unsigned char)src[g_lex.posi + 2])) != 0)
         return t;
-    return (unsigned char)src[posi];
+    return (unsigned char)src[g_lex.posi];
 }
 
 int getc_src(void)
 {
     int c, t;
-    if (posi >= src_len) return 0;
-    c = (unsigned char)src[posi++];
-    if (c == '\n') { line_no++; return c; }
-    if (c == '?' && posi + 1 < src_len && (unsigned char)src[posi] == '?' &&
-            (t = trigraph_xlat((unsigned char)src[posi + 1])) != 0) {
-        posi += 2;
+    if (g_lex.posi >= src_len) return 0;
+    c = (unsigned char)src[g_lex.posi++];
+    if (c == '\n') { g_lex.line_no++; return c; }
+    if (c == '?' && g_lex.posi + 1 < src_len && (unsigned char)src[g_lex.posi] == '?' &&
+            (t = trigraph_xlat((unsigned char)src[g_lex.posi + 1])) != 0) {
+        g_lex.posi += 2;
         return t;
     }
     return c;
@@ -399,4 +545,3 @@ int getc_src(void)
 
 int define_number_value(const char *name, long *out, int depth);
 void strip_macro_replacement_comments(char *s);
-

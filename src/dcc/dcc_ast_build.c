@@ -7,10 +7,10 @@
  * source grammar (including dcc's C99 conveniences -
  * it operates purely on the token stream, so for-init/mid-block expressions
  * and // comments are handled transparently by the shared lexer).  It builds
- * an AstNode tree from the current lexer position by calling next_token(); it
- * never emits, interns strings, or allocates symbols, so the only global state
- * it touches is the lexer cursor.  The AST emitter consumes the built tree;
- * unsupported shapes are compiler errors in normal codegen.
+ * an AstNode tree from the current lexer position and emits no assembly.
+ * Compound-literal and optimization shapes may reserve compiler-generated
+ * locals while building, so speculative callers must restore lexer/frame state
+ * when discarding a tree. MIR and the metadata walkers consume the result.
  */
 #include "dcc.h"
 #include "dcc_ast.h"
@@ -106,9 +106,15 @@ static struct FieldDef *ast_member_field_for_sizeof(const struct AstNode *n)
     return find_field_def(sid, n->sval);
 }
 
+static int ast_index_root_and_count(const struct AstNode *n,
+                                    const struct AstNode **root);
+static int ast_expr_is_array_row(const struct AstNode *n);
+
 int ast_expr_type_for_sizeof(const struct AstNode *n)
 {
     struct Sym *s;
+    const struct AstNode *root;
+    int index_count;
     int lt;
     int rt;
     struct FieldDef *fd;
@@ -128,11 +134,41 @@ int ast_expr_type_for_sizeof(const struct AstNode *n)
             return TYPE_INT;
         return s->type;
     case AST_INDEX:
+        index_count = ast_index_root_and_count(n, &root);
+        if (root != NULL && root->kind == AST_IDENT) {
+            s = find_sym(root->sval);
+            if (s != NULL &&
+                ((s->is_array && s->dim_count == index_count) ||
+                 (!s->is_array && type_ptr_depth(s->type) > 0 &&
+                  s->dim_count + 1 == index_count)))
+                return s->is_array ? s->type : type_decay_ptr(s->type);
+        }
+        if (root != NULL && root->kind == AST_MEMBER) {
+            fd = ast_member_field_for_sizeof(root);
+            if (fd != NULL && fd->is_array && fd->dim_count == index_count)
+                return fd->elem_type;
+        }
         lt = ast_expr_type_for_sizeof(n->a);
         if (n->a != NULL && n->a->kind == AST_IDENT) {
             s = find_sym(n->a->sval);
             if (s != NULL && s->is_array)
                 return s->type;
+        }
+        /* n->a is a struct/union array FIELD (`f.arr[i]` / `p->arr[i]`):
+         * the AST_MEMBER case above already returns fd->elem_type for an
+         * array field - i.e. lt here is already arr[i]'s own type, not
+         * "the type of arr as a whole" - so it must not be decayed again
+         * the way a genuinely pointer-valued n->a would be below. Missing
+         * this case for AST_MEMBER (unlike the AST_IDENT case just above,
+         * which already avoids the same double-decay for a plain array
+         * variable) silently dropped a pointer level for any struct field
+         * declared as a pointer ARRAY (`struct Foo *arr[N];`): elem_type
+         * is one-pointer-deep, type_decay_ptr then dropped it to zero,
+         * so `p = f.arr[0];` looked like an int-to-pointer assignment. */
+        if (n->a != NULL && n->a->kind == AST_MEMBER) {
+            struct FieldDef *fd = ast_member_field_for_sizeof(n->a);
+            if (fd != NULL && fd->is_array)
+                return lt;
         }
         if (type_ptr_depth(lt) > 0)
             return type_decay_ptr(lt);
@@ -158,6 +194,10 @@ int ast_expr_type_for_sizeof(const struct AstNode *n)
     case AST_CAST:
         return n->type;
     case AST_BINARY:
+    {
+        int lhs_pointer;
+        int rhs_pointer;
+
         lt = ast_expr_type_for_sizeof(n->a);
         rt = ast_expr_type_for_sizeof(n->b);
         if (n->op == '<' || n->op == '>' || n->op == TOK_LE || n->op == TOK_GE ||
@@ -165,14 +205,27 @@ int ast_expr_type_for_sizeof(const struct AstNode *n)
             return TYPE_INT;
         if (n->op == TOK_SHL || n->op == TOK_SHR)
             return promote_int_type(lt);
-        if ((n->op == '+' || n->op == '-') && type_ptr_depth(lt) > 0) {
-            if (n->op == '-' && type_ptr_depth(rt) > 0)
+
+        lhs_pointer = type_ptr_depth(lt) > 0 ||
+                      ast_expr_is_array_decay(n->a) ||
+                      ast_expr_is_array_row(n->a);
+        rhs_pointer = type_ptr_depth(rt) > 0 ||
+                      ast_expr_is_array_decay(n->b) ||
+                      ast_expr_is_array_row(n->b);
+        if ((n->op == '+' || n->op == '-') && lhs_pointer) {
+            if (n->op == '-' && rhs_pointer)
                 return TYPE_INT;
-            return lt;
+            if (ast_expr_is_array_decay(n->a) || ast_expr_is_array_row(n->a))
+                return type_add_ptr(lt);
+            return type_ptr_depth(lt) > 0 ? lt : type_add_ptr(lt);
         }
-        if (n->op == '+' && type_ptr_depth(rt) > 0)
-            return rt;
+        if (n->op == '+' && rhs_pointer) {
+            if (ast_expr_is_array_decay(n->b) || ast_expr_is_array_row(n->b))
+                return type_add_ptr(rt);
+            return type_ptr_depth(rt) > 0 ? rt : type_add_ptr(rt);
+        }
         return common_arith_type(lt, rt);
+    }
     case AST_LOGAND:
     case AST_LOGOR:
         return TYPE_INT;
@@ -242,11 +295,64 @@ static int ast_expr_is_array_row(const struct AstNode *n)
     return 0;
 }
 
+/*
+ * Descend an rvalue's base chain - through subscripts, member selections
+ * (. and ->) and pointer dereferences - to the identifier its value derives
+ * from, and report whether that identifier is absent from the symbol table.
+ * Such a base is a local declared in an inner block whose scope AST-build has
+ * not entered (nested-block locals register only when emitted), so the whole
+ * expression's type is unknowable here.  Enum constants are excluded: they
+ * carry a known int type and must keep the precise E0920 diagnostic.
+ */
+static int ast_expr_base_ident_unresolved(const struct AstNode *n)
+{
+    while (n != NULL) {
+        switch (n->kind) {
+        case AST_INDEX:
+        case AST_MEMBER:
+            n = n->a;
+            break;
+        case AST_UNARY:
+            if (n->op != '*')
+                return 0;
+            n = n->a;
+            break;
+        case AST_IDENT:
+            return find_sym(n->sval) == NULL && find_enum_const(n->sval) < 0;
+        default:
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static int ast_expr_is_pointer_assignment_rhs(const struct AstNode *n)
 {
+    const struct AstNode *cast;
+    const struct AstNode *call;
     if (n == NULL)
         return 0;
+    if (n->kind == AST_UNARY && n->op == '*' && n->a != NULL &&
+        n->a->kind == AST_CAST) {
+        cast = n->a;
+        call = cast->a;
+        if (call != NULL && call->kind == AST_CALL && call->a != NULL &&
+            call->a->kind == AST_IDENT && !strcmp(call->a->sval, "__va_arg") &&
+            type_ptr_depth(type_decay_ptr(cast->type)) > 0)
+            return 1;
+    }
     if (ast_expr_is_null_pointer_constant(n))
+        return 1;
+    /*
+     * When the value derives from an identifier not yet in the symbol table
+     * - a bare reference, or a subscript/member/deref rooted on one - that
+     * identifier is a declaration from an inner block whose scope AST-build
+     * has not entered (nested-block locals only register when emitted).  Its
+     * type is not knowable here, so ast_expr_type_for_sizeof would wrongly
+     * default it to int.  Do not treat that as an integer-to-pointer
+     * assignment; a genuinely undeclared identifier is diagnosed later.
+     */
+    if (ast_expr_base_ident_unresolved(n))
         return 1;
     if (type_ptr_depth(ast_expr_type_for_sizeof(n)) > 0)
         return 1;
@@ -259,7 +365,7 @@ static int ast_expr_is_pointer_assignment_rhs(const struct AstNode *n)
     return 0;
 }
 
-static int ast_sizeof_expr_value(const struct AstNode *n)
+int ast_sizeof_expr_value(const struct AstNode *n)
 {
     struct Sym *s;
     struct FieldDef *fd;
@@ -281,7 +387,7 @@ static int ast_sizeof_expr_value(const struct AstNode *n)
         }
         break;
     case AST_STR_LIT:
-        return (int)strlen(n->sval) + 1;
+        return (int)n->uval + 1;
     case AST_INDEX:
         index_count = ast_index_root_and_count(n, &root);
         if (root != NULL && root->kind == AST_IDENT) {
@@ -306,17 +412,29 @@ static int ast_sizeof_expr_value(const struct AstNode *n)
     return type_size(t);
 }
 
+struct Sym *ast_sizeof_whole_vla_sym(const struct AstNode *n)
+{
+    struct Sym *s;
+
+    if (n == NULL || n->kind != AST_IDENT)
+        return NULL;
+    s = find_sym(n->sval);
+    if (s == NULL || !s->is_vla)
+        return NULL;
+    return s;
+}
+
 static void ast_skip_braced_initializer(void)
 {
     int depth;
 
     depth = 0;
     do {
-        if (tok.kind == TOK_EOF)
+        if (g_lex.tok.kind == TOK_EOF)
             break;
-        if (tok.kind == '{')
+        if (g_lex.tok.kind == '{')
             depth++;
-        else if (tok.kind == '}')
+        else if (g_lex.tok.kind == '}')
             depth--;
         next_token();
     } while (depth > 0);
@@ -328,11 +446,11 @@ static struct AstNode *ast_build_compound_literal(struct AstArena *ar, int type)
     struct AstCompoundLitSpan *sp;
 
     sp = (struct AstCompoundLitSpan *)ast_arena_alloc(ar, sizeof(struct AstCompoundLitSpan));
-    sp->posi = posi;
-    sp->tok_start_pos = tok_start_pos;
-    sp->line_no = line_no;
-    sp->tok_line = tok_line;
-    sp->tok = tok;
+    sp->posi = g_lex.posi;
+    sp->tok_start_pos = g_lex.tok_start_pos;
+    sp->line_no = g_lex.line_no;
+    sp->tok_line = g_lex.tok_line;
+    sp->tok = g_lex.tok;
 
     n = ast_new(ar, AST_COMPOUND_LITERAL);
     n->type = type;
@@ -344,42 +462,90 @@ static struct AstNode *ast_build_compound_literal(struct AstArena *ar, int type)
     return n;
 }
 
+static struct Sym *ast_add_struct_return_member_temp(struct AstArena *ar,
+                                                     const struct AstNode *base)
+{
+    struct Sym *fn;
+    struct Sym *tmp;
+    struct Sym *copy;
+    char name[64];
+    int bytes;
+
+    if (base == NULL || base->kind != AST_CALL || base->a == NULL ||
+        base->a->kind != AST_IDENT)
+        return NULL;
+    fn = find_global(base->a->sval);
+    if (fn == NULL || fn->storage != SC_FUNC || !type_is_struct_object(fn->type))
+        return NULL;
+
+    bytes = type_size(fn->type);
+    if (bytes <= 0)
+        bytes = 2;
+    sprintf(name, "#sret%d", g_frame.nlocals);
+    tmp = add_local_alloc(name, fn->type, bytes);
+    copy = (struct Sym *)ast_arena_alloc(ar, sizeof(*copy));
+    memcpy(copy, tmp, sizeof(*copy));
+    return copy;
+}
+
 /* Forward declarations (mutually recursive grammar). */
 static struct AstNode *p_assign(struct AstArena *ar);
 
 /* Copy the current token's text into the arena. */
 static char *cur_text(struct AstArena *ar)
 {
-    return ast_arena_strdup(ar, tok.text);
+    return ast_arena_strdup(ar, g_lex.tok.text);
 }
 
 static struct AstNode *p_primary(struct AstArena *ar)
 {
     struct AstNode *n;
 
-    switch (tok.kind) {
+    switch (g_lex.tok.kind) {
     case TOK_NUM:
     case TOK_CHARLIT:
         {
-            long v = (tok.kind == TOK_NUM) ? (long)strtoul(tok.text, NULL, 0) : tok.val;
+            long v;
+            unsigned long uv = 0;
             int ty;
+            int is_long;
+            if (g_lex.tok.kind == TOK_NUM) {
+                /* Use cf_parse_integer_literal_bits, not strtoul, and
+                 * classify on uv (the literal's raw 32-bit unsigned bit
+                 * pattern), not v: on a host where long is only 32 bits
+                 * (MSVC), a constant needing the full unsigned 32-bit
+                 * range (e.g. 4294967295) wraps negative when narrowed
+                 * into a 32-bit signed long, so neither "v > 0xffff" nor
+                 * "v < -32768" would be true - silently misclassifying a
+                 * genuinely 32-bit constant as a 16-bit int and
+                 * truncating it throughout codegen. A 64-bit host long
+                 * (Linux/macOS) never wraps here, so this is a no-
+                 * behavior-change there. Same hazard already fixed in
+                 * cf_parse_primary (dcc_fold.c) and emit_init_numeric
+                 * (dcc_data.c); this AST-building path had been missed. */
+                uv = cf_parse_integer_literal_bits(g_lex.tok.text);
+                v = (long)uv;
+            } else {
+                v = g_lex.tok.val;
+            }
             /* Mirror gen_primary's literal classification so the codegen
              * walker can reproduce its emit exactly. */
-            int is_long = (v > 0xffffL || v < -32768L ||
-                           (tok.kind == TOK_NUM && g_tok_long_suffix));
+            is_long = (g_lex.tok.kind == TOK_NUM)
+                ? (uv > 0xffffUL || g_tok_long_suffix)
+                : (v > 0xffffL || v < -32768L);
             ty = is_long ? TYPE_LONG : TYPE_INT;
-            if (tok.kind == TOK_NUM && g_tok_unsigned_suffix)
+            if (g_lex.tok.kind == TOK_NUM && g_tok_unsigned_suffix)
                 ty |= TYPE_UNSIGNED;
             n = ast_int_lit(ar, v, ty);
-            if (tok.kind == TOK_CHARLIT)
+            if (g_lex.tok.kind == TOK_CHARLIT)
                 n->uval = AST_INT_UVAL_CHARLIT;
-            else if (ast_num_text_plain_decimal(tok.text))
+            else if (ast_num_text_plain_decimal(g_lex.tok.text))
                 n->uval = AST_INT_UVAL_PLAIN_DECIMAL;
             next_token();
             return n;
         }
     case TOK_FLOATLIT:
-        n = ast_float_lit(ar, parse_float_literal_bits(tok.text), TYPE_FLOAT);
+        n = ast_float_lit(ar, parse_float_literal_bits(g_lex.tok.text), TYPE_FLOAT);
         next_token();
         return n;
     case TOK_STR:
@@ -388,33 +554,37 @@ static struct AstNode *p_primary(struct AstArena *ar)
             /* Concatenate adjacent string literals exactly like gen_primary;
              * this also advances the lexer past every piece.  Interning is a
              * codegen side effect, so it is deferred to the walker (the build
-             * must stay free of codegen side effects); ival carries is_wide. */
+             * must stay free of codegen side effects); ival carries is_wide,
+             * uval carries the true byte length (may exceed strlen(sval) if
+             * the literal has an embedded \0 escape). */
             int is_wide = 0;
-            char *lit = read_adjacent_string_literals_ex(&is_wide);
+            int litlen = 0;
+            char *lit = read_adjacent_string_literals_ex(&is_wide, &litlen);
             n = ast_new(ar, AST_STR_LIT);
-            n->sval = ast_arena_strdup(ar, lit);
+            n->sval = ast_arena_memdup(ar, lit, litlen);
             n->ival = is_wide;
+            n->uval = (unsigned long)litlen;
             n->type = TYPE_CHAR | TYPE_PTR;
             free(lit);
             return n;
         }
     case TOK_ID:
-        if (!strcmp(tok.text, "__offsetof")) {
+        if (!strcmp(g_lex.tok.text, "__offsetof")) {
             long v = parse_offsetof_value();
             return ast_int_lit(ar, v, TYPE_INT);
         }
         n = ast_new(ar, AST_IDENT);
         n->sval = cur_text(ar);
         /* read-only resolution; both lookups only scan existing tables */
-        n->sym = find_local_decl(tok.text);
+        n->sym = find_local_decl(g_lex.tok.text);
         if (n->sym == NULL)
-            n->sym = find_global(tok.text);
+            n->sym = find_global(g_lex.tok.text);
         next_token();
         return n;
     case '(':
         next_token();
         n = ast_build_expr(ar);          /* comma operator allowed in parens */
-        if (tok.kind == ')')
+        if (g_lex.tok.kind == ')')
             next_token();
         return n;
     default:
@@ -422,14 +592,10 @@ static struct AstNode *p_primary(struct AstArena *ar)
     }
 }
 
-static struct AstNode *p_postfix(struct AstArena *ar)
+static struct AstNode *p_postfix_tail(struct AstArena *ar, struct AstNode *n)
 {
-    struct AstNode *n = p_primary(ar);
-    if (n == NULL)
-        return NULL;
-
     for (;;) {
-        if (tok.kind == '[') {
+        if (g_lex.tok.kind == '[') {
             struct AstNode *m = ast_new(ar, AST_INDEX);
             int base_type = ast_expr_type_for_sizeof(n);
             if (n != NULL && n->kind == AST_IDENT) {
@@ -446,25 +612,25 @@ static struct AstNode *p_postfix(struct AstArena *ar)
             next_token();
             m->a = n;
             m->b = ast_build_expr(ar);
-            if (tok.kind == ']')
+            if (g_lex.tok.kind == ']')
                 next_token();
             n = m;
-        } else if (tok.kind == '(') {
+        } else if (g_lex.tok.kind == '(') {
             struct AstNode *call = ast_call(ar, n, 0);
             next_token();
-            if (tok.kind != ')') {
+            if (g_lex.tok.kind != ')') {
                 for (;;) {
                     struct AstNode *arg = p_assign(ar);
                     if (arg != NULL)
                         ast_list_push(ar, call, arg);
-                    if (tok.kind == ',') {
+                    if (g_lex.tok.kind == ',') {
                         next_token();
                         continue;
                     }
                     break;
                 }
             }
-            if (tok.kind == ')')
+            if (g_lex.tok.kind == ')')
                 next_token();
             if (n->kind == AST_IDENT && n->sym != NULL && n->sym->has_proto && !n->sym->proto_variadic) {
                 if (call->list_len < n->sym->proto_nargs)
@@ -473,19 +639,21 @@ static struct AstNode *p_postfix(struct AstArena *ar)
                     error_here("too many arguments to function call");
             }
             n = call;
-        } else if (tok.kind == '.' || tok.kind == TOK_ARROW) {
+        } else if (g_lex.tok.kind == '.' || g_lex.tok.kind == TOK_ARROW) {
             struct AstNode *m = ast_new(ar, AST_MEMBER);
-            m->op = tok.kind;
+            m->op = g_lex.tok.kind;
             m->a = n;
+            if (g_lex.tok.kind == '.')
+                m->sym = ast_add_struct_return_member_temp(ar, n);
             next_token();
-            if (tok.kind == TOK_ID) {
+            if (g_lex.tok.kind == TOK_ID) {
                 m->sval = cur_text(ar);
                 next_token();
             }
             n = m;
-        } else if (tok.kind == TOK_INC || tok.kind == TOK_DEC) {
+        } else if (g_lex.tok.kind == TOK_INC || g_lex.tok.kind == TOK_DEC) {
             struct AstNode *m = ast_new(ar, AST_POSTFIX);
-            m->op = tok.kind;
+            m->op = g_lex.tok.kind;
             m->a = n;
             next_token();
             n = m;
@@ -496,21 +664,32 @@ static struct AstNode *p_postfix(struct AstArena *ar)
     return n;
 }
 
+static struct AstNode *p_postfix(struct AstArena *ar)
+{
+    struct AstNode *n = p_primary(ar);
+    if (n == NULL)
+        return NULL;
+    return p_postfix_tail(ar, n);
+}
+
 static struct AstNode *p_unary(struct AstArena *ar)
 {
-    int k = tok.kind;
+    int k = g_lex.tok.kind;
 
     if (k == '-' || k == '+' || k == '!' || k == '~' ||
         k == '*' || k == '&' || k == TOK_INC || k == TOK_DEC) {
         struct AstNode *operand;
+        struct AstNode *unary;
         next_token();
         operand = p_unary(ar);
-        return ast_unary(ar, k, operand, 0);
+        unary = ast_unary(ar, k, operand, 0);
+        unary->type = ast_expr_type_for_sizeof(unary);
+        return unary;
     }
 
     if (k == TOK_SIZEOF) {
         next_token();
-        if (tok.kind == '(' && paren_starts_cast()) {
+        if (g_lex.tok.kind == '(' && paren_starts_cast()) {
             struct AstNode *n = ast_new(ar, AST_SIZEOF_TYPE);
             int ty;
             int sz;
@@ -524,7 +703,10 @@ static struct AstNode *p_unary(struct AstArena *ar)
             struct AstNode *n = ast_new(ar, AST_SIZEOF_EXPR);
             n->a = p_unary(ar);
             n->type = TYPE_INT;
-            n->ival = ast_sizeof_expr_value(n->a);
+            /* The operand's size is resolved at EMIT time (see
+             * gen_sizeof_expr_ast): a local declared in a nested block only
+             * enters the symbol table when its declaration span is emitted,
+             * which is after this node is built but before it is walked. */
             return n;
         }
     }
@@ -536,8 +718,8 @@ static struct AstNode *p_unary(struct AstArena *ar)
         next_token();                    /* consume '(' */
         parse_type_name_decl(&cty, &csz); /* parse ( type-name */
         expect(')');
-        if (tok.kind == '{')
-            return ast_build_compound_literal(ar, cty);
+        if (g_lex.tok.kind == '{')
+            return p_postfix_tail(ar, ast_build_compound_literal(ar, cty));
         operand = p_unary(ar);
         return ast_cast(ar, cty, operand);
     }
@@ -571,7 +753,7 @@ static struct AstNode *p_binary(struct AstArena *ar, int min_level)
         return NULL;
 
     for (;;) {
-        int k = tok.kind;
+        int k = g_lex.tok.kind;
         int lev = binop_level(k);
         struct AstNode *rhs;
         int peek = 0;
@@ -595,6 +777,14 @@ static struct AstNode *p_binary(struct AstArena *ar, int min_level)
         else {
             lhs = ast_binary(ar, AST_BINARY, k, lhs, rhs, 0);
             lhs->peek_type = peek;
+            lhs->type = ast_expr_type_for_sizeof(lhs);
+            if (k == TOK_SHL || k == TOK_SHR)
+                lhs->operand_type = promote_int_type(
+                    ast_expr_type_for_sizeof(lhs->a));
+            else
+                lhs->operand_type = common_arith_type(
+                    ast_expr_type_for_sizeof(lhs->a),
+                    ast_expr_type_for_sizeof(lhs->b));
         }
     }
     return lhs;
@@ -603,15 +793,19 @@ static struct AstNode *p_binary(struct AstArena *ar, int min_level)
 static struct AstNode *p_conditional(struct AstArena *ar)
 {
     struct AstNode *c = p_binary(ar, 1);
-    if (tok.kind == '?') {
+    if (g_lex.tok.kind == '?') {
         struct AstNode *then_e;
         struct AstNode *else_e;
         next_token();
         then_e = ast_build_expr(ar);     /* full expression before ':' */
-        if (tok.kind == ':')
+        if (g_lex.tok.kind == ':')
             next_token();
         else_e = p_conditional(ar);
-        return ast_cond(ar, c, then_e, else_e, 0);
+        {
+            struct AstNode *conditional = ast_cond(ar, c, then_e, else_e, 0);
+            conditional->type = ast_expr_type_for_sizeof(conditional);
+            return conditional;
+        }
     }
     return c;
 }
@@ -628,8 +822,8 @@ static int is_assign_op(int k)
 static struct AstNode *p_assign(struct AstArena *ar)
 {
     struct AstNode *lhs = p_conditional(ar);
-    if (is_assign_op(tok.kind)) {
-        int op = tok.kind;
+    if (is_assign_op(g_lex.tok.kind)) {
+        int op = g_lex.tok.kind;
         struct AstNode *rhs;
         next_token();
         rhs = p_assign(ar);              /* right-associative */
@@ -644,7 +838,7 @@ static struct AstNode *p_assign(struct AstArena *ar)
 struct AstNode *ast_build_expr(struct AstArena *ar)
 {
     struct AstNode *n = p_assign(ar);
-    while (tok.kind == ',') {
+    while (g_lex.tok.kind == ',') {
         struct AstNode *rhs;
         next_token();
         rhs = p_assign(ar);
@@ -669,15 +863,22 @@ static struct AstNode *ast_build_return_stmt(struct AstArena *ar)
 {
     struct AstNode *n;
     struct AstNode *val = NULL;
+    int ret_line = g_lex.tok_line;             /* the 'return' keyword's own line -
+                                           * ast_new below would otherwise
+                                           * stamp whatever token follows the
+                                           * trailing ';', off by a line for
+                                           * the common one-statement-per-line
+                                           * case */
 
     next_token();                        /* consume 'return' */
-    if (tok.kind != ';')
+    if (g_lex.tok.kind != ';')
         val = ast_build_expr(ar);
-    if (tok.kind != ';')
+    if (g_lex.tok.kind != ';')
         return NULL;                     /* malformed: decline */
     next_token();                        /* consume ';' */
 
     n = ast_new(ar, AST_RETURN);
+    n->line = ret_line;
     n->a = val;
     return n;
 }
@@ -687,7 +888,7 @@ static struct AstNode *ast_build_return_stmt(struct AstArena *ar)
 static struct AstNode *ast_build_jump_stmt(struct AstArena *ar, int kind)
 {
     next_token();                        /* consume 'break' / 'continue' */
-    if (tok.kind != ';')
+    if (g_lex.tok.kind != ';')
         return NULL;
     next_token();                        /* consume ';' */
     return ast_new(ar, kind);
@@ -701,11 +902,11 @@ static struct AstNode *ast_build_goto_stmt(struct AstArena *ar)
     char *name;
 
     next_token();                        /* consume 'goto' */
-    if (tok.kind != TOK_ID)
+    if (g_lex.tok.kind != TOK_ID)
         return NULL;
-    name = ast_arena_strdup(ar, tok.text);
+    name = ast_arena_strdup(ar, g_lex.tok.text);
     next_token();                        /* consume label name */
-    if (tok.kind != ';')
+    if (g_lex.tok.kind != ';')
         return NULL;
     next_token();                        /* consume ';' */
 
@@ -723,7 +924,7 @@ static struct AstNode *ast_build_expr_stmt(struct AstArena *ar)
     struct AstNode *e;
 
     e = ast_build_expr(ar);
-    if (e == NULL || tok.kind != ';')
+    if (e == NULL || g_lex.tok.kind != ';')
         return NULL;
     next_token();                        /* consume ';' */
 
@@ -740,28 +941,16 @@ static struct AstNode *ast_build_label_stmt(struct AstArena *ar)
     struct AstNode *n;
     struct AstNode *body;
     char *name;
-    long save_posi;
-    long save_tok_start_pos;
-    int save_line_no;
-    int save_tok_line;
-    struct Token save_tok;
+    LexState _ls;
 
-    save_posi = posi;
-    save_tok_start_pos = tok_start_pos;
-    save_line_no = line_no;
-    save_tok_line = tok_line;
-    save_tok = tok;
+    _ls = lex_save();
 
-    name = ast_arena_strdup(ar, tok.text);
+    name = ast_arena_strdup(ar, g_lex.tok.text);
     next_token();                        /* consume the identifier */
-    if (tok.kind != ':') {
+    if (g_lex.tok.kind != ':') {
         /* Not a label: rewind to the identifier and build an expression
          * statement starting there. */
-        posi = save_posi;
-        tok_start_pos = save_tok_start_pos;
-        line_no = save_line_no;
-        tok_line = save_tok_line;
-        tok = save_tok;
+        lex_restore(&_ls);
         return ast_build_expr_stmt(ar);
     }
     next_token();                        /* consume ':' */
@@ -787,12 +976,12 @@ static struct AstNode *ast_build_if_stmt(struct AstArena *ar)
     struct AstNode *else_s = NULL;
 
     next_token();                        /* consume 'if' */
-    if (tok.kind != '(')
+    if (g_lex.tok.kind != '(')
         return NULL;
     next_token();                        /* consume '(' */
 
     cond = ast_build_expr(ar);
-    if (cond == NULL || tok.kind != ')')
+    if (cond == NULL || g_lex.tok.kind != ')')
         return NULL;
     next_token();                        /* consume ')' */
 
@@ -800,7 +989,7 @@ static struct AstNode *ast_build_if_stmt(struct AstArena *ar)
     if (then_s == NULL)
         return NULL;
 
-    if (tok.kind == TOK_ELSE) {
+    if (g_lex.tok.kind == TOK_ELSE) {
         next_token();                    /* consume 'else' */
         else_s = ast_build_stmt(ar);
         if (else_s == NULL)
@@ -823,12 +1012,12 @@ static struct AstNode *ast_build_while_stmt(struct AstArena *ar)
     struct AstNode *body;
 
     next_token();                        /* consume 'while' */
-    if (tok.kind != '(')
+    if (g_lex.tok.kind != '(')
         return NULL;
     next_token();                        /* consume '(' */
 
     cond = ast_build_expr(ar);
-    if (cond == NULL || tok.kind != ')')
+    if (cond == NULL || g_lex.tok.kind != ')')
         return NULL;
     next_token();                        /* consume ')' */
 
@@ -856,18 +1045,18 @@ static struct AstNode *ast_build_do_stmt(struct AstArena *ar)
     if (body == NULL)
         return NULL;
 
-    if (tok.kind != TOK_WHILE)
+    if (g_lex.tok.kind != TOK_WHILE)
         return NULL;
     next_token();                        /* consume 'while' */
-    if (tok.kind != '(')
+    if (g_lex.tok.kind != '(')
         return NULL;
     next_token();                        /* consume '(' */
 
     cond = ast_build_expr(ar);
-    if (cond == NULL || tok.kind != ')')
+    if (cond == NULL || g_lex.tok.kind != ')')
         return NULL;
     next_token();                        /* consume ')' */
-    if (tok.kind != ';')
+    if (g_lex.tok.kind != ';')
         return NULL;
     next_token();                        /* consume ';' */
 
@@ -883,8 +1072,8 @@ static struct AstNode *ast_build_case_stmt(struct AstArena *ar)
     long cv;
 
     next_token();                        /* consume 'case' */
-    cv = parse_const_long_expr();
-    if (tok.kind != ':')
+    cv = parse_typed_const_long_expr();
+    if (g_lex.tok.kind != ':')
         return NULL;
     next_token();                        /* consume ':' */
 
@@ -901,7 +1090,7 @@ static struct AstNode *ast_build_default_stmt(struct AstArena *ar)
     struct AstNode *n;
 
     next_token();                        /* consume 'default' */
-    if (tok.kind != ':')
+    if (g_lex.tok.kind != ':')
         return NULL;
     next_token();                        /* consume ':' */
 
@@ -927,35 +1116,34 @@ static struct AstNode *ast_build_for_stmt(struct AstArena *ar)
     struct AstNode *body;
 
     next_token();                        /* consume 'for' */
-    if (tok.kind != '(')
+    if (g_lex.tok.kind != '(')
         return NULL;
     next_token();                        /* consume '(' */
 
     if (starts_type()) {
         /* C99 for-init declaration `for (int i = 0; ...)`: capture it as an
-         * AST_DECL span (consumes through the first ';') and let
-         * ast_gen_for_stmt replay it via declaration codegen and for-scope
-         * rename machinery. */
+         * AST_DECL span (consumes through the first ';') for direct metadata
+         * replay and for-scope rename handling. */
         init = ast_build_decl_span(ar);
         if (init == NULL)
             return NULL;
     } else {
-        if (tok.kind != ';')
+        if (g_lex.tok.kind != ';')
             init = ast_build_expr(ar);
-        if (tok.kind != ';')
+        if (g_lex.tok.kind != ';')
             return NULL;
         next_token();                    /* consume first ';' */
     }
 
-    if (tok.kind != ';')
+    if (g_lex.tok.kind != ';')
         cond = ast_build_expr(ar);
-    if (tok.kind != ';')
+    if (g_lex.tok.kind != ';')
         return NULL;
     next_token();                        /* consume second ';' */
 
-    if (tok.kind != ')')
+    if (g_lex.tok.kind != ')')
         inc = ast_build_expr(ar);
-    if (tok.kind != ')')
+    if (g_lex.tok.kind != ')')
         return NULL;
     next_token();                        /* consume ')' */
 
@@ -969,13 +1157,13 @@ static struct AstNode *ast_build_for_stmt(struct AstArena *ar)
     n->c = inc;
     n->d = body;
 
-    /* The cyclic-byte-fill fast path (ast_gen_for_stmt) needs a one-byte
+    /* The cyclic-byte-fill metadata plan needs a one-byte
      * frame slot for its rolling counter. Local frame layout is finalised
      * during this build pass (add_local_alloc grows the running frame size
      * as declarations/temporaries are encountered), before codegen emits the
      * function prologue - so the slot must be reserved here, not later at
      * codegen time. Stash the resulting Sym* on the node (AST_FOR does not
-     * otherwise use n->sym) for ast_gen_for_stmt to pick up. */
+     * otherwise use n->sym) for the metadata planner to pick up. */
     if (ast_for_mod_fill_supported(n, NULL, NULL, NULL, NULL, NULL))
         n->sym = add_local_alloc("#modfill", TYPE_CHAR | TYPE_UNSIGNED, 1);
 
@@ -992,12 +1180,12 @@ static struct AstNode *ast_build_switch_stmt(struct AstArena *ar)
     struct AstNode *body;
 
     next_token();                        /* consume 'switch' */
-    if (tok.kind != '(')
+    if (g_lex.tok.kind != '(')
         return NULL;
     next_token();                        /* consume '(' */
 
     ctrl = ast_build_expr(ar);
-    if (ctrl == NULL || tok.kind != ')')
+    if (ctrl == NULL || g_lex.tok.kind != ')')
         return NULL;
     next_token();                        /* consume ')' */
 
@@ -1021,6 +1209,7 @@ struct DeclSpan {
     long tok_start_pos;
     int line_no;
     int tok_line;
+    int unsupported_for_storage;
     struct Token tok;
 };
 
@@ -1037,22 +1226,35 @@ static struct AstNode *ast_build_decl_span(struct AstArena *ar)
     int depth;
 
     sp = (struct DeclSpan *)ast_arena_alloc(ar, sizeof(struct DeclSpan));
-    sp->posi = posi;
-    sp->tok_start_pos = tok_start_pos;
-    sp->line_no = line_no;
-    sp->tok_line = tok_line;
-    sp->tok = tok;
+    sp->posi = g_lex.posi;
+    sp->tok_start_pos = g_lex.tok_start_pos;
+    sp->line_no = g_lex.line_no;
+    sp->tok_line = g_lex.tok_line;
+    sp->unsupported_for_storage = 0;
+    sp->tok = g_lex.tok;
 
     depth = 0;
     for (;;) {
-        if (tok.kind == TOK_EOF)
+        if (g_lex.tok.kind == TOK_EOF)
             return NULL;
-        if (tok.kind == '(' || tok.kind == '[' || tok.kind == '{') {
+        /* C99/C11 6.8.5p3 permits only object declarations with storage class
+         * auto or register in a for-init declaration.  dcc treats auto/register
+         * as automatic locals; `register` remains an allocation hint, exactly
+         * as in block scope.  The
+         * remaining explicit storage classes and function specifiers
+         * (static/extern/typedef/inline) are rejected here; direct function and
+         * type/tag-only declarations are caught separately during replay. */
+        if (depth == 0 &&
+            (g_lex.tok.kind == TOK_EXTERN || g_lex.tok.kind == TOK_STATIC ||
+             g_lex.tok.kind == TOK_TYPEDEF || g_lex.tok.kind == TOK_INLINE ||
+             g_lex.tok.kind == TOK_NORETURN))
+            sp->unsupported_for_storage = 1;
+        if (g_lex.tok.kind == '(' || g_lex.tok.kind == '[' || g_lex.tok.kind == '{') {
             depth++;
-        } else if (tok.kind == ')' || tok.kind == ']' || tok.kind == '}') {
+        } else if (g_lex.tok.kind == ')' || g_lex.tok.kind == ']' || g_lex.tok.kind == '}') {
             if (depth > 0)
                 depth--;
-        } else if (tok.kind == ';' && depth == 0) {
+        } else if (g_lex.tok.kind == ';' && depth == 0) {
             next_token();                /* consume the terminating ';' */
             break;
         }
@@ -1065,40 +1267,92 @@ static struct AstNode *ast_build_decl_span(struct AstArena *ar)
     return n;
 }
 
+int ast_for_decl_storage_supported(const struct AstNode *n)
+{
+    const struct DeclSpan *sp;
+
+    if (n == NULL || n->kind != AST_DECL)
+        return 0;
+    sp = (const struct DeclSpan *)n->aux;
+    return sp != NULL && !sp->unsupported_for_storage;
+}
+
+/* Seeks the lexer to the start of the declaration span n captures, saving
+ * the caller's own lexer position into *save for a later
+ * ast_decl_span_restore. Returns 0 (no seek performed, *save untouched) if
+ * n isn't a usable AST_DECL span - not a declaration at all, or one
+ * ast_build_decl_span already marked unsupported_for_storage. Exposed for
+ * dcc_func.c's try_scan_inline_local_decl, which needs to speculatively
+ * re-parse just a declaration's declarator + initializer as a real
+ * expression AST (via ast_build_expr) - unlike ast_emit_decl_span just
+ * above, it never emits anything, so it can't share that function's
+ * emitting declaration codegen path. struct DeclSpan itself stays private
+ * to this file; only this seek/restore pair crosses the module boundary. */
+int ast_decl_span_seek(const struct AstNode *n, struct DeclSpanSave *save)
+{
+    const struct DeclSpan *sp;
+
+    if (n == NULL || n->kind != AST_DECL)
+        return 0;
+    sp = (const struct DeclSpan *)n->aux;
+    if (sp == NULL || sp->unsupported_for_storage)
+        return 0;
+
+    save->posi = g_lex.posi;
+    save->tok_start_pos = g_lex.tok_start_pos;
+    save->line_no = g_lex.line_no;
+    save->tok_line = g_lex.tok_line;
+    save->tok = g_lex.tok;
+
+    g_lex.posi = sp->posi;
+    g_lex.tok_start_pos = sp->tok_start_pos;
+    g_lex.line_no = sp->line_no;
+    g_lex.tok_line = sp->tok_line;
+    g_lex.tok = sp->tok;
+    return 1;
+}
+
+void ast_decl_span_restore(const struct DeclSpanSave *save)
+{
+    g_lex.posi = save->posi;
+    g_lex.tok_start_pos = save->tok_start_pos;
+    g_lex.line_no = save->line_no;
+    g_lex.tok_line = save->tok_line;
+    g_lex.tok = save->tok;
+}
+
 /* Re-emit a captured local-declaration span (see ast_build_decl_span).  The
  * lexer is transiently re-seeked to the declaration, declaration codegen runs
  * (mirroring gen_compound's declaration branch exactly, so locals[] / frame
  * offsets match the frame-sizing scan), then the
  * lexer is restored - leaving no net cursor movement for the surrounding AST
  * walk. */
-void ast_emit_decl_span(const struct AstNode *n)
+void ast_replay_decl_span(const struct AstNode *n)
 {
     struct DeclSpan *sp = (struct DeclSpan *)n->aux;
-    long sv_posi = posi;
-    long sv_tok_start = tok_start_pos;
-    int sv_line = line_no;
-    int sv_tok_line = tok_line;
-    struct Token sv_tok = tok;
+    LexState _ls = lex_save();
 
-    posi = sp->posi;
-    tok_start_pos = sp->tok_start_pos;
-    line_no = sp->line_no;
-    tok_line = sp->tok_line;
-    tok = sp->tok;
+    g_lex.posi = sp->posi;
+    g_lex.tok_start_pos = sp->tok_start_pos;
+    g_lex.line_no = sp->line_no;
+    g_lex.tok_line = sp->tok_line;
+    g_lex.tok = sp->tok;
 
     /* Drive the declaration through the declaration codegen.  Initializer
      * expressions are emitted via ast_emit_init_expr, which builds into the
      * isolated g_ast_init_arena and so never disturbs the shared g_ast_arena
      * that still holds the surrounding AST statement's pending sibling nodes. */
-    if (tok.kind == TOK_TYPEDEF) {
+    if (g_lex.tok.kind == TOK_STATIC_ASSERT) {
+        parse_static_assert_decl();
+    } else if (g_lex.tok.kind == TOK_TYPEDEF) {
         parse_typedef_decl();
     } else {
         int t;
         int is_static_local;
-        decl_is_extern = 0;
-        is_static_local = (tok.kind == TOK_STATIC);
+        g_decl.is_extern = 0;
+        is_static_local = (g_lex.tok.kind == TOK_STATIC);
         t = parse_base_type();
-        if (tok.kind == ';')
+        if (g_lex.tok.kind == ';')
             next_token();
         else if (is_static_local)
             scan_static_local_decl_after_type(t);
@@ -1106,11 +1360,39 @@ void ast_emit_decl_span(const struct AstNode *n)
             gen_local_decl_after_type(t);
     }
 
-    posi = sv_posi;
-    tok_start_pos = sv_tok_start;
-    line_no = sv_line;
-    tok_line = sv_tok_line;
-    tok = sv_tok;
+    lex_restore(&_ls);
+}
+
+void ast_scan_decl_span(const struct AstNode *n)
+{
+    struct DeclSpan *sp = (struct DeclSpan *)n->aux;
+    LexState saved = lex_save();
+
+    g_lex.posi = sp->posi;
+    g_lex.tok_start_pos = sp->tok_start_pos;
+    g_lex.line_no = sp->line_no;
+    g_lex.tok_line = sp->tok_line;
+    g_lex.tok = sp->tok;
+
+    if (g_lex.tok.kind == TOK_STATIC_ASSERT) {
+        parse_static_assert_decl();
+    } else if (g_lex.tok.kind == TOK_TYPEDEF) {
+        parse_typedef_decl();
+    } else {
+        int type;
+        int is_static_local;
+
+        g_decl.is_extern = 0;
+        is_static_local = (g_lex.tok.kind == TOK_STATIC);
+        type = parse_base_type();
+        if (g_lex.tok.kind == ';')
+            next_token();
+        else if (is_static_local)
+            scan_static_local_decl_after_type(type);
+        else
+            scan_local_decl_after_type(type);
+    }
+    lex_restore(&saved);
 }
 
 /* Build a brace-delimited block `{ stmt* }`.  Local declarations (and
@@ -1126,13 +1408,13 @@ static struct AstNode *ast_build_compound_stmt(struct AstArena *ar)
     next_token();                        /* consume '{' */
     n = ast_new(ar, AST_COMPOUND);
 
-    while (tok.kind != '}' && tok.kind != TOK_EOF) {
+    while (g_lex.tok.kind != '}' && g_lex.tok.kind != TOK_EOF) {
         struct AstNode *child;
 
         /* A typedef or any declaration is captured as a span and re-emitted
          * by declaration codegen at emit time (which rebuilds
          * locals[] / frame offsets identically to the frame-sizing scan). */
-        if (tok.kind == TOK_TYPEDEF || starts_type()) {
+        if (g_lex.tok.kind == TOK_STATIC_ASSERT || g_lex.tok.kind == TOK_TYPEDEF || starts_type()) {
             child = ast_build_decl_span(ar);
             if (child == NULL)
                 return NULL;
@@ -1146,8 +1428,11 @@ static struct AstNode *ast_build_compound_stmt(struct AstArena *ar)
         ast_list_push(ar, n, child);
     }
 
-    if (tok.kind != '}')
+    if (g_lex.tok.kind != '}')
         return NULL;
+    n->end_file = ast_arena_strdup(ar, g_lex.tok.file[0] ? g_lex.tok.file :
+                                   (input_name ? input_name : "<input>"));
+    n->end_line = g_lex.tok_line;
     next_token();                        /* consume '}' */
     return n;
 }
@@ -1157,21 +1442,28 @@ static struct AstNode *ast_build_compound_stmt(struct AstArena *ar)
  * NULL result is reported as an unsupported AST shape. */
 struct AstNode *ast_build_stmt(struct AstArena *ar)
 {
-    switch (tok.kind) {
-    case '{':          return ast_build_compound_stmt(ar);
-    case ';':          next_token(); return ast_new(ar, AST_EMPTY);
-    case TOK_RETURN:   return ast_build_return_stmt(ar);
-    case TOK_BREAK:    return ast_build_jump_stmt(ar, AST_BREAK);
-    case TOK_CONTINUE: return ast_build_jump_stmt(ar, AST_CONTINUE);
-    case TOK_GOTO:     return ast_build_goto_stmt(ar);
-    case TOK_IF:       return ast_build_if_stmt(ar);
-    case TOK_WHILE:    return ast_build_while_stmt(ar);
-    case TOK_DO:       return ast_build_do_stmt(ar);
-    case TOK_FOR:      return ast_build_for_stmt(ar);
-    case TOK_SWITCH:   return ast_build_switch_stmt(ar);
-    case TOK_CASE:     return ast_build_case_stmt(ar);
-    case TOK_DEFAULT:  return ast_build_default_stmt(ar);
-    case TOK_ID:       return ast_build_label_stmt(ar);
+    struct AstNode *n;
+    struct Token start_tok;
+    int start_line;
+
+    start_tok = g_lex.tok;
+    start_line = g_lex.tok_line;
+
+    switch (g_lex.tok.kind) {
+    case '{':          n = ast_build_compound_stmt(ar); break;
+    case ';':          next_token(); n = ast_new(ar, AST_EMPTY); break;
+    case TOK_RETURN:   n = ast_build_return_stmt(ar); break;
+    case TOK_BREAK:    n = ast_build_jump_stmt(ar, AST_BREAK); break;
+    case TOK_CONTINUE: n = ast_build_jump_stmt(ar, AST_CONTINUE); break;
+    case TOK_GOTO:     n = ast_build_goto_stmt(ar); break;
+    case TOK_IF:       n = ast_build_if_stmt(ar); break;
+    case TOK_WHILE:    n = ast_build_while_stmt(ar); break;
+    case TOK_DO:       n = ast_build_do_stmt(ar); break;
+    case TOK_FOR:      n = ast_build_for_stmt(ar); break;
+    case TOK_SWITCH:   n = ast_build_switch_stmt(ar); break;
+    case TOK_CASE:     n = ast_build_case_stmt(ar); break;
+    case TOK_DEFAULT:  n = ast_build_default_stmt(ar); break;
+    case TOK_ID:       n = ast_build_label_stmt(ar); break;
     /* Expression statements that do not begin with an identifier: a deref
      * store `*p = x;`, a parenthesised expression `(expr);`, an address-of or
      * unary-led expression, or a prefix ++/-- statement.  ast_build_expr_stmt
@@ -1180,9 +1472,16 @@ struct AstNode *ast_build_stmt(struct AstArena *ar)
      * mis-routing a non-expression lead is harmless. */
     case '*': case '(': case '&': case '-': case '+': case '!': case '~':
     case TOK_INC: case TOK_DEC: case TOK_SIZEOF:
-                       return ast_build_expr_stmt(ar);
+                       n = ast_build_expr_stmt(ar); break;
     default:           return NULL;
     }
+
+    if (n != NULL) {
+        n->file = ast_arena_strdup(ar, start_tok.file[0] ? start_tok.file :
+                                   (input_name ? input_name : "<input>"));
+        n->line = start_line;
+    }
+    return n;
 }
 
 /* ------------------------------------------------------------------------- *

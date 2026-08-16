@@ -2,6 +2,109 @@
 
 Developer utility scripts for the `dcc` (CP/M-80 / Z80) toolchain.
 
+## `mir-migration-census.py`
+
+Measures generated MIR selection across `tests/*.c` and compares two snapshots
+to produce the smallest `runall.ps1 -Apps ...` validation command for a
+compiler change.
+
+The script is read-only with respect to test and performance baselines. It
+compiles each source with `DCC_MIR_SELECT_REPORT=1` and
+`DCC_MIR_REQUIRE_EMIT=1`, deduplicates buffered/final reports by
+`(app, function)`, and writes a stable tab-separated snapshot containing the
+selected generated selector, assembly-text size, instruction count, hash, and
+CFG block count. Compatibility `captured_*` columns remain present with `-1`;
+no legacy text is retained or measured.
+
+### Fast staged MIR workflow
+
+```sh
+# 1. Snapshot before changing a selector or MIR optimization.
+python3 scripts/mir-migration-census.py \
+  --output build/mir-before.tsv
+
+# 2. Edit and rebuild dcc.
+sh src/dcc/build-dcc.sh
+
+# 3. Measure the new rollout and print newly accepted/regressed functions plus
+#    the exact focused validation command for affected apps.
+python3 scripts/mir-migration-census.py \
+  --output build/mir-after.tsv \
+  --compare build/mir-before.tsv \
+  --fail-on-regression
+
+# 4. Run the printed command, for example:
+pwsh ./scripts/runall.ps1 -Apps tret,tatexit -Mode full -RunTimeout 20
+```
+
+Use `--apps app1,app2` while developing a local change. Run the complete census
+only when the focused hypothesis succeeds. Reserve an unfiltered
+`runall.ps1 -Mode full` for a material coverage milestone instead of every
+selector iteration.
+
+Apps marked `ignore` in `tests/_test_overrides.json` are skipped by default, so
+the complete census matches the runnable app suite. Pass `--include-ignored`
+when deliberately investigating those sources. Per-app `dcc_args` overrides
+are forwarded automatically.
+
+`--fail-on-regression` returns nonzero when a previously reported MIR selection
+disappears or becomes non-MIR. Run the generated focused command whenever a
+selected hash or generated metric changes.
+
+### MIR-only cost-policy matrix
+
+`--cost-policy-output` records the generated MIR candidates considered by the
+`mir-v1` policy. The TSV includes emitted machine bytes/instructions,
+loop-weighted T-states, helper calls, frame/spill costs, allocator and stream
+moves, prologue/callee-save costs, register homes, eligibility, score, and
+output hash. With no explicit `--cost-policy`, the option uses the production
+`mir-v1` default; pass `--cost-policy mir-v1-report` to report without adopting
+alternatives.
+
+```sh
+python3 scripts/mir-migration-census.py \
+  --cost-policy mir-v1 \
+  --cost-policy-output build/mir-cost.tsv \
+  --output build/mir-selected.tsv
+```
+
+## `mir-current-vs-parent.py`
+
+Runs strict normal and stack-check censuses with a current compiler and a
+separately built parent compiler, then reports selection/hash changes:
+
+```sh
+python3 scripts/mir-current-vs-parent.py \
+  --parent-compiler build/parent/dcc \
+  --apps cint,cobint
+```
+
+This replaces forced-legacy A/B and fallback-bisection utilities.
+
+For one generated-candidate runtime comparison, use the diagnostic controls:
+
+```sh
+DCC_MIR_SELECT_FUNCTION=parse_move \
+DCC_MIR_SELECT_CANDIDATE=spilled-rhs-forward \
+  pwsh ./scripts/runall.ps1 -Apps tchess -Mode full
+```
+
+Candidate names are the `candidate` values in `--cost-policy-output`; no
+legacy stream is involved.
+
+## `run-mir-lifetime-tests.ps1`
+
+Runs the physical-lifetime candidates that require diagnostic forcing in both
+peep/nopeep and stack/no-stack modes. It verifies that `regional_address`
+selects `regional` before exercising DE preservation in `tmirlife`, and that
+`cint.primary` selects `spilled-phi-slot` before running both CINT workloads.
+It also requires the same-ABI signed-byte scanner near-match to reach and
+decline the bounded-decimal schedule's argument-conversion guard.
+
+```sh
+pwsh ./scripts/run-mir-lifetime-tests.ps1
+```
+
 ## `publish-package.ps1`
 
 Publishes or republishes the binary package release. By default it reads the
@@ -164,6 +267,86 @@ The sweep varies the reserve through the `DCC_STACK_SIZE` hook honored by
 the size, bake it in by building with `DCC_STACK_SIZE=<n> ./ma.sh <app>` or, for
 the regression suite, add it to the per-app `stack_size_for` table in
 `runall.sh` (and the matching block in `runall.bat`).
+
+## `dccprof.ps1` / `dccprof.py`
+
+Builds an app (peep-optimized, the real shipped build), runs it under
+`ntvcm`'s per-PC execution-count profiler (`-g:<file>`), and correlates the
+result against the build's `.PRN`/`.SYM` listings into a hot-function
+summary plus per-line annotated listings you can open directly in an
+editor - no manual address correlation required.
+
+### Purpose
+
+`ntvcm -g:<file>` writes a raw `pc,count,asm` CSV of every executed
+address, but a dcc build links two separately-assembled modules (the app
+and the stripped runtime, `RTLMIN.MAC`) at final addresses that differ from
+each module's own standalone `.PRN` listing by a different offset per
+module - and a `.PRN` listing's address column is the address *after* each
+line's own emitted bytes, not its start (see `dccprof.py`'s own module
+docstring for how this was confirmed against known Z80 instruction
+encodings). Getting either of these wrong silently shifts hit counts to
+the wrong function or line with no crash to reveal the mistake.
+`dccprof.py` formalizes the correlation once, correctly, instead of
+requiring it be re-derived by hand for every profiling investigation - it
+is also directly reusable on its own against an already-built app and an
+already-captured profile.
+
+### Usage
+
+```pwsh
+pwsh ./scripts/dccprof.ps1 <app> [-SourcePath FILE] [-BuildDir DIR] [-OutDir DIR] [-Clock HZ] [-ProgramArgs ...]
+```
+
+One cross-platform script (Windows/macOS/Linux, like `ma.ps1`/`runall.ps1`)
+rather than separate shell/batch wrappers - it delegates the build itself
+to `ma.ps1` and adds the profiling-specific steps on top: regenerating
+`RTLMIN.PRN` (a normal build only assembles it without the `/L` listing
+flag, since nothing else needs it), running the app under `ntvcm -g`, and
+invoking `dccprof.py`.
+
+### Examples
+
+```pwsh
+pwsh ./scripts/dccprof.ps1 tbig
+pwsh ./scripts/dccprof.ps1 tbig -ProgramArgs 20000
+pwsh ./scripts/dccprof.ps1 mm -BuildDir /tmp/profmm
+```
+
+### Output
+
+Written to `-OutDir` (default: same as `-BuildDir`):
+
+- `<app>_profile_summary.md` — ranked hot-function table (hits, % of
+  total, module, function name). Open directly, or in VS Code's Markdown
+  preview.
+- `<app>_profile_app.txt` — the app's own `.MAC`, with every instruction
+  line prefixed by its own hit count, in original `.PRN` address/line-
+  number order.
+- `<app>_profile_rtl.txt` — the same, for whichever `DCCRTL.MAC` routines
+  were actually hit (routines never reached are omitted - the full runtime
+  is large and a given run typically touches only a small slice of it).
+
+Open an annotated listing directly in any editor and use search / go-to-
+line to jump to a specific hot address or line called out in the summary.
+
+### Calling `dccprof.py` directly
+
+Given an already-built app (its `.PRN`/`.SYM`/`.MAC`, plus a regenerated
+`RTLMIN.PRN`) and an already-captured profile CSV, skip the build+run
+steps entirely:
+
+```sh
+python3 scripts/dccprof.py --app tbig --build-dir build/dccprof/tbig --profile-csv build/dccprof/tbig/tbig_profile.csv
+```
+
+### Environment Variables
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `M80C` | `m80c` | Native assembler used to regenerate `RTLMIN.PRN` |
+| `NTVCM` | `ntvcm` | Emulator command |
+| `PYTHON` | `python3` (falls back to `python`) | Python launcher used for `dccprof.py` |
 
 ## `ma.ps1`
 

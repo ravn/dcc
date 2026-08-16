@@ -1,10 +1,33 @@
 /* pint.c - tiny Pascal subset compiler/interpreter for DCC/C89.
  * Supports enough Pascal for E.PAS, SIEVE.PAS, TTT.PAS, and NQ1D.PAS.
  */
+
+#ifdef SDCC
+#define ZCC
+/*
+ * z88dk newlib malloc configuration.
+ *
+ * A negative CLIB_MALLOC_HEAP_SIZE tells the CP/M CRT to initialize the
+ * standard malloc heap with all free memory between the end of BSS and the
+ * reserved stack area.  Without this, the default configuration used by some
+ * recent z88dk builds may leave only a small fixed heap.
+ *
+ * CRT_STACK_SIZE is the amount excluded from the top of memory for stack use.
+ * pint's C stack use is modest; the Pascal VM stacks and frames are allocated
+ * separately by init_run_storage().
+ */
+#pragma output CLIB_MALLOC_HEAP_SIZE = -1
+#pragma output CRT_STACK_SIZE = 768
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+
+#ifdef ZCC
+#include <malloc.h>
+#endif
 
 #define MAXSRC 50000L
 #define MAXTOK 64
@@ -109,7 +132,7 @@ struct Proc {
 static struct Ins *code;
 static struct Sym *sym;
 static struct Proc *proc;
-static int *fret;
+static struct Ins **fret;
 static unsigned char *floc;
 static unsigned char *flp;
 
@@ -1177,9 +1200,10 @@ static inline void pushv(int v)
     *stp++ = v;
 }
 
-static void call_proc(int pi, int pc)
+static void call_proc(int pi, struct Ins *retaddr)
 {
     int i;
+    struct Proc *prp = &proc[pi];
 
     if (fp + 1 >= MAXFRAME) {
         fprintf(stderr, "frame overflow\n");
@@ -1188,32 +1212,30 @@ static void call_proc(int pi, int pc)
     fp++;
     flp += MAXLOC * INT_BYTES;
     memset(flp, 0, MAXLOC * INT_BYTES);
-    fret[fp] = pc;
-    for (i = proc[pi].nparam - 1; i >= 0; i--)
-        if (proc[pi].pesz[i] == 1)
-            flp[proc[pi].pofs[i]] = (unsigned char)popv();
+    fret[fp] = retaddr;
+    for (i = prp->nparam - 1; i >= 0; i--)
+        if (prp->pesz[i] == 1)
+            flp[prp->pofs[i]] = (unsigned char)popv();
         else
-            *(short *)(flp + proc[pi].pofs[i]) = (short)popv();
+            *(short *)(flp + prp->pofs[i]) = (short)popv();
 }
 
 static void run(void)
 {
-    int pc;
     int a;
     int b;
     int v;
     int pi;
     struct Ins *in;
 
-    pc = 0;
+    in = code;
     fp = 0;
     sp = 0;
     stp = st;
     flp = floc;
-    memset(fret, 0, sizeof(int) * MAXFRAME);
+    memset(fret, 0, sizeof(struct Ins *) * MAXFRAME);
     memset(floc, 0, MAXFRAME * MAXLOC * INT_BYTES);
     for (;;) {
-        in = &code[pc++];
         switch (in->op) {
         case OP_HALT:
             return;
@@ -1365,34 +1387,41 @@ static void run(void)
             pushv(a << b);
             break;
         case OP_JMP:
-            pc = in->a;
-            break;
+            in = &code[in->a];
+            continue;
         case OP_JZ:
             a = popv();
-            if (!a)
-                pc = in->a;
+            if (!a) {
+                in = &code[in->a];
+                continue;
+            }
             break;
         case OP_JNZ:
             a = popv();
-            if (a)
-                pc = in->a;
+            if (a) {
+                in = &code[in->a];
+                continue;
+            }
             break;
         case OP_CALL:
             pi = in->a;
-            call_proc(pi, pc);
-            pc = proc[pi].entry;
-            break;
-        case OP_RET:
+            call_proc(pi, in + 1);
+            in = &code[proc[pi].entry];
+            continue;
+        case OP_RET: {
+            int isf;
             pi = in->a;
+            isf = proc[pi].isfunc;
             v = 0;
-            if (proc[pi].isfunc)
+            if (isf)
                 v = popv();
-            pc = fret[fp];
+            in = fret[fp];
             fp--;
             flp -= MAXLOC * INT_BYTES;
-            if (proc[pi].isfunc)
+            if (isf)
                 pushv(v);
-            break;
+            continue;
+        }
         case OP_WRI:
             printf("%d", popv());
             break;
@@ -1410,6 +1439,7 @@ static void run(void)
             fprintf(stderr, "bad op %d\n", in->op);
             exit(1);
         }
+        in++;
     }
 }
 
@@ -1446,7 +1476,7 @@ static void init_compile_storage(void)
 
 static void init_run_storage(void)
 {
-    fret = (int *)xcalloc(MAXFRAME, sizeof(int));
+    fret = (struct Ins **)xcalloc(MAXFRAME, sizeof(struct Ins *));
     floc = (unsigned char *)xcalloc(MAXFRAME * MAXLOC * INT_BYTES, 1);
     gmem = (unsigned char *)xcalloc(MAXMEM * INT_BYTES, 1);
     st = (int *)xcalloc(MAXSTACK, sizeof(int));
@@ -1467,7 +1497,7 @@ static void print_stats(void)
         return;
 
     fprintf(stderr, "\nPINT usage summary\n");
-    fprintf(stderr, "  Source bytes:             %ld / %ld\n", slen, MAXSRC);
+    fprintf(stderr, "  Source bytes:             %u / %u\n", (unsigned)slen, (unsigned)MAXSRC);
     fprintf(stderr, "  Bytecode instructions:    %d / %d\n", cp, code_limit);
     fprintf(stderr, "  Symbols:                  %d / %d\n", nsym, MAXSYM);
     fprintf(stderr, "  Procedures/functions:     %d / %d\n", nproc, MAXPROC);
@@ -1529,6 +1559,8 @@ static int load_file(const char *name)
 int main(int argc, char **argv)
 {
     int argi;
+
+
 
     argi = 1;
     if (argi < argc && strcmp(argv[argi], "-V") == 0) {

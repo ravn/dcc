@@ -6,11 +6,15 @@
  * code that loads/stores a symbol's address or value (frame-relative or direct
  * for globals), including post-increment/decrement fast paths.
  *
- * MODULE: compiled as its own translation unit; shared declarations are in dcc.h.
+ * MODULE: compiled as its own translation unit.
  * Source provenance: monolith src/ddc.c lines 3829-4801.
  */
 
 #include "dcc.h"
+#include "dcc_mir.h"
+
+static int block_scope_ids[MAX_SCOPE_DEPTH];
+static int block_scope_rename_counts[MAX_SCOPE_DEPTH];
 
 /*
  * C99 for-init renames.  While code generation (or the frame-sizing scan) is
@@ -24,7 +28,7 @@
 const char *resolve_local_rename(const char *name)
 {
     int k;
-    for (k = g_forren_n - 1; k >= 0; --k) {
+    for (k = g_func_pass.forren_n - 1; k >= 0; --k) {
         if (!strcmp(g_forren_from[k], name))
             return g_forren_to[k];
     }
@@ -72,40 +76,80 @@ const char *enter_for_decl_rename(const char *name)
 {
     int n;
 
-    if (g_for_decl_seq < 0)
+    if (g_func_pass.for_decl_seq < 0)
         fatal("bad for-init scope");
 
-    n = g_for_decl_rename_index;
-    if (g_for_decl_recording) {
-        add_for_scope_rename(g_for_decl_seq, name);
+    n = g_func_pass.for_decl_rename_index;
+    if (g_func_pass.for_decl_recording) {
+        add_for_scope_rename(g_func_pass.for_decl_seq, name);
     } else {
-        if (g_for_decl_seq >= MAX_FOR_SCOPES)
+        if (g_func_pass.for_decl_seq >= MAX_FOR_SCOPES)
             fatal("too many for statements");
-        if (n >= g_for_rename_count[g_for_decl_seq])
+        if (n >= g_for_rename_count[g_func_pass.for_decl_seq])
             fatal("for-init scope mismatch");
     }
 
-    push_for_rename(g_for_rename_from[g_for_decl_seq][n],
-                    g_for_rename_to[g_for_decl_seq][n]);
-    g_for_decl_rename_index = n + 1;
-    return g_for_rename_to[g_for_decl_seq][n];
+    push_for_rename(g_for_rename_from[g_func_pass.for_decl_seq][n],
+                    g_for_rename_to[g_func_pass.for_decl_seq][n]);
+    g_func_pass.for_decl_rename_index = n + 1;
+    return g_for_rename_to[g_func_pass.for_decl_seq][n];
+}
+
+const char *enter_block_decl_rename(const char *name)
+{
+    static char renamed[MAX_SCOPE_DEPTH][MAX_FOR_SCOPE_RENAMES][64];
+    int depth;
+    int ordinal;
+
+    if (g_func_pass.scope_depth <= 0 || find_local_decl(name) != NULL ||
+        find_local(name) == NULL)
+        return name;
+    depth = g_func_pass.scope_depth - 1;
+    ordinal = block_scope_rename_counts[depth];
+    if (ordinal >= MAX_FOR_SCOPE_RENAMES)
+        fatal("too many block-scope shadow declarations");
+    snprintf(renamed[depth][ordinal], sizeof(renamed[depth][ordinal]),
+             "%s#b%d#%d", name, block_scope_ids[depth], ordinal);
+    push_for_rename(name, renamed[depth][ordinal]);
+    block_scope_rename_counts[depth] = ordinal + 1;
+    return renamed[depth][ordinal];
+}
+
+const char *enter_static_local_rename(const char *name,
+                                      const char *backing_name)
+{
+    static char renamed[MAX_SCOPE_DEPTH][MAX_FOR_SCOPE_RENAMES][64];
+    int depth;
+    int ordinal;
+
+    if (g_func_pass.scope_depth <= 0)
+        return name;
+    depth = g_func_pass.scope_depth - 1;
+    ordinal = block_scope_rename_counts[depth];
+    if (ordinal >= MAX_FOR_SCOPE_RENAMES)
+        fatal("too many block-scope shadow declarations");
+    snprintf(renamed[depth][ordinal], sizeof(renamed[depth][ordinal]),
+             "%s#%s", name, backing_name);
+    push_for_rename(name, renamed[depth][ordinal]);
+    block_scope_rename_counts[depth] = ordinal + 1;
+    return renamed[depth][ordinal];
 }
 
 void push_for_rename(const char *from, const char *to)
 {
-    if (g_forren_n >= MAX_FORREN)
+    if (g_func_pass.forren_n >= MAX_FORREN)
         fatal("too many nested for-init scopes");
-    strncpy(g_forren_from[g_forren_n], from, 63);
-    g_forren_from[g_forren_n][63] = 0;
-    strncpy(g_forren_to[g_forren_n], to, 63);
-    g_forren_to[g_forren_n][63] = 0;
-    g_forren_n++;
+    strncpy(g_forren_from[g_func_pass.forren_n], from, 63);
+    g_forren_from[g_func_pass.forren_n][63] = 0;
+    strncpy(g_forren_to[g_func_pass.forren_n], to, 63);
+    g_forren_to[g_func_pass.forren_n][63] = 0;
+    g_func_pass.forren_n++;
 }
 
 void pop_for_rename(void)
 {
-    if (g_forren_n > 0)
-        g_forren_n--;
+    if (g_func_pass.forren_n > 0)
+        g_func_pass.forren_n--;
 }
 
 const char *sym_asm_name(struct Sym *s)
@@ -126,19 +170,294 @@ const char *sym_asm_name(struct Sym *s)
  */
 void enter_scope(void)
 {
-    if (g_scope_depth >= MAX_SCOPE_DEPTH)
+    if (g_func_pass.scope_depth >= MAX_SCOPE_DEPTH)
         fatal("too many nested block scopes");
-    g_scope_watermark[g_scope_depth++] = nlocals;
+    block_scope_ids[g_func_pass.scope_depth] = g_func_pass.block_seq++;
+    block_scope_rename_counts[g_func_pass.scope_depth] = 0;
+    g_scope_watermark[g_func_pass.scope_depth++] = g_frame.nlocals;
+    /* A freshly opened scope has no VLA save slot yet. */
+    if (g_func_pass.scope_depth < MAX_SCOPE_DEPTH)
+        g_vla_scope_off[g_func_pass.scope_depth] = 0;
+}
+
+/*
+ * Ensure the current block scope has a hidden slot in which to save SP before
+ * its first VLA is allocated, so the scope's VLAs can be reclaimed when it
+ * exits.  Called by BOTH the frame-sizing scan and codegen at the first VLA in
+ * a scope, so the two passes reserve the identical slot (local_size is
+ * monotonic).  Returns the slot's frame offset, or 0 if the scope already has
+ * one / on overflow.
+ */
+int vla_scope_ensure_save_slot(void)
+{
+    struct Sym *s;
+
+    if (g_func_pass.scope_depth < 0 || g_func_pass.scope_depth >= MAX_SCOPE_DEPTH)
+        return 0;
+    if (g_vla_scope_off[g_func_pass.scope_depth] != 0)
+        return 0;                       /* already allocated for this scope */
+    s = add_local_alloc("#vlasp", TYPE_INT, 2);
+    g_vla_scope_off[g_func_pass.scope_depth] = s->offset;
+    /* Noted for the IY register allocator, which must stay out of functions
+     * that juggle SP themselves - see
+     * function_qualifies_for_speculative_iy_regalloc. */
+    current_function_has_vla = 1;
+    return s->offset;
+}
+
+int vla_active_scope_depth(void)
+{
+    int d;
+    for (d = 1; d <= g_func_pass.scope_depth && d < MAX_SCOPE_DEPTH; ++d)
+        if (g_vla_scope_off[d] != 0)
+            return d;
+    return 0;
+}
+
+/* HL-free helper: save the current SP into the frame slot at `off`. */
+void emit_vla_save_sp(int off)
+{
+    mir_capture_vla_save(off);
+    if (mir_is_active())
+        return;
+    emit("\tld hl,0\n\tadd hl,sp\n");   /* HL = SP */
+    emit("\tpush hl\n");                /* stash SP value */
+    emit("\tpush ix\n\tpop hl\n");      /* HL = IX */
+    fprintf(g_emit_sink.stream, "\tld de,%d\n\tadd hl,de\n", off);
+    emit("\tpop de\n");                 /* DE = SP value */
+    emit("\tld (hl),e\n\tinc hl\n\tld (hl),d\n");
+}
+
+/* Restore SP from the frame slot at `off`, reclaiming that scope's VLAs. */
+void emit_vla_restore_sp(int off)
+{
+    mir_capture_vla_restore(off);
+    if (mir_is_active())
+        return;
+    emit("\tpush ix\n\tpop hl\n");      /* HL = IX */
+    fprintf(g_emit_sink.stream, "\tld de,%d\n\tadd hl,de\n", off);
+    emit("\tld a,(hl)\n\tinc hl\n\tld h,(hl)\n\tld l,a\n");  /* HL = saved SP */
+    emit("\tld sp,hl\n");
+}
+
+/*
+ * Reclaim VLAs when leaving a loop/switch via break or continue.  Restore SP to
+ * the outermost active VLA save slot among the scopes being exited (depths
+ * greater than floor_depth); restoring an outer slot reclaims every inner
+ * scope's VLAs, so only one restore is needed.  Emits nothing when no VLA was
+ * declared inside the loop.
+ */
+void emit_vla_restore_for_flow(int floor_depth)
+{
+    int d;
+    for (d = floor_depth + 1; d <= g_func_pass.scope_depth && d < MAX_SCOPE_DEPTH; ++d) {
+        if (g_vla_scope_off[d] != 0) {
+            emit_vla_restore_sp(g_vla_scope_off[d]);
+            return;
+        }
+    }
+}
+
+/*
+ * Record a forward goto issued from within a VLA scope.  Single-pass codegen
+ * cannot yet know whether the (not-yet-emitted) target label sits inside the
+ * same VLA scopes, an enclosing one, or outside them all, so the exact SP to
+ * restore is unknown here.  Snapshot the goto's active VLA save-slot offsets
+ * and hand back a fresh stub label id; the caller jumps there, and
+ * vla_resolve_fwd_gotos() later emits the stub once the label's scope is known.
+ * Returns the stub label id (a fresh label even on overflow so the emitted jump
+ * is still well-formed).
+ */
+int vla_record_fwd_goto(int label_index, int line)
+{
+    struct VlaFwdGoto *g;
+    int fixup;
+    int d, i, same;
+
+    /* Reuse an existing pending stub when another goto already targets this
+     * label with the identical active-VLA snapshot: same target and same
+     * scope offsets mean identical reclaim, so one shared stub suffices (and
+     * a fresh label is not consumed). */
+    for (i = 0; i < g_vla_fwd_ngoto; ++i) {
+        g = &g_vla_fwd_gotos[i];
+        if (g->label_index != label_index || g->snap_depth != g_func_pass.scope_depth)
+            continue;
+        same = 1;
+        for (d = 0; d < MAX_SCOPE_DEPTH; ++d) {
+            int off = (d <= g_func_pass.scope_depth) ? g_vla_scope_off[d] : 0;
+            if (g->snap_off[d] != off) { same = 0; break; }
+        }
+        if (same)
+            return g->fixup_id;
+    }
+
+    fixup = new_label();
+    if (g_vla_fwd_ngoto >= MAX_VLA_FWD_GOTOS) {
+        if (asm_suppress_depth == 0)
+            fatal("too many forward gotos out of variable-length array scopes");
+        return fixup;
+    }
+    g = &g_vla_fwd_gotos[g_vla_fwd_ngoto++];
+    g->label_index = label_index;
+    g->fixup_id = fixup;
+    g->line = line;
+    g->snap_depth = g_func_pass.scope_depth;
+    for (d = 0; d < MAX_SCOPE_DEPTH; ++d)
+        g->snap_off[d] = (d <= g_func_pass.scope_depth) ? g_vla_scope_off[d] : 0;
+    return fixup;
+}
+
+/* Is frame-slot offset `off` one of the VLA scopes currently active (i.e. an
+ * enclosing scope of the point being emitted)?  Offsets are monotonic and never
+ * reused, so a matching offset means the very same scope instance. */
+static int vla_off_active_now(int off)
+{
+    int d;
+    if (off == 0)
+        return 0;
+    for (d = 1; d <= g_func_pass.scope_depth && d < MAX_SCOPE_DEPTH; ++d)
+        if (g_vla_scope_off[d] == off)
+            return 1;
+    return 0;
+}
+
+static int vla_off_in_label_scope(int label_index, int off)
+{
+    int d;
+    if (off == 0)
+        return 0;
+    for (d = 1; d <= ulabel_vla_snap_depth[label_index] && d < MAX_SCOPE_DEPTH; ++d)
+        if (ulabel_vla_snap_off[label_index][d] == off)
+            return 1;
+    return 0;
+}
+
+void vla_snapshot_user_label(int label_index)
+{
+    int d;
+    if (label_index < 0 || label_index >= MAX_USER_LABELS)
+        return;
+    ulabel_vla_snap_depth[label_index] = g_func_pass.scope_depth;
+    for (d = 0; d < MAX_SCOPE_DEPTH; ++d)
+        ulabel_vla_snap_off[label_index][d] = (d <= g_func_pass.scope_depth) ? g_vla_scope_off[d] : 0;
+}
+
+int vla_jump_enters_label_scope(int label_index)
+{
+    int d;
+    if (label_index < 0 || label_index >= MAX_USER_LABELS)
+        return 0;
+    for (d = 1; d <= ulabel_vla_snap_depth[label_index] && d < MAX_SCOPE_DEPTH; ++d) {
+        int off = ulabel_vla_snap_off[label_index][d];
+        if (off != 0 && !vla_off_active_now(off))
+            return 1;
+    }
+    return 0;
+}
+
+void emit_vla_restore_to_label_scope(int label_index)
+{
+    int d;
+    if (label_index < 0 || label_index >= MAX_USER_LABELS)
+        return;
+    for (d = 1; d <= g_func_pass.scope_depth && d < MAX_SCOPE_DEPTH; ++d) {
+        int off = g_vla_scope_off[d];
+        if (off != 0 && !vla_off_in_label_scope(label_index, off)) {
+            emit_vla_restore_sp(off);
+            return;
+        }
+    }
+}
+
+/*
+ * Emit the deferred SP-fixup stubs for every forward goto that targeted this
+ * label from inside a VLA scope, now that the label's own scope is known.  For
+ * each such goto: verify the C99 constraint that the jump does not enter the
+ * scope of a VLA (every VLA scope still active at the label must also have been
+ * active at the goto), then restore SP to reclaim exactly the VLA scopes the
+ * goto is leaving before jumping to the real label.  Emits nothing when no
+ * forward goto targeted this label.  Must be called just before the real label
+ * is emitted; `real_id` is that label's id.
+ */
+void vla_resolve_fwd_gotos(int label_index, int real_id)
+{
+    int i, d, k;
+    int any;
+    int bad;
+
+    any = 0;
+    for (i = 0; i < g_vla_fwd_ngoto; ++i)
+        if (g_vla_fwd_gotos[i].label_index == label_index) { any = 1; break; }
+    if (!any)
+        return;
+
+    /* Fall-through from the preceding statement must land on the real label,
+     * not run into the stubs that sit just above it. */
+    if (!mir_is_active())
+        emit_jp_label("jp", real_id);
+
+    for (i = 0; i < g_vla_fwd_ngoto; ++i) {
+        struct VlaFwdGoto *g = &g_vla_fwd_gotos[i];
+        if (g->label_index != label_index)
+            continue;
+
+        /* Jump-into check: each VLA scope active at the label must be one that
+         * was also active at the goto (same frame slot). */
+        bad = 0;
+        for (d = 1; d <= g_func_pass.scope_depth && d < MAX_SCOPE_DEPTH; ++d) {
+            int off = g_vla_scope_off[d];
+            int seen = 0;
+            if (off == 0)
+                continue;
+            for (k = 1; k <= g->snap_depth && k < MAX_SCOPE_DEPTH; ++k)
+                if (g->snap_off[k] == off) { seen = 1; break; }
+            if (!seen) {
+                dcc_error_at(g_lex.tok.file[0] ? g_lex.tok.file :
+                                 (input_name ? input_name : "<input>"),
+                             g->line, -1,
+                             "goto into a variable-length array scope is not supported",
+                             NULL);
+                bad = 1;
+                break;
+            }
+        }
+        if (bad)
+            continue;
+
+        if (!mir_is_active())
+            emit_label(g->fixup_id);
+        /* Reclaim the goto's inner VLA scopes the label is not within: restore
+         * the outermost such slot (which reclaims it and every deeper scope). */
+        for (k = 1; k <= g->snap_depth && k < MAX_SCOPE_DEPTH; ++k) {
+            int off = g->snap_off[k];
+            if (off != 0 && !vla_off_active_now(off)) {
+                emit_vla_restore_sp(off);
+                break;
+            }
+        }
+        if (!mir_is_active())
+            emit_jp_label("jp", real_id);
+    }
 }
 
 void leave_scope(void)
 {
-    if (g_scope_depth <= 0)
+    int first;
+    int i;
+    if (g_func_pass.scope_depth <= 0)
         return;
     /* Block-local names leave scope.  local_size is intentionally left alone:
      * storage is monotonic (slots are never reused), so the frame size still
      * equals the sum over every scope. */
-    nlocals = g_scope_watermark[--g_scope_depth];
+    --g_func_pass.scope_depth;
+    while (block_scope_rename_counts[g_func_pass.scope_depth] > 0) {
+        pop_for_rename();
+        --block_scope_rename_counts[g_func_pass.scope_depth];
+    }
+    first = g_scope_watermark[g_func_pass.scope_depth];
+    for (i = first; i < g_frame.nlocals; ++i)
+        emit_debug_variable_end(&locals[i]);
+    g_frame.nlocals = first;
 }
 
 /* Lookup used while DECLARING a local: only the innermost open block is
@@ -148,8 +467,8 @@ void leave_scope(void)
 struct Sym *find_local_decl(const char *name)
 {
     int i, base;
-    base = g_scope_depth > 0 ? g_scope_watermark[g_scope_depth - 1] : 0;
-    for (i = nlocals - 1; i >= base; --i)
+    base = g_func_pass.scope_depth > 0 ? g_scope_watermark[g_func_pass.scope_depth - 1] : 0;
+    for (i = g_frame.nlocals - 1; i >= base; --i)
         if (!strcmp(locals[i].name, name)) return &locals[i];
     return NULL;
 }
@@ -170,13 +489,13 @@ struct Sym *find_local(const char *name)
      * an outer same-named local, and an inner block redeclaration shadow the
      * for-init variable, both correctly. */
     plain_idx = -1;
-    for (i = nlocals - 1; i >= 0; --i)
+    for (i = g_frame.nlocals - 1; i >= 0; --i)
         if (!strcmp(locals[i].name, name)) { plain_idx = i; break; }
 
     ren_idx = -1;
     rn = resolve_local_rename(name);
     if (rn != name) {
-        for (i = nlocals - 1; i >= 0; --i)
+        for (i = g_frame.nlocals - 1; i >= 0; --i)
             if (!strcmp(locals[i].name, rn)) { ren_idx = i; break; }
     }
 
@@ -185,11 +504,45 @@ struct Sym *find_local(const char *name)
     return NULL;
 }
 
+/* Hash index over globals[], keyed by name. add_global (the sole inserter -
+ * globals[] is otherwise append-only for the whole compile: nglobals never
+ * resets or decrements) is the only place that needs to update this, since
+ * every other reference to globals[] is a lookup through find_global.
+ *
+ * Buckets/chain links store (index + 1), 0 meaning empty/end-of-chain, so
+ * the static arrays' default zero-initialization already leaves the table
+ * empty - no explicit init pass needed for a process that compiles exactly
+ * one translation unit before exiting. */
+#define GLOBAL_HASH_BUCKETS 2048
+static int global_hash_buckets[GLOBAL_HASH_BUCKETS];
+static int global_hash_next[MAX_SYMS];
+
+static unsigned global_name_hash(const char *name)
+{
+    unsigned h = 0;
+    while (*name)
+        h = h * 131u + (unsigned char)*name++;
+    return h & (GLOBAL_HASH_BUCKETS - 1);
+}
+
+static void global_hash_insert(int index)
+{
+    unsigned h = global_name_hash(globals[index].name);
+    global_hash_next[index] = global_hash_buckets[h];
+    global_hash_buckets[h] = index + 1;
+}
+
 struct Sym *find_global(const char *name)
 {
-    int i;
-    for (i = nglobals - 1; i >= 0; --i)
-        if (!strcmp(globals[i].name, name)) return &globals[i];
+    unsigned h = global_name_hash(name);
+    int slot = global_hash_buckets[h];
+
+    while (slot) {
+        int index = slot - 1;
+        if (!strcmp(globals[index].name, name))
+            return &globals[index];
+        slot = global_hash_next[index];
+    }
     return NULL;
 }
 
@@ -215,7 +568,7 @@ int is_global_char_array_sym(struct Sym *s)
 void emit_global_char_index_addr(struct Sym *s)
 {
     emit_extrn_if_needed(s);
-    fprintf(outf, "\tld de,%s\n", asm_name_for(sym_asm_name(s)));
+    fprintf(g_emit_sink.stream, "\tld de,%s\n", asm_name_for(sym_asm_name(s)));
     emit("\tadd hl,de\n");
 }
 
@@ -245,6 +598,7 @@ struct Sym *add_global(const char *name, int type, int storage)
     s->type = type;
     s->storage = storage;
     s->size = type_size(type);
+    global_hash_insert(nglobals - 1);
     return s;
 }
 
@@ -253,9 +607,9 @@ struct Sym *add_local_known(const char *name, int type, int storage,
 {
     struct Sym *s;
 
-    if (nlocals >= MAX_LOCALS) fatal("too many locals");
+    if (g_frame.nlocals >= MAX_LOCALS) fatal("too many locals");
 
-    s = &locals[nlocals++];
+    s = &locals[g_frame.nlocals++];
     memset(s, 0, sizeof(*s));
     strncpy(s->name, name, sizeof(s->name) - 1);
     s->type = type;
@@ -268,8 +622,8 @@ struct Sym *add_local_known(const char *name, int type, int storage,
 struct Sym *add_local_alloc(const char *name, int type, int bytes)
 {
     struct Sym *s;
-    local_size += bytes;
-    s = add_local_known(name, type, SC_LOCAL, -local_size, bytes);
+    g_frame.local_size += bytes;
+    s = add_local_known(name, type, SC_LOCAL, -g_frame.local_size, bytes);
     return s;
 }
 
@@ -282,7 +636,7 @@ struct Sym *add_compound_literal_local(int type)
     if (bytes <= 0)
         bytes = 2;
 
-    sprintf(name, "#clit%d", g_compound_literal_seq++);
+    sprintf(name, "#clit%d", g_func_pass.compound_literal_seq++);
     return add_local_alloc(name, type, bytes);
 }
 
@@ -291,25 +645,31 @@ struct Sym *add_param_alloc(const char *name, int type)
     struct Sym *s;
     int sz = type_size(type);
     if (sz < 2) sz = 2;
-    s = add_local_known(name, type, SC_PARAM, param_offset, sz);
-    param_offset += sz;
+    s = add_local_known(name, type, SC_PARAM, g_frame.param_offset, sz);
+    g_frame.param_offset += sz;
     return s;
 }
 
-int add_string_ex(const char *s, int is_wide)
+int add_string_ex(const char *s, int len, int is_wide)
 {
     int i;
+    char *copy;
     is_wide = is_wide ? 1 : 0;
     for (i = 0; i < nstrings; i++)
-        if (string_wide[i] == is_wide && strcmp(strings[i], s) == 0)
+        if (string_wide[i] == is_wide && string_len[i] == len &&
+            memcmp(strings[i], s, (size_t)len) == 0)
             return i;
     if (nstrings >= MAX_STRINGS) fatal("too many strings");
-    strings[nstrings] = xstrdup2(s);
+    copy = (char *)xmalloc((size_t)len + 1);
+    memcpy(copy, s, (size_t)len);
+    copy[len] = 0;
+    strings[nstrings] = copy;
     string_wide[nstrings] = is_wide;
+    string_len[nstrings] = len;
     return nstrings++;
 }
 
-char *read_adjacent_string_literals_ex(int *is_widep)
+char *read_adjacent_string_literals_ex(int *is_widep, int *lenp)
 {
     char *buf;
     int cap;
@@ -322,12 +682,17 @@ char *read_adjacent_string_literals_ex(int *is_widep)
     buf = (char *)xmalloc((size_t)cap);
     buf[0] = 0;
 
-    while (tok.kind == TOK_STR || tok.kind == TOK_WSTR) {
+    while (g_lex.tok.kind == TOK_STR || g_lex.tok.kind == TOK_WSTR) {
         int slen;
-        if (tok.kind == TOK_WSTR)
+        if (g_lex.tok.kind == TOK_WSTR)
             is_wide = 1;
 
-        slen = (int)strlen(tok.text);
+        /*
+         * Use the lexer's recorded length, not strlen(tok.text): a literal
+         * containing a \0 escape has real bytes past that point, which
+         * strlen() would silently discard.
+         */
+        slen = g_lex.tok.text_len;
         if (len + slen + 1 > cap) {
             char *nbuf;
             int ncap;
@@ -340,7 +705,7 @@ char *read_adjacent_string_literals_ex(int *is_widep)
             buf = nbuf;
             cap = ncap;
         }
-        memcpy(buf + len, tok.text, (size_t)slen);
+        memcpy(buf + len, g_lex.tok.text, (size_t)slen);
         len += slen;
         buf[len] = 0;
         next_token();
@@ -348,6 +713,8 @@ char *read_adjacent_string_literals_ex(int *is_widep)
 
     if (is_widep)
         *is_widep = is_wide;
+    if (lenp)
+        *lenp = len;
     return buf;
 }
 
@@ -392,7 +759,7 @@ void emit_deferred_extrns(void)
         struct Sym *s;
         s = used_extrns[i];
         if (s && s->needs_extrn && !s->is_defined && !asm_name_is_internal_public(s->name))
-            fprintf(outf, "\textrn %s\n", asm_name_for(sym_asm_name(s)));
+            fprintf(g_emit_sink.stream, "\textrn %s\n", asm_name_for(sym_asm_name(s)));
     }
 }
 
@@ -401,6 +768,9 @@ void emit_runtime_extrn_if_needed(const char *name)
 {
     static const char *emitted[64];
     static int nemitted;
+    static const char *buf_emitted[64];
+    static int n_buf_emitted;
+    static int buf_epoch;
     int i;
 
     /*
@@ -414,7 +784,34 @@ void emit_runtime_extrn_if_needed(const char *name)
         return;
 
     if (g_inline_body_buffering) {
-        fprintf(outf, "\textrn %s\n", name);
+        /* Dedup within this one buffered/speculative attempt only - never
+         * against the persistent `emitted` cache below, which would
+         * reintroduce the exact hazard this branch exists to avoid (see the
+         * caller-side comment on g_inline_body_buffering). g_buffering_epoch
+         * is bumped at every g_inline_body_buffering++ site (dcc_func.c), so
+         * comparing it (not `g_emit_sink.stream`'s pointer value) is what detects "a new
+         * attempt started": g_emit_sink.stream points at a tmpfile(), and a closed
+         * tmpfile's freed FILE* can be reused by a later, unrelated
+         * tmpfile() at the exact same address - keying off g_emit_sink.stream identity
+         * caused a real miscompilation (tests/mm.c producing fewer output
+         * lines than expected) by wrongly treating an unrelated later
+         * attempt as a continuation of an earlier one and suppressing an
+         * EXTRN it still needed. Without any such reset, a function with
+         * many sequential calls to the same runtime helper (e.g. a
+         * usage()-style block of printf calls) emits one duplicate `extrn`
+         * per call when buffered - confirmed to send ntvcm's L80 emulation
+         * into a multi-minute stall on a real test (tests/a1.c) once printf
+         * itself started routing through this path. */
+        if (buf_epoch != g_buffering_epoch) {
+            buf_epoch = g_buffering_epoch;
+            n_buf_emitted = 0;
+        }
+        for (i = 0; i < n_buf_emitted; ++i)
+            if (!strcmp(buf_emitted[i], name))
+                return;
+        if (n_buf_emitted < 64)
+            buf_emitted[n_buf_emitted++] = name;
+        fprintf(g_emit_sink.stream, "\textrn %s\n", name);
         return;
     }
 
@@ -426,7 +823,7 @@ void emit_runtime_extrn_if_needed(const char *name)
     if (nemitted >= 64)
         fatal("too many runtime extrns");
 
-    fprintf(outf, "\textrn %s\n", name);
+    fprintf(g_emit_sink.stream, "\textrn %s\n", name);
     emitted[nemitted++] = name;
 }
 
@@ -434,49 +831,49 @@ void emit_runtime_call(const char *name)
 {
     emit_runtime_extrn_if_needed(name);
     if (!scan_mode)
-        fprintf(outf, "\tcall %s\n", name);
-}
-
-
-int frame_sp_offset_for_sym(struct Sym *s)
-{
-    /* With normal frame, first parameter is ix+4.  With no IX frame,
-     * SP still points at the return address, so the same parameter is sp+2. */
-    return s->offset - 2;
+        fprintf(g_emit_sink.stream, "\tcall %s\n", name);
 }
 
 void emit_load_frame_addr_hl(struct Sym *s)
 {
     int n;
-    if (current_omit_ix_frame && s->storage == SC_PARAM) {
-        n = frame_sp_offset_for_sym(s);
-        if (n == 0) {
-            emit("\tpush sp\n\tpop hl\n");
-        } else {
-            fprintf(outf, "\tld hl,%d\n", n);
-            emit("\tadd hl,sp\n");
-        }
-    } else {
-        emit("\tpush ix\n");
-        emit("\tpop hl\n");
-        if (s->offset > 0 && s->offset <= 3) {
-            for (n = 0; n < s->offset; ++n) emit("\tinc hl\n");
-        } else if (s->offset < 0 && s->offset >= -3) {
-            for (n = 0; n < -s->offset; ++n) emit("\tdec hl\n");
-        } else if (s->offset != 0) {
-            fprintf(outf, "\tld de,%d\n", s->offset);
-            emit("\tadd hl,de\n");
-        }
+    if (s->has_addr_cache) {
+        /* This local array's address was materialized once, unconditionally,
+         * right after the prologue allocated locals (see dcc_func.c) - it
+         * never changes for the life of the function, so every later
+         * reference just rereads the cached pointer instead of redoing the
+         * push ix/pop hl/ld de,N/add hl,de below. */
+        fprintf(g_emit_sink.stream, "\tld l,(ix%+d)\n", s->addr_cache_offset);
+        fprintf(g_emit_sink.stream, "\tld h,(ix%+d)\n", s->addr_cache_offset + 1);
+        return;
+    }
+    emit("\tpush ix\n");
+    emit("\tpop hl\n");
+    if (s->offset > 0 && s->offset <= 3) {
+        for (n = 0; n < s->offset; ++n) emit("\tinc hl\n");
+    } else if (s->offset < 0 && s->offset >= -3) {
+        for (n = 0; n < -s->offset; ++n) emit("\tdec hl\n");
+    } else if (s->offset != 0) {
+        fprintf(g_emit_sink.stream, "\tld de,%d\n", s->offset);
+        emit("\tadd hl,de\n");
     }
 }
 
 void emit_load_sym_addr(struct Sym *s)
 {
+    if (s->is_vla) {
+        /* A VLA's storage is allocated at run time below SP; its frame slot
+         * holds a pointer to that block.  The array decays to that pointer
+         * value, so load the slot contents rather than the slot's address. */
+        emit_load_frame_addr_hl(s);
+        emit("\tld a,(hl)\n\tinc hl\n\tld h,(hl)\n\tld l,a\n");
+        return;
+    }
     if (s->storage == SC_LOCAL || s->storage == SC_PARAM) {
         emit_load_frame_addr_hl(s);
     } else {
         emit_extrn_if_needed(s);
-        fprintf(outf, "\tld hl,%s\n", asm_name_for(sym_asm_name(s)));
+        fprintf(g_emit_sink.stream, "\tld hl,%s\n", asm_name_for(sym_asm_name(s)));
     }
 }
 
@@ -493,6 +890,27 @@ int sym_can_ix_direct(struct Sym *s)
     return 1;
 }
 
+/* Like sym_can_ix_direct, but for a `size`-byte access at frame-relative
+ * `s->offset + off` rather than for the whole of `s`'s own type/extent -
+ * i.e. one element of a local array, or one member of a local struct, at a
+ * possibly nonzero byte offset from the symbol's base. Deliberately does
+ * NOT exclude s->is_array (an in-range element of an array is still a
+ * perfectly good (ix+d) direct access), but DOES exclude a VLA: its frame
+ * slot holds a runtime pointer to the actual (heap/stack-allocated)
+ * storage, not the data itself, so no fixed (ix+d) offset addresses its
+ * elements. */
+int local_offset_can_ix_direct(struct Sym *s, int off, int size)
+{
+    int lo, hi;
+    if (!s) return 0;
+    if (s->storage != SC_LOCAL && s->storage != SC_PARAM) return 0;
+    if (s->is_vla) return 0;
+    if (size < 1) size = 1;
+    lo = s->offset + off;
+    hi = lo + size - 1;
+    return lo >= -128 && hi <= 127;
+}
+
 /* True for global/extern 16-bit non-array variables that support direct word load/store. */
 int is_global_word_sym(struct Sym *s)
 {
@@ -506,14 +924,14 @@ int is_global_word_sym(struct Sym *s)
 void emit_load_global_word_direct(struct Sym *s)
 {
     emit_extrn_if_needed(s);
-    fprintf(outf, "\tld hl,(%s)\n", asm_name_for(sym_asm_name(s)));
+    fprintf(g_emit_sink.stream, "\tld hl,(%s)\n", asm_name_for(sym_asm_name(s)));
 }
 
 /* Z80: ld (name),hl — store 16-bit HL value to global/extern directly. */
 void emit_store_global_word_direct(struct Sym *s)
 {
     emit_extrn_if_needed(s);
-    fprintf(outf, "\tld (%s),hl\n", asm_name_for(sym_asm_name(s)));
+    fprintf(g_emit_sink.stream, "\tld (%s),hl\n", asm_name_for(sym_asm_name(s)));
 }
 
 void emit_load_sym_value_direct(struct Sym *s)
@@ -522,30 +940,8 @@ void emit_load_sym_value_direct(struct Sym *s)
         emit_load_global_word_direct(s);
         return;
     }
-    if (current_omit_ix_frame && s->storage == SC_PARAM) {
-        if (type_size(s->type) == 1) {
-            emit_load_frame_addr_hl(s);
-            emit("\tld l,(hl)\n");
-            if ((s->type & TYPE_UNSIGNED) || type_is_bool(s->type))
-                emit("\tld h,0\n");
-            else
-                emit("\tld a,l\n\trlca\n\tsbc a,a\n\tld h,a\n");
-            if (type_is_bool(s->type))
-                emit_bool_normalize_hl(s->type);
-        } else if (type_size(s->type) == 4) {
-            emit_load_frame_addr_hl(s);
-            emit("\tld a,(hl)\n\tld l,a\n\tinc hl\n\tld a,(hl)\n\tld h,a\n");
-            emit("\tpush hl\n");
-            emit_load_frame_addr_hl(s);
-            emit("\tinc hl\n\tinc hl\n\tld e,(hl)\n\tinc hl\n\tld d,(hl)\n\tpop hl\n");
-        } else {
-            emit_load_frame_addr_hl(s);
-            emit("\tld a,(hl)\n\tinc hl\n\tld h,(hl)\n\tld l,a\n");
-        }
-        return;
-    }
     if (type_size(s->type) == 1) {
-        fprintf(outf, "\tld l,(ix%+d)\n", s->offset);
+        fprintf(g_emit_sink.stream, "\tld l,(ix%+d)\n", s->offset);
         if ((s->type & TYPE_UNSIGNED) || type_is_bool(s->type))
             emit("\tld h,0\n");
         else
@@ -553,36 +949,127 @@ void emit_load_sym_value_direct(struct Sym *s)
         if (type_is_bool(s->type) && s->storage == SC_PARAM)
             emit_bool_normalize_hl(s->type);
     } else if (type_size(s->type) == 4) {
-        fprintf(outf, "\tld l,(ix%+d)\n", s->offset);
-        fprintf(outf, "\tld h,(ix%+d)\n", s->offset + 1);
-        fprintf(outf, "\tld e,(ix%+d)\n", s->offset + 2);
-        fprintf(outf, "\tld d,(ix%+d)\n", s->offset + 3);
+        fprintf(g_emit_sink.stream, "\tld l,(ix%+d)\n", s->offset);
+        fprintf(g_emit_sink.stream, "\tld h,(ix%+d)\n", s->offset + 1);
+        fprintf(g_emit_sink.stream, "\tld e,(ix%+d)\n", s->offset + 2);
+        fprintf(g_emit_sink.stream, "\tld d,(ix%+d)\n", s->offset + 3);
     } else {
-        fprintf(outf, "\tld l,(ix%+d)\n", s->offset);
-        fprintf(outf, "\tld h,(ix%+d)\n", s->offset + 1);
+        fprintf(g_emit_sink.stream, "\tld l,(ix%+d)\n", s->offset);
+        fprintf(g_emit_sink.stream, "\tld h,(ix%+d)\n", s->offset + 1);
     }
+}
+
+/* True if s's value load is a genuine two-byte memory fetch that a
+ * `sym & <const < 256>` fast path could trim to one byte - i.e. not
+ * already register-resident (there a full load is already just 1-2 cheap
+ * register moves, nothing to trim) and not an array/const-folded/long/
+ * float/pointer symbol (out of scope for this fast path; long has its own
+ * separate `& const` fast path in gen_long_arith_ast).
+ *
+ * The remaining three load shapes emit_load_sym_low_byte_and_const uses
+ * each have their own addressing constraint: is_global_word_sym and the
+ * no-ix-frame frame-address case both compute a full 16-bit address (via
+ * `ld a,(name)` or emit_load_frame_addr_hl's HL arithmetic), so any offset
+ * works; the plain ix-relative fallback instead emits a bare `(ix+d)`,
+ * whose displacement is a signed 8-bit field - sym_can_ix_direct is the
+ * existing range check for exactly that (a local frame can easily exceed
+ * +-127 bytes; found via tests/tptrcnd.c's large-frame case, where an
+ * unchecked `ld a,(ix-756)` silently wrapped to the wrong offset instead
+ * of failing to assemble, corrupting an unrelated read). */
+int sym_word_load_is_two_byte_fetch(struct Sym *s)
+{
+    if (s == NULL)
+        return 0;
+    if (s->is_array || s->is_const_value)
+        return 0;
+    if (type_size(s->type) != 2)
+        return 0;
+    if (type_is_float(s->type) || type_ptr_depth(s->type) != 0)
+        return 0;
+    if (is_global_word_sym(s))
+        return 1;
+    return sym_can_ix_direct(s);
+}
+
+/* Load only s's low byte and AND it with mask (caller guarantees
+ * mask <= 255). The result's high byte is always 0 regardless of s's
+ * actual value or sign - a mask with no bits above bit 7 set can never
+ * depend on s's high byte - so this skips fetching it at all, unlike the
+ * normal two-byte load emit_load_sym_value_direct does before any masking
+ * happens. Leaves the zero-extended result in HL. Caller has already
+ * confirmed sym_word_load_is_two_byte_fetch(s). */
+void emit_load_sym_low_byte_and_const(struct Sym *s, unsigned int mask)
+{
+    if (is_global_word_sym(s)) {
+        emit_extrn_if_needed(s);
+        fprintf(g_emit_sink.stream, "\tld a,(%s)\n", asm_name_for(sym_asm_name(s)));
+    } else {
+        fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset);
+    }
+    fprintf(g_emit_sink.stream, "\tand %u\n", mask & 255);
+    emit("\tld l,a\n\tld h,0\n");
+}
+
+/* True if s is a byte-sized (char/uchar/bool) scalar whose value is a
+ * single-instruction raw byte fetch - i.e. safe to use directly in an
+ * 8-bit-only comparison (sub/cp) without this codebase's usual int-
+ * promotion (sign/zero-extend into H) on every byte read. Same three load
+ * shapes and the same sym_can_ix_direct range check as
+ * sym_word_load_is_two_byte_fetch, just for a 1-byte rather than 2-byte
+ * value. */
+int sym_is_direct_byte_fetch(struct Sym *s)
+{
+    if (s == NULL)
+        return 0;
+    if (s->is_array || s->is_const_value)
+        return 0;
+    if (type_size(s->type) != 1)
+        return 0;
+    if (s->storage == SC_GLOBAL || s->storage == SC_EXTERN)
+        return 1;
+    return sym_can_ix_direct(s);
+}
+
+/* Load s's raw byte value into A - no int-promotion, since the only use is
+ * an 8-bit-only comparison that doesn't need one. Caller has already
+ * confirmed sym_is_direct_byte_fetch(s). */
+void emit_load_sym_byte_to_a(struct Sym *s)
+{
+    if (s->storage == SC_GLOBAL || s->storage == SC_EXTERN) {
+        emit_extrn_if_needed(s);
+        fprintf(g_emit_sink.stream, "\tld a,(%s)\n", asm_name_for(sym_asm_name(s)));
+        return;
+    }
+    fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset);
 }
 
 void emit_load_sym_de_direct(struct Sym *s)
 {
-    if (current_omit_ix_frame && s->storage == SC_PARAM) {
-        if (type_size(s->type) == 1) {
-            emit_load_frame_addr_hl(s);
-            emit("\tld e,(hl)\n");
-            if ((s->type & TYPE_UNSIGNED) || type_is_bool(s->type))
-                emit("\tld d,0\n");
-            else
-                emit("\tld a,e\n\trlca\n\tsbc a,a\n\tld d,a\n");
-            if (type_is_bool(s->type))
-                emit("\tld a,e\n\tor a\n\tld e,0\n\tjr z,$+3\n\tinc e\n\tld d,0\n");
-        } else {
-            emit_load_frame_addr_hl(s);
-            emit("\tld e,(hl)\n\tinc hl\n\tld d,(hl)\n");
-        }
+    if (s == NULL)
+        fatal("emit_load_sym_de_direct: missing symbol");
+    if (is_global_word_sym(s)) {
+        emit("\tpush hl\n");
+        emit_load_global_word_direct(s);
+        emit("\tex de,hl\n\tpop hl\n");
         return;
     }
+    if ((s->storage == SC_GLOBAL || s->storage == SC_EXTERN) &&
+        !s->is_array && type_size(s->type) == 1) {
+        emit("\tpush hl\n");
+        emit_load_sym_addr(s);
+        emit("\tld e,(hl)\n\tpop hl\n");
+        if ((s->type & TYPE_UNSIGNED) || type_is_bool(s->type))
+            emit("\tld d,0\n");
+        else
+            emit("\tld a,e\n\trlca\n\tsbc a,a\n\tld d,a\n");
+        if (type_is_bool(s->type))
+            emit("\tld a,e\n\tor a\n\tld e,0\n\tjr z,$+3\n\tinc e\n\tld d,0\n");
+        return;
+    }
+    if (!sym_can_ix_direct(s))
+        fatal("emit_load_sym_de_direct: symbol is not directly loadable");
     if (type_size(s->type) == 1) {
-        fprintf(outf, "\tld e,(ix%+d)\n", s->offset);
+        fprintf(g_emit_sink.stream, "\tld e,(ix%+d)\n", s->offset);
         if ((s->type & TYPE_UNSIGNED) || type_is_bool(s->type))
             emit("\tld d,0\n");
         else
@@ -590,8 +1077,8 @@ void emit_load_sym_de_direct(struct Sym *s)
         if (type_is_bool(s->type) && s->storage == SC_PARAM)
             emit("\tld a,e\n\tor a\n\tld e,0\n\tjr z,$+3\n\tinc e\n\tld d,0\n");
     } else {
-        fprintf(outf, "\tld e,(ix%+d)\n", s->offset);
-        fprintf(outf, "\tld d,(ix%+d)\n", s->offset + 1);
+        fprintf(g_emit_sink.stream, "\tld e,(ix%+d)\n", s->offset);
+        fprintf(g_emit_sink.stream, "\tld d,(ix%+d)\n", s->offset + 1);
     }
 }
 
@@ -601,36 +1088,42 @@ void emit_store_hl_to_sym_direct(struct Sym *s)
         emit_store_global_word_direct(s);
         return;
     }
-    if (current_omit_ix_frame && s->storage == SC_PARAM) {
-        if (type_size(s->type) == 1) {
-            if (type_is_bool(s->type))
-                emit_bool_normalize_hl(s->type);
-            emit("\tld e,l\n");
-            emit_load_frame_addr_hl(s);
-            emit("\tld (hl),e\n");
-        } else if (type_size(s->type) == 4) {
-            emit("\tpush de\n\tex de,hl\n");
-            emit_load_frame_addr_hl(s);
-            emit("\tld (hl),e\n\tinc hl\n\tld (hl),d\n\tinc hl\n\tpop de\n\tld (hl),e\n\tinc hl\n\tld (hl),d\n");
-        } else {
-            emit("\tex de,hl\n");
-            emit_load_frame_addr_hl(s);
-            emit("\tld (hl),e\n\tinc hl\n\tld (hl),d\n");
-        }
+    if ((s->storage == SC_LOCAL || s->storage == SC_PARAM) &&
+        type_size(s->type) <= 2 && !sym_can_ix_direct(s)) {
+        /* Frame slot is outside the (ix+d) signed-8-bit displacement range,
+         * so compute the address and store through it. Normalize a _Bool
+         * value up front (mirroring the plain (ix+d) path below) so the
+         * value left in HL on exit is the normalized 0/1, not just the
+         * stored byte - keeping this fallback's HL contract identical to the
+         * in-range path for a consumed assignment result.
+         *
+         * Only 1- and 2-byte objects need this: every caller that stores a
+         * 4-byte long/float to an out-of-range frame slot already computes
+         * the address itself and uses emit_store_de_to_addr_hl (see
+         * gen_assign_ast's !sym_can_ix_direct long/float branches), so a
+         * size-4 store only ever reaches the (ix+d) code below with an
+         * in-range offset. */
+        if (type_is_bool(s->type))
+            emit_bool_normalize_hl(s->type);
+        emit("\tpush hl\n");
+        emit_load_sym_addr(s);
+        emit("\tpop de\n");
+        emit_store_de_to_addr_hl(s->type);
+        emit("\tex de,hl\n");
         return;
     }
     if (type_size(s->type) == 1) {
         if (type_is_bool(s->type))
             emit_bool_normalize_hl(s->type);
-        fprintf(outf, "\tld (ix%+d),l\n", s->offset);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),l\n", s->offset);
     } else if (type_size(s->type) == 4) {
-        fprintf(outf, "\tld (ix%+d),l\n", s->offset);
-        fprintf(outf, "\tld (ix%+d),h\n", s->offset + 1);
-        fprintf(outf, "\tld (ix%+d),e\n", s->offset + 2);
-        fprintf(outf, "\tld (ix%+d),d\n", s->offset + 3);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),l\n", s->offset);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),h\n", s->offset + 1);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),e\n", s->offset + 2);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),d\n", s->offset + 3);
     } else {
-        fprintf(outf, "\tld (ix%+d),l\n", s->offset);
-        fprintf(outf, "\tld (ix%+d),h\n", s->offset + 1);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),l\n", s->offset);
+        fprintf(g_emit_sink.stream, "\tld (ix%+d),h\n", s->offset + 1);
     }
 }
 
@@ -668,7 +1161,7 @@ int try_emit_post_update_sym_direct(struct Sym *s, int op)
 
     emit_store_hl_to_sym_direct(s);    /* store new value */
     emit("\tpop hl\n");               /* return old value */
-    g_expr_type = s->type;
+    g_expr.type = s->type;
     return 1;
 }
 
@@ -705,9 +1198,9 @@ void emit_incdec_sym_direct(struct Sym *s, int op)
 
     if (type_size(s->type) == 1) {
         if (op == TOK_INC)
-            fprintf(outf, "\tinc (ix%+d)\n", s->offset);
+            fprintf(g_emit_sink.stream, "\tinc (ix%+d)\n", s->offset);
         else
-            fprintf(outf, "\tdec (ix%+d)\n", s->offset);
+            fprintf(g_emit_sink.stream, "\tdec (ix%+d)\n", s->offset);
         return;
     }
 
@@ -724,40 +1217,40 @@ void emit_incdec_sym_direct(struct Sym *s, int op)
          * continue once more with i's low word equal to -1.
          */
         if (op == TOK_INC) {
-            fprintf(outf, "\tinc (ix%+d)\n", s->offset);
+            fprintf(g_emit_sink.stream, "\tinc (ix%+d)\n", s->offset);
             emit_jp_label("jp nz,", done);
-            fprintf(outf, "\tinc (ix%+d)\n", s->offset + 1);
+            fprintf(g_emit_sink.stream, "\tinc (ix%+d)\n", s->offset + 1);
             emit_jp_label("jp nz,", done);
-            fprintf(outf, "\tinc (ix%+d)\n", s->offset + 2);
+            fprintf(g_emit_sink.stream, "\tinc (ix%+d)\n", s->offset + 2);
             emit_jp_label("jp nz,", done);
-            fprintf(outf, "\tinc (ix%+d)\n", s->offset + 3);
+            fprintf(g_emit_sink.stream, "\tinc (ix%+d)\n", s->offset + 3);
         } else {
-            fprintf(outf, "\tld a,(ix%+d)\n", s->offset);
-            fprintf(outf, "\tdec (ix%+d)\n", s->offset);
+            fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset);
+            fprintf(g_emit_sink.stream, "\tdec (ix%+d)\n", s->offset);
             emit("\tor a\n");
             emit_jp_label("jp nz,", done);
-            fprintf(outf, "\tld a,(ix%+d)\n", s->offset + 1);
-            fprintf(outf, "\tdec (ix%+d)\n", s->offset + 1);
+            fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset + 1);
+            fprintf(g_emit_sink.stream, "\tdec (ix%+d)\n", s->offset + 1);
             emit("\tor a\n");
             emit_jp_label("jp nz,", done);
-            fprintf(outf, "\tld a,(ix%+d)\n", s->offset + 2);
-            fprintf(outf, "\tdec (ix%+d)\n", s->offset + 2);
+            fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset + 2);
+            fprintf(g_emit_sink.stream, "\tdec (ix%+d)\n", s->offset + 2);
             emit("\tor a\n");
             emit_jp_label("jp nz,", done);
-            fprintf(outf, "\tdec (ix%+d)\n", s->offset + 3);
+            fprintf(g_emit_sink.stream, "\tdec (ix%+d)\n", s->offset + 3);
         }
     } else {
         /* 2-byte int ++/--. */
         if (op == TOK_INC) {
-            fprintf(outf, "\tinc (ix%+d)\n", s->offset);
+            fprintf(g_emit_sink.stream, "\tinc (ix%+d)\n", s->offset);
             emit_jp_label("jp nz,", done);
-            fprintf(outf, "\tinc (ix%+d)\n", s->offset + 1);
+            fprintf(g_emit_sink.stream, "\tinc (ix%+d)\n", s->offset + 1);
         } else {
-            fprintf(outf, "\tld a,(ix%+d)\n", s->offset);
-            fprintf(outf, "\tdec (ix%+d)\n", s->offset);
+            fprintf(g_emit_sink.stream, "\tld a,(ix%+d)\n", s->offset);
+            fprintf(g_emit_sink.stream, "\tdec (ix%+d)\n", s->offset);
             emit("\tor a\n");
             emit_jp_label("jp nz,", done);
-            fprintf(outf, "\tdec (ix%+d)\n", s->offset + 1);
+            fprintf(g_emit_sink.stream, "\tdec (ix%+d)\n", s->offset + 1);
         }
     }
 
@@ -786,7 +1279,7 @@ void emit_add_field_offset(struct FieldDef *fd)
         for (i = 0; i < fd->offset; i++)
             emit("\tinc hl\n");
     } else if (fd->offset) {
-        fprintf(outf, "\tld de,%d\n", fd->offset);
+        fprintf(g_emit_sink.stream, "\tld de,%d\n", fd->offset);
         emit("\tadd hl,de\n");
     }
 }
@@ -798,10 +1291,10 @@ void skip_balanced_bracket(int open_ch, int close_ch)
     depth = 1;
     next_token();
 
-    while (tok.kind != TOK_EOF && depth > 0) {
-        if (tok.kind == open_ch) {
+    while (g_lex.tok.kind != TOK_EOF && depth > 0) {
+        if (g_lex.tok.kind == open_ch) {
             depth++;
-        } else if (tok.kind == close_ch) {
+        } else if (g_lex.tok.kind == close_ch) {
             depth--;
         }
 
@@ -817,7 +1310,7 @@ int parse_offsetof_value(void)
     int off;
     struct FieldDef *fd;
 
-    if (tok.kind != TOK_ID || strcmp(tok.text, "__offsetof") != 0) {
+    if (g_lex.tok.kind != TOK_ID || strcmp(g_lex.tok.text, "__offsetof") != 0) {
         error_here("__offsetof expected");
         return 0;
     }
@@ -835,14 +1328,14 @@ int parse_offsetof_value(void)
 
     off = 0;
     for (;;) {
-        if (tok.kind != TOK_ID) {
+        if (g_lex.tok.kind != TOK_ID) {
             error_here("field name expected in offsetof");
-            while (tok.kind != TOK_EOF && tok.kind != ')')
+            while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != ')')
                 next_token();
             break;
         }
 
-        fd = find_field_def(sid, tok.text);
+        fd = find_field_def(sid, g_lex.tok.text);
         if (!fd) {
             error_here("unknown field in offsetof");
             next_token();
@@ -853,11 +1346,11 @@ int parse_offsetof_value(void)
         off += fd->offset;
         t = fd->is_array ? fd->elem_type : fd->type;
 
-        while (tok.kind == '[') {
+        while (g_lex.tok.kind == '[') {
             int idx;
             int elem;
             next_token();
-            idx = parse_const_int_expr();
+            idx = parse_typed_const_int_expr();
             expect(']');
             elem = fd->is_array ? fd->elem_size : type_size(t);
             if (elem <= 0)
@@ -866,13 +1359,13 @@ int parse_offsetof_value(void)
             t = fd->elem_type ? fd->elem_type : t;
         }
 
-        if (tok.kind != '.')
+        if (g_lex.tok.kind != '.')
             break;
         next_token();
         sid = base_struct_id_from_type(t);
         if (sid <= 0) {
             error_here("nested offsetof field is not struct/union");
-            while (tok.kind != TOK_EOF && tok.kind != ')')
+            while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != ')')
                 next_token();
             break;
         }
@@ -919,7 +1412,7 @@ int sizeof_parse_primary_type(int *typep, int *sizep)
     int sid;
     int i;
 
-    if (tok.kind == '*') {
+    if (g_lex.tok.kind == '*') {
         next_token();
         if (!sizeof_parse_primary_type(&type, &sz)) {
             *typep = TYPE_INT;
@@ -934,7 +1427,7 @@ int sizeof_parse_primary_type(int *typep, int *sizep)
         return 1;
     }
 
-    if (tok.kind == '&') {
+    if (g_lex.tok.kind == '&') {
         next_token();
         if (!sizeof_parse_primary_type(&type, &sz)) {
             *typep = TYPE_INT | TYPE_PTR;
@@ -946,7 +1439,7 @@ int sizeof_parse_primary_type(int *typep, int *sizep)
         return 1;
     }
 
-    if (tok.kind == TOK_NUM) {
+    if (g_lex.tok.kind == TOK_NUM) {
         type = g_tok_long_suffix ? TYPE_LONG : TYPE_INT;
         if (g_tok_unsigned_suffix)
             type |= TYPE_UNSIGNED;
@@ -956,18 +1449,19 @@ int sizeof_parse_primary_type(int *typep, int *sizep)
         return 1;
     }
 
-    if (tok.kind == TOK_CHARLIT) {
+    if (g_lex.tok.kind == TOK_CHARLIT) {
         next_token();
         *typep = TYPE_INT;
         *sizep = 2;
         return 1;
     }
 
-    if (tok.kind == TOK_STR || tok.kind == TOK_WSTR) {
+    if (g_lex.tok.kind == TOK_STR || g_lex.tok.kind == TOK_WSTR) {
         char *lit;
         int is_wide;
-        lit = read_adjacent_string_literals_ex(&is_wide);
-        sz = (int)strlen(lit) + 1;
+        int litlen;
+        lit = read_adjacent_string_literals_ex(&is_wide, &litlen);
+        sz = litlen + 1;
         if (is_wide)
             sz *= 2;
         free(lit);
@@ -976,7 +1470,7 @@ int sizeof_parse_primary_type(int *typep, int *sizep)
         return 1;
     }
 
-    if (tok.kind == '(') {
+    if (g_lex.tok.kind == '(') {
         next_token();
         if (starts_type()) {
             parse_type_name_decl(&type, &sz);
@@ -993,18 +1487,18 @@ int sizeof_parse_primary_type(int *typep, int *sizep)
         return 1;
     }
 
-    if (tok.kind != TOK_ID) {
+    if (g_lex.tok.kind != TOK_ID) {
         error_here("unsupported sizeof expression");
         *typep = TYPE_INT;
         *sizep = 2;
         return 0;
     }
 
-    s = find_sym(tok.text);
+    s = find_sym(g_lex.tok.text);
     if (!s) {
         /* enum constants behave like int; unknown identifiers are diagnosed. */
         for (i = 0; i < nenum_consts; ++i) {
-            if (!strcmp(enum_const_names[i], tok.text)) {
+            if (!strcmp(enum_const_names[i], g_lex.tok.text)) {
                 next_token();
                 *typep = TYPE_INT;
                 *sizep = 2;
@@ -1013,7 +1507,7 @@ int sizeof_parse_primary_type(int *typep, int *sizep)
         }
         {
             char msg[MAX_TOK_TEXT + 64];
-            sprintf(msg, "use of undeclared identifier '%s'", tok.text);
+            sprintf(msg, "use of undeclared identifier '%s'", g_lex.tok.text);
             error_here(msg);
         }
         next_token();
@@ -1027,63 +1521,76 @@ int sizeof_parse_primary_type(int *typep, int *sizep)
     sz = is_arr ? s->size : type_size(type);
     elem_size = s->elem_size ? s->elem_size : type_size(type);
     if (elem_size <= 0) elem_size = 1;
-    next_token();
+    {
+        /* sizeof of a whole VLA needs its runtime byte size, which is not a
+         * compile-time constant; reject rather than silently use the pointer
+         * slot size.  Indexing/field access below reduces to a constant-size
+         * subobject, so only the bare VLA operand is diagnosed (checked after
+         * the postfix loop via vla_whole). */
+        int vla_whole = s->is_vla;
+        next_token();
 
-    for (;;) {
-        if (tok.kind == '[') {
-            skip_balanced_bracket('[', ']');
-            if (is_arr) {
-                sz = elem_size;
+        for (;;) {
+            if (g_lex.tok.kind == '[') {
+                skip_balanced_bracket('[', ']');
+                vla_whole = 0;
+                if (is_arr) {
+                    sz = elem_size;
+                    is_arr = 0;
+                } else {
+                    type = type_decay_ptr(type);
+                    sz = type_size(type);
+                    if (sz <= 0) sz = 1;
+                }
+            } else if (g_lex.tok.kind == '(') {
+                /* Function call expression: sizeof uses the function return
+                 * type.  Arguments are not evaluated; just skip the list. */
+                skip_balanced_bracket('(', ')');
                 is_arr = 0;
-            } else {
-                type = type_decay_ptr(type);
+                vla_whole = 0;
                 sz = type_size(type);
-                if (sz <= 0) sz = 1;
-            }
-        } else if (tok.kind == '(') {
-            /* Function call expression: sizeof uses the function return type.
-             * Arguments are not evaluated; just skip the argument list. */
-            skip_balanced_bracket('(', ')');
-            is_arr = 0;
-            sz = type_size(type);
-            if (sz <= 0) sz = 2;
-        } else if (tok.kind == '.' || tok.kind == TOK_ARROW) {
-            int arrow;
+                if (sz <= 0) sz = 2;
+            } else if (g_lex.tok.kind == '.' || g_lex.tok.kind == TOK_ARROW) {
+                int arrow;
 
-            arrow = tok.kind == TOK_ARROW;
-            next_token();
-
-            if (tok.kind != TOK_ID) {
-                error_here("field name expected");
-                break;
-            }
-
-            if (arrow)
-                sid = base_struct_id_from_type(type_decay_ptr(type));
-            else
-                sid = base_struct_id_from_type(type);
-
-            fd = find_field_def(sid, tok.text);
-            if (!fd) {
-                error_here("unknown struct field");
+                arrow = g_lex.tok.kind == TOK_ARROW;
+                vla_whole = 0;
                 next_token();
+
+                if (g_lex.tok.kind != TOK_ID) {
+                    error_here("field name expected");
+                    break;
+                }
+
+                if (arrow)
+                    sid = base_struct_id_from_type(type_decay_ptr(type));
+                else
+                    sid = base_struct_id_from_type(type);
+
+                fd = find_field_def(sid, g_lex.tok.text);
+                if (!fd) {
+                    error_here("unknown struct field");
+                    next_token();
+                    break;
+                }
+
+                next_token();
+
+                type = fd->is_array ? fd->elem_type : fd->type;
+                sz = fd->is_array ? fd->size : fd->size;
+                is_arr = fd->is_array;
+                elem_size = fd->elem_size ? fd->elem_size : type_size(type);
+                if (elem_size <= 0) elem_size = 1;
+            } else {
                 break;
             }
-
-            next_token();
-
-            type = fd->is_array ? fd->elem_type : fd->type;
-            sz = fd->is_array ? fd->size : fd->size;
-            is_arr = fd->is_array;
-            elem_size = fd->elem_size ? fd->elem_size : type_size(type);
-            if (elem_size <= 0) elem_size = 1;
-        } else {
-            break;
         }
+
+        if (vla_whole)
+            error_here("sizeof applied to a variable-length array is not supported");
     }
 
     *typep = type;
     *sizep = sz;
     return 1;
 }
-

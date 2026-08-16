@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <limits.h>
+#include <string.h>
 
 // most of this fails with dccrtl, but it's good to know where things stand.
 
@@ -64,6 +65,22 @@ int main()
     printf("%x\n", 2748);      /* abc */
     printf("%x\n", 32767);     /* 7fff */
 
+    /* %o octal -- minimal width */
+    printf("%o\n", 0);         /* 0 */
+    printf("%o\n", 8);         /* 10 */
+    printf("%o\n", 10);        /* 12 */
+    printf("%o\n", 511);       /* 777 */
+    printf("[%6o]\n", 10);     /* [    12] */
+
+    /* An unsupported flag ('+' force-sign, '#' alternate-form) must not
+     * desync the arguments that follow it on the same call - confirmed as
+     * a real bug: it used to shift every subsequent %-conversion's
+     * argument by one. Neither flag's own cosmetic effect is implemented
+     * (no '+' sign, no "0x"/leading-0 prefix), but everything after them
+     * must still read the right argument. */
+    printf("%+d %d %d\n", 1, 2, 3);        /* 1 2 3 */
+    printf("%#x %#o %d\n", 6, 4, 9);       /* 6 4 9 */
+
     /* %c character */
     printf("%c\n", 65);        /* A */
     printf("%c\n", 97);        /* a */
@@ -72,6 +89,14 @@ int main()
     /* %s string */
     printf("%s\n", "hello");
     printf("%s\n", "world");
+
+    /* %.Ns string precision: truncate to at most N characters, stopping
+     * at a NUL first if the string is shorter than N. */
+    printf("[%.4s]\n", "hello");       /* [hell] */
+    printf("[%.0s]\n", "hello");       /* [] */
+    printf("[%.20s]\n", "hi");         /* [hi] */
+    printf("[%10.3s]\n", "hello");     /* [       hel] */
+    printf("[%-10.3s]\n", "hello");    /* [hel       ] */
 
     /* %% literal percent */
     printf("100%%\n");
@@ -102,6 +127,71 @@ int main()
     printf("[%5s]\n", "ab");       /* [   ab] */
     printf("[%-5s]\n", "ab");      /* [ab   ] */
     printf("[%-3s:%3d:%6ld]\n", "x", 7, 12345L); /* [x  :  7: 12345] */
+
+    /* %.0f: an explicit zero precision must round to the nearest integer
+     * and print no decimal point at all - not fall back to the default of
+     * 6 decimal places (the previous behavior, since it couldn't tell
+     * "no precision given" from "precision explicitly 0"). */
+    printf("[%.0f]\n", 1.5);       /* [2] */
+    printf("[%.2f]\n", 1.5);       /* [1.50] */
+
+    /* %f field width: right-justified (space), left-justified (space),
+     * and the '0' flag (zero-fill, landing after a '-' sign rather than
+     * before it) - none of this was implemented at all previously; width
+     * was silently ignored for every %f conversion. */
+    printf("[%8.2f]\n", 1.5);      /* [    1.50] */
+    printf("[%-8.2f]\n", 1.5);     /* [1.50    ] */
+    printf("[%08.2f]\n", 1.5);     /* [00001.50] */
+    printf("[%08.2f]\n", -1.5);    /* [-0001.50] */
+    printf("[%12f]\n", 1.5);       /* [    1.500000] */
+
+    /* long strings: %s length must not truncate to 8 bits. A strlen >= 256
+     * used to wrap to 0 in printf's internal length counter, so
+     * printf("%s", ac) printed nothing at all for such a string - exactly
+     * what surfaced when tests/pihex.c was hand-modified to double its
+     * generated string's length. A related bug in the same fix (caught only
+     * via sprintf's return value, not by what got printed) had the
+     * length-computation helper collide with printf's own running
+     * output-char count, corrupting the count for every %s conversion. */
+    {
+        char buf[300];
+        char sbuf[300];
+        char vb[8];
+        int i, sn;
+
+        for (i = 0; i < 296; i++) buf[i] = 'a';
+        buf[296] = 'x';
+        buf[297] = 'y';
+        buf[298] = 'z';
+        buf[299] = 0;
+
+        printf("longstr len: %d\n", (int)strlen(buf));        /* 299 */
+        printf("longstr first3: %.3s\n", buf);                 /* aaa */
+        printf("longstr last3: %s\n", buf + 296);               /* xyz */
+        printf("longstr full:\n%s\n", buf);
+
+        sn = sprintf(sbuf, "%s", buf);
+        printf("sprintf longstr n=%d slen=%d\n", sn, (int)strlen(sbuf)); /* 299 299 */
+
+        for (i = 0; i < 255; i++) buf[i] = 'p';
+        buf[255] = 0;
+        printf("buf255 len: %d\n", (int)strlen(buf));           /* 255 */
+
+        for (i = 0; i < 256; i++) buf[i] = 'p';
+        buf[256] = 0;
+        printf("buf256 len: %d\n", (int)strlen(buf));           /* 256 */
+
+        /* precision clamp on a long (>255) string */
+        for (i = 0; i < 296; i++) buf[i] = 'a';
+        buf[296] = 0;
+        printf("[%.5s]\n", buf);                                 /* [aaaaa] */
+
+        /* sprintf's return value must equal the number of characters
+         * written, not corrupted by the register collision above
+         * (previously shipped bug: this returned 4 instead of 2). */
+        sn = sprintf(vb, "%s", "hi");
+        printf("sprintf short n=%d\n", sn);                      /* 2 */
+    }
 
     // no real attempt to make printf conformant on a Z80 cppreference();
 

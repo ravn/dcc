@@ -1,6 +1,16 @@
 #include <stdio.h>
+#include <stdint.h>
 
 static int fails;
+
+struct LongBox { int32_t l; int32_t a[2]; };
+
+static int32_t glive;
+static int32_t glarr[2];
+static int m1q_grid_values[] = {
+    -32768, -32767, -1024, -257, -256, -255, -129, -128, -1,
+    0, 1, 127, 128, 254, 255, 256, 257, 1024, 32767
+};
 
 static void chk(long got, long want, char *name)
 {
@@ -36,6 +46,10 @@ static int br_lt65535(int x) { if (x < 65535) return 1; return 0; }
 static int br_lt_hex_u(int x) { if (x < 0xffff) return 1; return 0; }
 static int br_ult_hex_u(unsigned int x) { if (x < 0xffff) return 1; return 0; }
 static int clamp_int_min(long a) { if (a < -32768L) return -32768; return (int)a; }
+static int32_t id32(int32_t value) { return value; }
+static int32_t ret_global_live_add(void) { return glive += 5L; }
+static int32_t ret_deref_live_add(int32_t *p) { return *p += 7L; }
+static int32_t ret_member_live_shr(struct LongBox *p) { return p->l >>= 2; }
 
 /* Compound long expressions that peek_simple_unary_type cannot predict: the
  * first term is 16-bit but the whole RHS is long.  The operator must still
@@ -95,6 +109,102 @@ static unsigned long ret_ubig2(unsigned long first, unsigned int second)
     return 131072UL;
 }
 
+static long mul_s8_s16(signed char left, int right)
+{
+    return (long)left * right;
+}
+
+static long mul_u8_s16(unsigned char left, int right)
+{
+    return (long)left * right;
+}
+
+static long mul_mask_s16(int left, int right)
+{
+    return (long)(left & 255) * right;
+}
+
+static long mul_mod_s16(int left, int right)
+{
+    return (long)(left % 256) * right;
+}
+
+static long mul_shift_s16(int left, int right)
+{
+    return (long)(left >> 8) * right;
+}
+
+static long mul_phi_s16(signed char left, signed char alternate,
+                        int choose_left, int right)
+{
+    return (long)(choose_left ? left : alternate) * right;
+}
+
+static long mul_s8_loop(signed char left, int right, int count)
+{
+    long total = 0;
+
+    while (count-- > 0)
+        total += (long)left * right;
+    return total;
+}
+
+static long mul_s16_s8_loop(int left, signed char right, int count)
+{
+    long total = 0;
+
+    while (count-- > 0)
+        total += (long)left * right;
+    return total;
+}
+
+extern long m1q_direct(int left, int right);
+
+#asm
+	public _m1q_direct
+	extrn __m1q
+_m1q_direct:
+	push ix
+	ld ix,0
+	add ix,sp
+	ld c,(ix+4)
+	ld b,(ix+5)
+	ld l,(ix+6)
+	ld h,(ix+7)
+	call __m1q
+	pop ix
+	ret
+#endasm
+
+static void test_m1q_grid(void)
+{
+    int left;
+    int right;
+
+    for (left = 0;
+         left < (int)(sizeof(m1q_grid_values) /
+                      sizeof(m1q_grid_values[0]));
+         ++left)
+        for (right = 0;
+             right < (int)(sizeof(m1q_grid_values) /
+                           sizeof(m1q_grid_values[0]));
+             ++right) {
+            long expected =
+                (long)m1q_grid_values[left] *
+                m1q_grid_values[right];
+            long actual = m1q_direct(
+                m1q_grid_values[left], m1q_grid_values[right]);
+
+            if (actual != expected) {
+                printf("FAIL m1q grid %d * %d got=%ld want=%ld\n",
+                       m1q_grid_values[left], m1q_grid_values[right],
+                       actual, expected);
+                fails++;
+                return;
+            }
+        }
+}
+
 static void test_widen_mul_edges(void)
 {
     int a, b, cond;
@@ -113,6 +223,14 @@ static void test_widen_mul_edges(void)
     b = 2;
     chk((long)a * b, -65536L, "s16mul minneg2");
 
+    a = -32768;
+    b = 32767;
+    chk((long)a * b, -1073709056L, "s16mul minmax");
+
+    a = 32767;
+    b = -32768;
+    chk((long)a * b, -1073709056L, "s16mul maxmin");
+
     ua = 65535U;
     ub = 65535U;
     chku((unsigned long)ua * ub, 4294836225UL, "u16mul max");
@@ -120,6 +238,21 @@ static void test_widen_mul_edges(void)
     ua = 40000U;
     ub = 40000U;
     chku((unsigned long)ua * ub, 1600000000UL, "u16mul 40000");
+
+    chk(mul_s8_s16(-128, -32768), 4194304L, "s8s16 minneg");
+    chk(mul_s8_s16(127, 32767), 4161409L, "s8s16 maxpos");
+    chk(mul_u8_s16(255, -32768), -8355840L, "u8s16 signed rhs");
+    chk(mul_mask_s16(0x12ff, -30000), -7650000L, "mask s16");
+    chk(mul_mod_s16(-511, 30000), -7650000L, "mod s16");
+    chk(mul_shift_s16(-32768, 30000), -3840000L, "shift s16");
+    chk(mul_phi_s16(-128, 127, 0, 32767), 4161409L, "phi s16");
+    chk(mul_s8_loop(-17, 30000, 7), -3570000L, "s8 loop");
+    chk(mul_s8_loop(-128, -32768, 1), 4194304L, "s8 loop min");
+    chk(mul_s16_s8_loop(-32768, -128, 1), 4194304L, "s8 rhs");
+    chk(m1q_direct(-32768, 32767), -1073709056L, "m1q fallback");
+    chk(m1q_direct(-256, 30000), -7680000L, "m1q minus256");
+    chk(m1q_direct(-32768, 255), -8355840L, "m1q right");
+    chk(m1q_direct(-255, -32768), 8355840L, "m1q swap");
 
     a = 1;
     b = 2;
@@ -395,8 +528,72 @@ static void test_compound_long_ops(void)
     chk(cb_ge(5, 30000, 60000L), 0L, "cb_ge 5>=90000");
 }
 
+/* A long assignment used as a live value must produce BOTH the stored lvalue and
+ * the propagated result correctly.  int32_t keeps the width identical on the
+ * clang host (32-bit int) and dcc (32-bit long). */
+static void test_local_long_assign_value(void)
+{
+    struct LongBox box;
+    int32_t a;
+    int32_t arr[2];
+    int32_t b;
+    int32_t *p;
+
+    a = 0L;
+    b = (a = 100000L);              /* chained plain = */
+    chk(a, 100000L, "chain= field");
+    chk(b, 100000L, "chain= result");
+
+    a = 100000L;
+    b = (a += 50000L);             /* compound += live */
+    chk(a, 150000L, "chain+= field");
+    chk(b, 150000L, "chain+= result");
+
+    a = 4L;
+    b = (a *= 100000L);            /* compound *= live */
+    chk(a, 400000L, "chain*= field");
+    chk(b, 400000L, "chain*= result");
+
+    a = 900000L;
+    b = (a -= 100000L);            /* compound -= live */
+    chk(a, 800000L, "chain-= field");
+    chk(b, 800000L, "chain-= result");
+
+    glive = 10L;
+    b = ret_global_live_add();
+    chk(glive, 15L, "global+= field");
+    chk(b, 15L, "global+= result");
+
+    a = 20L;
+    p = &a;
+    b = ret_deref_live_add(p);
+    chk(a, 27L, "deref+= field");
+    chk(b, 27L, "deref+= result");
+
+    box.l = 0x80L;
+    b = ret_member_live_shr(&box);
+    chk(box.l, 0x20L, "member>>= field");
+    chk(b, 0x20L, "member>>= result");
+
+    arr[1] = 9L;
+    b = id32(arr[1] *= 5L);
+    chk(arr[1], 45L, "index*= field");
+    chk(b, 45L, "index*= result");
+
+    glarr[1] = 100L;
+    b = id32(glarr[1] -= 58L);
+    chk(glarr[1], 42L, "gindex-= field");
+    chk(b, 42L, "gindex-= result");
+
+    box.a[1] = 0x10L;
+    b = id32(box.a[1] <<= 2);
+    chk(box.a[1], 0x40L, "mindex<<= field");
+    chk(b, 0x40L, "mindex<<= result");
+}
+
 int main(void)
 {
+    test_m1q_grid();
     test_widen_mul_edges();
     test_stale_marker_boundaries();
     test_unary_widen_mul();
@@ -404,6 +601,7 @@ int main(void)
     test_shift_edges();
     test_long_const_compare_edges();
     test_compound_long_ops();
+    test_local_long_assign_value();
 
     if (fails == 0)
         printf("tlongopt passed with great success\n");

@@ -1,13 +1,26 @@
 # Appendix: compiler architecture
 
 This appendix describes the DCC C Compiler toolchain: the compiler `dcc`, the peephole
-optimizer `dccpeep`, the runtime size reducer `dccrtlstrip`, and the Microsoft
-`M80` / `L80` assembler and linker.
+optimizer `dccpeep`, the runtime size reducer `dccrtlstrip`, and the assembler
+and linker - either the host-native `m80c`/`l80c`, or the Microsoft `M80`/`L80`
+originals running under `ntvcm`.
 
 !!! note "Host-resident tools"
-  `dcc`, `dccpeep`, and `dccrtlstrip` run on Windows, macOS, and Linux. They
-  never run on a Z80. They emit Z80 assembly text and CP/M `.COM` files that
-  run under CP/M-80, for example via the `ntvcm` emulator.
+  `dcc`, `dccpeep`, `dccrtlstrip`, `m80c`, and `l80c` run on Windows, macOS,
+  and Linux. They never run on a Z80. They emit Z80 assembly text and CP/M
+  `.COM` files that run under CP/M-80, for example via the `ntvcm` emulator.
+  `m80c`/`l80c` are clean-room, LINK-80-object-format-compatible
+  reimplementations of `M80`/`L80` with unbounded host memory instead of
+  CP/M's own 64K tables - large `nopeep` builds can exhaust real `L80`'s own
+  in-emulator linking workspace well before the target program itself would
+  not fit; `l80c` has no such ceiling. They are the default; pass
+  `dcc-use-emulated-m80=true`/`dcc-use-emulated-l80=true` to `dccmake` (or
+  `--emulated-m80`/`--emulated-l80` to `ma.sh`/`ma.ps1`) to use the real
+  `M80.COM`/`L80.COM` under `ntvcm` instead, e.g. to cross-check output.
+
+  The compiler implementation is portable C11 host code built by modern Clang,
+  GCC, or MSVC. That implementation language is independent of `dcc`'s C89
+  base language and selected C99/C11 additions for the 16-bit Z80 target.
 
 ## The toolchain at a glance
 
@@ -16,72 +29,139 @@ Each stage has one job and hands a text or object file to the next:
 
 ```mermaid
 flowchart LR
-    SRC([".c source"]) --> DCC["dcc<br/>C89 -> Z80 asm"]
+    SRC([".c source"]) --> DCC["dcc<br/>C front end<br/>AST -> MIR -> Z80 asm"]
     DCC --> MAC([".MAC assembly"])
     MAC --> PEEP["dccpeep<br/>peephole optimizer"]
     PEEP --> MAC2([".MAC optimized"])
-    MAC2 --> M80A["M80<br/>assemble"]
+    MAC2 --> M80A["m80c / M80<br/>assemble"]
     RTL([" DCCRTL.MAC<br/>full runtime"]) --> STRIP["dccrtlstrip<br/>dead-block removal"]
     MAC2 -. references .-> STRIP
     STRIP --> RTLMIN([" RTLMIN.MAC<br/>used routines only"])
-    RTLMIN --> M80B["M80<br/>assemble"]
+    RTLMIN --> M80B["m80c / M80<br/>assemble"]
     M80A --> REL([" app.REL"])
     M80B --> RRTL([" RTLMIN.REL"])
-    REL --> L80["L80<br/>link"]
+    REL --> L80["l80c / L80<br/>link"]
     RRTL --> L80
     L80 --> COM([".COM executable"])
 ```
 
 | Stage | Tool | Input | Output | Role |
 | --- | --- | --- | --- | --- |
-| Compile | `dcc` | `.c` | `.MAC` | Translate C89 to Z80/M80 assembly |
+| Compile | `dcc` | `.c` | `.MAC` | Parse typed AST, lower and verify MIR, then select Z80/M80 assembly |
 | Optimize | `dccpeep` | `.MAC` | `.MAC` | Local peephole rewriting of the asm |
 | Reduce runtime | `dccrtlstrip` | `DCCRTL.MAC` + app `.MAC` | `RTLMIN.MAC` | Keep only the runtime routines the app references |
-| Assemble | `M80` | `.MAC` | `.REL` | Object code (relocatable) |
-| Link | `L80` | `.REL` files | `.COM` | Resolve symbols into a CP/M executable |
+| Assemble | `m80c` or `M80` | `.MAC` | `.REL` | Object code (relocatable); `dccmake` uses native `m80c` by default |
+| Link | `l80c` or `L80` | `.REL` files | `.COM` | Resolve symbols into a CP/M executable; `dccmake` uses native `l80c` by default |
 
 The `dccpeep` stage is optional (`./scripts/ma.ps1 name -Mode nopeep` skips it
 when run from PowerShell in the DCC C Compiler checkout). `dccrtlstrip` runs against the
 *final* application assembly so it
 sees the real set of runtime symbols the program calls.
 
-## Compiler Shape
+## Compiler shape: front end, AST, and MIR
 
-DCC C Compiler's implementation is AST-driven for function bodies: statements and
-expressions are parsed into typed AST nodes, and the AST walker emits the Z80
-assembly. Code generation is a **single AST path** — every expression and
-statement, including local-declaration initializers, is lowered through the AST
-emitter (initializers build into an isolated arena so they never disturb the
-surrounding statement walk). The AST is "function-local" only in scope:
-top-level declarations, the preprocessor, and the global type/symbol tables
-remain direct table-driven front-end machinery rather than AST nodes.
+DCC C Compiler is an **AST/MIR compiler**. The recursive-descent front end
+builds typed AST nodes for function statements and expressions. Those transient
+nodes lower into one persistent MIR function before the AST arena is reused.
+Production function assembly is emitted from generated MIR candidates.
+
+Top-level declarations, global initializers, strings, and data/BSS placement
+remain table-driven because they are not function-body instructions.
 
 ```mermaid
 flowchart LR
-    SRC([".c source"]) --> PP["preprocess +<br/>#include splice"]
-    PP --> LEX["lexer<br/>(next_token)"]
-    LEX --> BUILD["dcc_ast_build.c<br/>build function-local AST"]
-    BUILD --> GEN["dcc_ast_gen*.c<br/>emit from AST"]
-    GEN --> ASM([".MAC assembly"])
+    SRC([".c source"]) --> PP["preprocessor + lexer"]
+    PPX["dcc_pp_expr.c<br/>#if / #elif"] -. evaluates .-> PP
+    PP --> PARSE["recursive-descent parser"]
+    PARSE --> AST["typed statement AST<br/>(transient arena)"]
+    AST --> LOWER["MIR lowering +<br/>metadata recording"]
+    LOWER --> REPAIR["deferred metadata repair<br/>and canonicalization"]
+    REPAIR --> VERIFY["CFG + verifier<br/>liveness + object promotion"]
+    VERIFY --> ALLOC["register homes + spills<br/>Z80 constraints"]
+    ALLOC --> SELECT["generated candidate<br/>selection + mir-v1 cost"]
+    SELECT --> ASM(["selected .MAC body"])
 ```
 
-The phases are:
+| Classic phase | DCC C Compiler implementation |
+| --- | --- |
+| Preprocessing / lexical analysis | Integrated macro engine and `next_token` lexer in `dcc_preproc.c`; `dcc_pp_expr.c` evaluates conditional directives |
+| Parsing | Recursive descent builds typed AST nodes against live symbol/type tables |
+| Intermediate representation | Persistent per-function MIR with virtual values, typed memory, calls, labels, branches, PHIs, VLA operations, and aggregate copies |
+| MIR analysis | Deferred metadata repair, CFG construction, verification, object promotion, liveness, target constraints, register homes, and spill-slot planning |
+| Instruction selection | Exact machine schedules plus general homed, hybrid/regional, and spilled CFG candidates |
+| Profitability | `mir-v1` compares generated candidates using machine instructions/bytes, helper/frame/spill costs, moves, branches, and loop weighting |
+| Machine-dependent cleanup | Standalone `dccpeep` fixpoint optimization over the selected assembly |
 
-| Classic phase | Conventional design | DCC C Compiler approach |
-| --- | --- | --- |
-| Lexical analysis | Separate tokenizer | `next_token` lexer in `dcc_preproc.c` (integrated with the preprocessor) |
-| Parsing | Build an AST | Recursive-descent parse into a function-local AST |
-| Semantic analysis | Walk the AST, annotate types | Done during AST construction against live symbol/type tables |
-| Intermediate representation | One or more IRs (e.g. three-address code, SSA) | **None** — C maps straight to Z80 |
-| Machine-independent optimization | Passes over the IR | Mostly absent by design; some peephole/idiom fast paths in codegen |
-| Code generation | Lower IR to target | AST walker emits Z80/M80 assembly through shared emit helpers |
-| Machine-dependent optimization | Target peephole pass | Separate program `dccpeep` over the emitted text |
+### Transient AST, persistent MIR
 
-### Typed expression lowering
+AST nodes retain C result type and effective operand type, so integer
+promotions, pointer scaling, long/float operations, bit-fields, and lvalue
+widths are decided before lowering. The MIR keeps those decisions after the AST
+arena is reset.
 
-The AST carries expression result types, so codegen can choose 16-bit, 32-bit,
-pointer, struct, or float lowering from the tree it is emitting — the full
-typed operand is always in hand before any code is emitted.
+MIR uses virtual values rather than source-register claims. Its instruction
+set represents constants, parameters, loads/stores, address/member/index
+formation, unary/binary operations, call-site-tagged arguments and calls,
+aggregate copies, labels, branches, jumps, edge-specific PHIs, returns, and VLA
+stack save/allocate/restore operations.
+
+### One production body walk
+
+`dcc_func.c` performs one production metadata/MIR walk for each function.
+Declarations are represented by stable placeholders because parser replay may
+discover initializers, renamed C99 loop variables, strings, inline temporaries,
+or VLA scope events after surrounding statements have already lowered.
+`dcc_ast_metadata.c` and `dcc_ast_stmt_meta.c` fill and position those events
+without generating a second assembly body.
+
+This separation is load-bearing:
+
+- declarations, scopes, VLA exits, labels, diagnostics, and debug events have
+  explicit non-emitting owners;
+- statement evaluation occurs once;
+- initializer side effects cannot be duplicated by metadata replay;
+- every production function body reaches instruction selection as verified MIR.
+
+### Verification, promotion, and allocation
+
+The verifier resolves labels, constructs instruction successors, rejects
+undefined or multiply defined virtual values, and solves backwards liveness.
+PHI operands are uses on their incoming CFG edges; call arguments remain live
+through the matching call-site ID.
+
+Conservative object promotion removes local/parameter loads only when every
+reachable predecessor agrees on the value. Unknown aliases, volatile accesses,
+opaque user assembly, calls, or ambiguous joins stop the proof.
+
+Allocation assigns lifetime homes in HL, DE, BC, or callee-saved IY, with
+deterministic spill slots when pressure or ABI constraints require them.
+Call-crossing ordinary values may use only IY. Fixed Z80 operand/result
+registers are boundary constraints, so the emitter inserts moves rather than
+precoloring a value for its whole lifetime.
+
+### Generated-only candidate selection
+
+Every candidate writes to its own temporary stream. A declining selector cannot
+leave partial text in the next candidate. Production then chooses among:
+
+- exact `scheduled-machine-cfg` kernels with complete structural proofs;
+- `homed-scalar-cfg`, including hybrid and regional-home variants;
+- the general `spilled-scalar-cfg` emitter.
+
+The `mir-v1` policy compares only generated MIR candidates.
+`DCC_MIR_REQUIRE_COMPLETE=1` and `DCC_MIR_REQUIRE_EMIT=1` are the strict
+semantic and generated-output boundaries.
+
+Proofs are deliberately conservative. Unknown, recursive, cyclic, volatile,
+aliased, or unsupported shapes decline an optimization, not MIR emission.
+
+### Refactor validation
+
+For behavior-preserving front-end or metadata refactors, compare raw compiler
+output and diagnostics before and after, then run the CP/M suite. For MIR
+selection changes, compare stack and no-stack census snapshots, run every app
+whose generated hash or metrics changed in peep and nopeep modes, and finish
+with strict full+extended stack and no-stack runs.
 
 ## Compiler Features
 
@@ -104,7 +184,7 @@ lock these messages and carets against exact baselines.
 | Preprocessor and include handling | `DCC-E0301`-`DCC-E0321` | malformed `#include`, unknown directives, unmatched `#elif`/`#else`/`#endif`, bad macro arity |
 | Constant expressions | `DCC-E0401`-`DCC-E0403` | non-constant expressions, division by zero, missing expression operands |
 | Struct/union/enum/type semantics | `DCC-E0501`-`DCC-E0540` | field designators, `offsetof`, bit-fields, duplicate enum constants, missing type names, multiple storage classes |
-| Array and pointer constraints | `DCC-E0601`-`DCC-E0602` | variable-length arrays, scalar subscripting |
+| Array and pointer constraints | `DCC-E0601`-`DCC-E0605` | unsupported variable inner dimensions, invalid bounds/object sizes, scalar subscripting |
 | Statement control flow | `DCC-E0701`-`DCC-E0706` | `break`/`continue` outside valid contexts, stray `case`/`default`, duplicate or undefined labels |
 | Functions and declarations | `DCC-E0801`-`DCC-E0806` | parameter declaration errors, redefinitions, too few or too many function-call arguments |
 | Initializers and assignment compatibility | `DCC-E0901`-`DCC-E0920` | invalid address initializers, non-constant initializers, string/array/struct initializer errors, integer-to-pointer assignment |
@@ -122,9 +202,9 @@ warn about arbitrary unreachable user statements. Instead, dead-code handling is
 pragmatic and size-focused at the points where the toolchain has reliable local
 knowledge:
 
-- **Dead expression results.** During AST lowering, expression statements and
-  condition-only contexts set internal "result is dead" state so the emitter can
-  choose forms that perform side effects without preserving an unused value.
+- **Dead MIR values and stores.** Lowering records side effects separately from
+  virtual results. Liveness, object promotion, and selector-local proofs can
+  omit unused values, dead stores, and rematerializable temporaries.
 - **Dead stores and labels in assembly.** `dccpeep` runs to a fixpoint over the
   emitted `.MAC` text. Among its cleanups are jump/label threading, jump-to-next
   removal, redundant load/store removal, and conservative dead IX-frame store
@@ -143,71 +223,101 @@ inline bodies, and unreferenced runtime support.
 
 ## Inside DCC C Compiler: module architecture
 
-The compiler is one binary built from focused modules that all share a single
-umbrella header, `dcc.h`. The parser, AST builder, AST emitter, and low-level
-emit helpers share file-scope compiler state (the source buffer, the lookahead
-token, the symbol/type tables, per-function codegen flags), so the natural
-layout is the classic single-binary compiler shape: **one shared header, many
-cooperating `.c` files**, with all mutable state defined once in `dcc_state.c`.
+The compiler is one binary built from focused modules. Foundational target
+types, shared data structures, and broadly used APIs live in `dcc.h`; narrower
+contracts live in subsystem `*_internal.h` headers. Shared compiler state is
+defined once in `dcc_state.c`; machine-family modules do not add shared data.
 
 ```mermaid
 graph TB
-    subgraph SHARED["Shared contract"]
-        H["dcc.h<br/>macros, types, externs, prototypes"]
-        STATE["dcc_state.c<br/>defines the shared globals"]
+    subgraph FE["Front end"]
+      DRIVER["dcc.c<br/>driver + CLI"]
+      PP["dcc_preproc.c / dcc_pp_expr.c<br/>preprocessor + lexer"]
+      PARSER["dcc_func.c / dcc_stmt.c<br/>declarations + statements"]
+      SEM["dcc_types.c / dcc_symbols.c<br/>types + symbols"]
     end
 
-    subgraph FE["1 - Front end"]
-        DRV["dcc.c<br/>driver, CLI, main()"]
-        PP["dcc_preproc.c<br/>preprocessor + lexer"]
-        DIAG["dcc_diag_emit.c<br/>diagnostics + emit"]
-        ASM["dcc_asmname.c<br/>C name -> asm symbol"]
+    subgraph AST["Transient typed AST"]
+      BUILD["dcc_ast_build.c"]
+      NODES["dcc_ast.c / dcc_ast.h"]
+      META["dcc_ast_metadata.c<br/>dcc_ast_stmt_meta.c"]
     end
 
-    subgraph TYP["2 - Types, symbols, constants"]
-        TYPES["dcc_types.c"]
-        SYM["dcc_symbols.c"]
-        CONST["dcc_constexpr.c"]
-        FOLD["dcc_fold.c"]
+    subgraph MIR["Persistent function MIR"]
+      CORE["dcc_mir.c<br/>lowering + repair + verifier"]
+      COMMON["dcc_mir_emit_common.c<br/>shared value emission"]
+      TARGET["dcc_mir_target.c / dcc_mir_schedule.c<br/>Z80 constraints + scheduling"]
     end
 
-    subgraph AST["3 - Function-local AST"]
-      ASTN["dcc_ast.c / dcc_ast.h"]
-      ASTB["dcc_ast_build.c"]
-      ASTG["dcc_ast_gen*.c<br/>(5 TUs)"]
+    subgraph BACK["Generated back ends"]
+      SELECT["dcc_mir_select.c<br/>candidate transaction + mir-v1"]
+      HOMED["dcc_mir_homed_cfg.c<br/>homed / hybrid / regional"]
+      SPILLED["dcc_mir_spilled_cfg.c<br/>general spilled CFG"]
+      MACHINE["dcc_mir_machine_*.c<br/>exact structural schedules"]
     end
 
-    subgraph CG["4 - Code generation helpers"]
-        EXPR["dcc_expr.c<br/>expressions, calls"]
-        OPS["dcc_ops.c<br/>arithmetic, bitwise"]
-        CMP["dcc_cmp.c<br/>compare, branch"]
-        ASSIGN["dcc_assign.c"]
-        STMT["dcc_stmt.c<br/>compound + switch helpers"]
-        DECL["dcc_decl.c<br/>local decls, initializers"]
+    subgraph OUT["Top level and data"]
+      INIT["dcc_global_init.c<br/>file-scope initializers"]
+      DATA["dcc_data.c<br/>strings, globals, BSS"]
+      ASM["selected function streams<br/>+ top-level assembly"]
     end
 
-    subgraph TOP["5 - Top level + output"]
-        FUNC["dcc_func.c<br/>functions, frame layout"]
-        DATA["dcc_data.c<br/>data-section emission"]
-    end
-
-    SHARED -.included by all.-> FE
-    FE ==> TYP ==> AST ==> CG ==> TOP
+    DRIVER --> PP --> PARSER --> BUILD --> CORE
+    SEM --> BUILD
+    NODES -.storage and typed nodes.-> BUILD
+    META -.declarations / scopes / VLA events.-> CORE
+    CORE --> TARGET --> SELECT
+    COMMON --> HOMED
+    COMMON --> SPILLED
+    SELECT --> HOMED
+    SELECT --> SPILLED
+    SELECT --> MACHINE
+    HOMED --> ASM
+    SPILLED --> ASM
+    MACHINE --> ASM
+    INIT --> DATA --> ASM
 ```
-
-The thick arrows are the dominant translation pipeline (front end → types →
-code generation → output). Within a stage the files are peers, and because
-every module sees the same prototypes through `dcc.h`, any module may call any
-other — the arrows show the usual direction, not a hard layering rule.
 
 | Group | Modules | Responsibility |
 | --- | --- | --- |
-| Shared | `dcc.h`, `dcc_state.c` | Contract + single definition of all shared state |
-| Front end | `dcc.c`, `dcc_preproc.c`, `dcc_diag_emit.c`, `dcc_asmname.c` | Driver/CLI, preprocessor + lexer, diagnostics + emit primitives, C-name-to-asm-symbol mapping |
+| Shared | `dcc.h`, `dcc_state.c`, subsystem `*_internal.h` files | Target model, shared contracts, and lifecycle-owned compiler state |
+| Front end | `dcc.c`, `dcc_preproc.c`, `dcc_pp_expr.c`, `dcc_func.c`, `dcc_stmt.c`, `dcc_diag_emit.c` | Driver, preprocessing/lexing, declarations/statements, frame scan, and diagnostics |
 | Types / symbols | `dcc_types.c`, `dcc_symbols.c`, `dcc_constexpr.c`, `dcc_fold.c` | Type system, symbol tables, constant-expression evaluation, constant folding |
-| Function-local AST | `dcc_ast.h`, `dcc_ast.c`, `dcc_ast_build.c`, `dcc_ast_gen.c` + `dcc_ast_gen_support.c` / `_expr.c` / `_cond.c` / `_stmt.c` (behind `dcc_ast_gen_internal.h`) | AST node storage, typed statement/expression building, and the AST-driven Z80 emitter — split into classifiers/type resolvers (`dcc_ast_gen.c`), the `ast_gen_supported` dispatch and folds (`_support.c`), expression emitters (`_expr.c`), condition/branch emitters (`_cond.c`), and switch/for/statement emitters (`_stmt.c`) |
-| Code generation helpers | `dcc_expr.c`, `dcc_ops.c`, `dcc_cmp.c`, `dcc_assign.c`, `dcc_stmt.c`, `dcc_decl.c`, `dcc_stmt_fast.c` | Shared low-level emit helpers — expression, operator, comparison, assignment, declaration, and compound-block/switch-table lowering — all invoked *by the AST emitter* |
-| Top level / output | `dcc_func.c`, `dcc_data.c` | Function/frame parsing and data-section emission |
+| Typed AST / metadata | `dcc_ast.c`, `dcc_ast_build.c`, `dcc_ast_gen*.c`, `dcc_ast_metadata.c`, `dcc_ast_stmt_meta.c` | Transient typed trees, semantic classifiers, and non-emitting declaration/scope replay |
+| Compatibility helpers | `dcc_expr.c`, `dcc_ops.c`, `dcc_cmp.c`, `dcc_assign.c`, `dcc_decl.c`, `dcc_stmt_fast.c`, `dcc_array_narrow.c` | Shared initializer/type behavior and conservative source proofs; not a production body emitter |
+| MIR core | `dcc_mir.c`, `dcc_mir_emit_common.c`, `dcc_mir_target.c`, `dcc_mir_schedule.c` | Persistent IR, metadata repair, CFG/verifier, liveness, target constraints, common emission |
+| MIR selection | `dcc_mir_select.c`, `dcc_mir_homed_cfg.c`, `dcc_mir_spilled_cfg.c` | Transactional generated candidates, homes/spills, and `mir-v1` selection |
+| Machine schedules | `dcc_mir_machine_emit.c`, `dcc_mir_machine_*.c` | Exact structural matchers and specialized Z80 streams |
+| Top level / output | `dcc_func.c`, `dcc_global_init.c`, `dcc_data.c` | Function/frame parsing, one production metadata/MIR body walk, global initializer recording, deferred static-body placement, and data-section emission |
+
+### Exact machine-schedule families
+
+`dcc_mir_machine_emit.c` owns common machine helpers and the order-sensitive
+dispatch. Cohesive schedules live in separately compiled families:
+
+| Family module | Responsibility |
+| --- | --- |
+| `dcc_mir_machine_attention.c` | Matrix, attention, and fixed-point kernels |
+| `dcc_mir_machine_numeric.c` | Integer, long, fixed-point, and math kernels |
+| `dcc_mir_machine_float_reports.c` | Float reports and checks |
+| `dcc_mir_machine_scanners.c` | Scan, parse, and traversal loops |
+| `dcc_mir_machine_aggregate_checks.c` | Aggregate, array, and struct checks |
+| `dcc_mir_machine_runtime_runners.c` | Runtime, file, and system orchestration |
+| `dcc_mir_machine_interpreter_runners.c` | Interpreter and parser runners |
+| `dcc_mir_machine_call_runners.c` | Call/control orchestration |
+| `dcc_mir_machine_validation_runners.c` | Scope, wide-value, and validation runners |
+| `dcc_mir_machine_endgame.c` | Large final exact schedule families |
+
+Machine families follow a zero-shared-state rule:
+
+- plans, candidates, and mutable matching state are automatic and attempt-local;
+- each family exports one dispatcher and no data;
+- module-local constant tables use internal linkage;
+- `dcc_mir_machine_internal.h` contains function contracts, not shared plan
+  storage.
+
+Run `scripts/audit-c-module-exports.py` after changing a module boundary. The
+audit must report only the allowed dispatcher and no exported data.
 
 ## Inside dccpeep: a fixpoint peephole optimizer
 
@@ -217,6 +327,26 @@ each one matches a short local instruction pattern and replaces it with a
 cheaper equivalent (for example folding a redundant store/reload, threading a
 jump-to-jump, turning an `ld`/`cp` against zero into `or a`, or replacing an
 absolute `jp` in range with a relative `jr`).
+
+The optimizer is split by responsibility. `peep_lines.c` owns storage,
+mutation, physical-line I/O, and opaque barriers for `; dcc user asm` regions;
+passes never rewrite or delete those user-authored lines. `peep_parse.c`
+contains stateless assembly parsers, `peep_effects.c` caches structured line,
+opcode, register, and flag metadata, and `peep_analyze.c` contains shared
+conservative register analysis. `peep_control_flow.c` owns versioned
+label/function indexes and bounded reachability queries. The main `dccpeep.c`
+file owns the descriptor-driven, order-sensitive fixed-point catalogue and
+remaining general passes. `PeepContext` groups program ownership, options,
+statistics, mutation versions, and cached indexes; compatibility globals
+preserve established pass signatures. `PeepEditTransaction` provides opt-in
+atomic commit/rollback for coupled rewrites.
+The high-volume local dispatcher, board/game idioms, loop registerization, and
+compiler-tagged temporary handling live in `peep_pass_once.c`,
+`peep_pass_minmax.c`, `peep_pass_loops.c`, and
+`peep_pass_inline_temp.c`. Label and branch rewrites live in
+`peep_pass_control_flow.c`. Post-convergence shared-helper rewrites and
+terminal cleanup live in `peep_pass_stubs.c` and `peep_pass_final.c`
+respectively, behind `dccpeep_internal.h`.
 
 dccpeep runs its rewrite catalogue to a **fixpoint** so one rewrite can expose
 the pattern another rewrite needs:
@@ -245,8 +375,17 @@ Key design points:
   canonical (un-folded) shape.
 - **Two optimization goals.** `-Ot` (default, "time") inlines helper sequences
   for speed; `-Os` ("size") factors recurring sequences into shared `call`
-  stubs to shrink the binary. The mode is chosen on the command line and
-  changes which post-convergence passes fire.
+  stubs to shrink the binary. Each helper family counts complete matches first
+  and fires only at its whole-program linked-stub break-even. The mode is
+  chosen on the command line and changes which post-convergence passes fire.
+- **Text safety is explicit.** Physical input lines are read without a fixed
+  length limit. Marked user-assembly regions become opaque label barriers while
+  optimization runs, then are restored byte-for-byte; address relaxation also
+  refuses to estimate across them.
+- **Direct observability.** `scripts/run-dccpeep-tests.ps1` checks focused
+  default, `-Os`, and undocumented-opcode fixtures plus idempotence. Optional
+  `-fstats` output reports convergence iterations, per-pass calls and changes,
+  and inserted/deleted line totals to stderr without changing normal output.
 
 !!! tip "Why a separate program instead of an in-compiler pass"
     Keeping the peephole optimizer as a standalone text-to-text filter keeps
@@ -341,10 +480,13 @@ the runtime and rebuilding the docs is all that is needed to refresh them.
 
 ## Architecture summary
 
-- the DCC C Compiler is an **AST-driven** C89 compiler for function bodies, with direct
-  lowering from typed AST nodes to Z80/M80 assembly.
-- Typed AST expression nodes drive mixed-width (16/32-bit, pointer, float)
-  codegen decisions from the tree being emitted.
+- DCC C Compiler is an **AST/MIR** C89-base compiler with selected C99/C11
+  additions. Typed AST nodes lower into persistent verified function MIR.
+- MIR owns CFG, PHIs, virtual values, object promotion, liveness, register
+  homes, spills, target constraints, and generated candidate selection.
+- Production function assembly comes only from MIR.
+- Exact machine families and general homed/spilled CFG emitters compete under
+  the generated-only `mir-v1` cost policy.
 - Machine-dependent optimization is split out into **`dccpeep`**, a
   fixpoint peephole optimizer over the assembly text, with separate time (`-Ot`)
   and size (`-Os`) strategies.
@@ -352,6 +494,7 @@ the runtime and rebuilding the docs is all that is needed to refresh them.
   ~297-line baseline), so every routine has a measurable
   `self`/`marginal` size cost and `dccrtlstrip` can link only the blocks a
   program references.
-- The back half of the pipeline reuses the proven off-the-shelf Microsoft
-  **`M80`/`L80`** assembler and linker, so DCC C Compiler never has to implement object
-  formats or relocation itself.
+- The back half of the pipeline uses native **`m80c`**/**`l80c`** (or
+  Microsoft **`M80`**/**`L80`** under `ntvcm`) for assembly and linking - a
+  shared LINK-80-compatible `.REL` object format that DCC C Compiler consumes
+  as a fixed target rather than needing to invent its own.
