@@ -230,7 +230,12 @@ build_clang() {
     local elf="$BUILD_DIR/clang_${upper}.elf"
     # Remove stale outputs so a failed compile/link can't masquerade as success.
     rm -f "$out" "$elf" "$BUILD_DIR/clang_${name}.o"
-    local cflags="--target=z80 -Os -fno-builtin -ffunction-sections -fdata-sections -nostdlib -nostartfiles -I $CPM_DIR"
+    # -ffreestanding: CP/M programs use BDOS directly, not a hosted C library.
+    # By C standard __STDC_HOSTED__ == 0 here. clang emits the "Freestanding"
+    # module flag which Z80NonReentrant uses to prove no cross-TU re-entry,
+    # enabling static-frame direct addressing (~35% speedup on div-heavy code
+    # like e.c; see ravn/llvm-z80#244).
+    local cflags="--target=z80 -Os -ffreestanding -fno-builtin -ffunction-sections -fdata-sections -nostdlib -nostartfiles -I $CPM_DIR"
     # Runtime objects are shared; rebuild them each time (cheap, always fresh).
     "$clang" $cflags -c "$CPM_DIR/cpm_crt0.s"   -o "$BUILD_DIR/clang_crt0.o"   2>/dev/null || return 1
     "$clang" $cflags -c "$CPM_DIR/cpm_io.c"     -o "$BUILD_DIR/clang_io.o"     2>/dev/null || return 1
