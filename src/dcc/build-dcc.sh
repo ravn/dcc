@@ -10,9 +10,8 @@
 #   sh src/dcc/build-dcc.sh            # build ./dcc at the repo root
 #   sh src/dcc/build-dcc.sh -o out/dcc # build to a custom path
 #
-# The companion peephole/runtime tools are built by mmacos.sh / m.sh / m.bat
-# from src/dccpeep/dccpeep.c and src/dccrtlstrip/dccrtlstrip.c; this script
-# only builds the modular dcc front end.
+# The canonical `scripts/build-dcc.ps1` build owns the complete host toolchain;
+# this internal helper only builds the modular dcc front end.
 
 set -e
 
@@ -26,7 +25,25 @@ if [ -z "$CC" ]; then
         *)      CC=gcc ;;
     esac
 fi
-CFLAGS=${CFLAGS:--std=c11 -Wall -Wextra -O2 -g}
+# -O3 -flto=auto measured ~3.8% faster dcc-compile throughput than -O2 on
+# gcc/Linux (non-overlapping across 3 interleaved A/B rounds via
+# scripts/runall.ps1 -TimingBreakdown), with build time itself unaffected
+# (=auto lets LTRANS parallelize across cores - plain -flto without a job
+# count falls back to serial LTRANS, which measured ~7x slower to build).
+#
+# clang measured its own, larger win from -O3 alone (~5.75%, non-overlapping
+# across 3 rounds on Ubuntu clang-14/WSL) - but -flto=thin on top of that
+# added no measurable further improvement (heavily overlapping ranges)
+# while costing ~2x build time, so LTO is not enabled for clang here.
+#
+# MSVC keeps the -O2 baseline this script and build-dcc.ps1 have always
+# used - MSVC's /GL+/LTCG has a different cost/benefit tradeoff that
+# hasn't been measured on this project.
+case "$CC" in
+    *gcc*)   CFLAGS=${CFLAGS:--std=c11 -Wall -Wextra -O3 -flto=auto -g} ;;
+    *clang*) CFLAGS=${CFLAGS:--std=c11 -Wall -Wextra -O3 -g} ;;
+    *)       CFLAGS=${CFLAGS:--std=c11 -Wall -Wextra -O2 -g} ;;
+esac
 
 # On macOS, clang can emit large tentative definitions into __DATA,__common
 # with very high alignment (for large objects), which triggers an ld warning

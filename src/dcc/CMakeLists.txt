@@ -13,6 +13,10 @@
 cmake_minimum_required(VERSION 3.10)
 project(dcc C)
 
+option(DCC_ENABLE_COVERAGE "Build dcc with Clang source coverage instrumentation" OFF)
+set(DCC_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH
+    "Directory in which to place the dcc executable")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -52,10 +56,11 @@ set(DCC_SOURCES
     dcc_ast_metadata.c  # non-emitting function-body metadata replay
     dcc_ast_gen.c           # AST classifiers / type & lvalue resolvers
     dcc_ast_gen_support.c   # AST support dispatch, calls/structs/folds
-    dcc_ast_gen_expr.c      # AST expression emitters
-    dcc_ast_gen_cond.c      # AST condition and branch emitters
+    dcc_ast_gen_expr.c      # AST initializer capture and inline metadata
+    dcc_ast_gen_cond.c      # AST statement/condition classification gates
     dcc_ast_stmt_meta.c     # AST statement parsing/sizing metadata
     dcc_mir.c               # analysis-only virtual-register MIR prototype
+    dcc_mir_verify.c
     dcc_mir_emit_common.c
     dcc_mir_homed_cfg.c
     dcc_mir_machine_emit.c # scheduled Z80 machine-template emission
@@ -69,9 +74,16 @@ set(DCC_SOURCES
     dcc_mir_machine_float_reports.c # strict float report/check schedules
     dcc_mir_machine_numeric.c # strict numeric kernel schedules
     dcc_mir_machine_scanners.c # strict scanner/parser schedules
+    dcc_mir_machine_containers.c # array/stack/append/row-store kernels
+    dcc_mir_machine_wide_records.c # wide-value and record-oriented kernels
+    dcc_mir_machine_structural_checks.c # structural/literal validation kernels
+    dcc_mir_machine_float_recursion.c # float polynomial and recursive kernels
+    dcc_mir_machine_byte_scans.c # byte/row scanning and fill kernels
+    dcc_mir_machine_constant_folding.c # constant-folding and result-switch kernels
     dcc_mir_select.c
     dcc_mir_schedule.c      # shadow sparse live-segment scheduler
     dcc_mir_spilled_cfg.c
+    dcc_mir_stream.c        # transactional in-memory candidate streams
     dcc_mir_target.c        # shadow Z80 constraints and template costs
 )
 
@@ -80,11 +92,82 @@ add_executable(dcc ${DCC_SOURCES} dcc.h dcc_ast_gen_internal.h
                    dcc_mir_machine_internal.h)
 target_include_directories(dcc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+if(DCC_ENABLE_COVERAGE)
+    if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang")
+        message(FATAL_ERROR "DCC_ENABLE_COVERAGE currently requires Clang")
+    endif()
+    target_compile_options(dcc PRIVATE
+        -Wall -Wextra -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+    set_property(TARGET dcc APPEND_STRING PROPERTY
+        LINK_FLAGS " -fprofile-instr-generate")
+elseif(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(dcc PRIVATE -Wall -Wextra -O2)
 endif()
 
 # Place the built binary at the repository root as ./dcc so the existing
 # ma.sh / runall.sh harness (which calls ./dcc) keeps working unchanged.
 set_target_properties(dcc PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+    RUNTIME_OUTPUT_DIRECTORY ${DCC_RUNTIME_OUTPUT_DIRECTORY})
+
+option(DCC_BUILD_MIR_TESTS "Build host-side MIR verifier regressions" OFF)
+if(DCC_BUILD_MIR_TESTS)
+    enable_testing()
+    set(DCC_MIR_TEST_SOURCES ${DCC_SOURCES})
+    list(REMOVE_ITEM DCC_MIR_TEST_SOURCES dcc.c)
+    add_executable(mir-verify-test
+        ../../tests/host/mir_verify.c ${DCC_MIR_TEST_SOURCES})
+    target_include_directories(mir-verify-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_executable(mir-scalar-dag-test
+        ../../tests/host/mir_scalar_dag.c ${DCC_MIR_TEST_SOURCES})
+    target_include_directories(
+        mir-scalar-dag-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_executable(mir-selector-isolation-test
+        ../../tests/host/mir_selector_isolation.c
+        ${DCC_MIR_TEST_SOURCES})
+    target_include_directories(
+        mir-selector-isolation-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_executable(mir-consteval-isolation-test
+        ../../tests/host/mir_consteval_isolation.c
+        ${DCC_MIR_TEST_SOURCES})
+    target_include_directories(
+        mir-consteval-isolation-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_executable(mir-vla-smooth-isolation-test
+        ../../tests/host/mir_vla_smooth_isolation.c
+        ${DCC_MIR_TEST_SOURCES})
+    target_include_directories(
+        mir-vla-smooth-isolation-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(
+        mir-vla-smooth-isolation-test PRIVATE
+        DCC_MIR_VLA_SMOOTH_ISOLATION_TEST=1)
+    if(DCC_ENABLE_COVERAGE)
+        target_compile_options(mir-verify-test PRIVATE
+            -Wall -Wextra -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+        set_property(TARGET mir-verify-test APPEND_STRING PROPERTY
+            LINK_FLAGS " -fprofile-instr-generate")
+        target_compile_options(mir-scalar-dag-test PRIVATE
+            -Wall -Wextra -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+        set_property(TARGET mir-scalar-dag-test APPEND_STRING PROPERTY
+            LINK_FLAGS " -fprofile-instr-generate")
+        target_compile_options(mir-selector-isolation-test PRIVATE
+            -Wall -Wextra -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+        set_property(TARGET mir-selector-isolation-test APPEND_STRING PROPERTY
+            LINK_FLAGS " -fprofile-instr-generate")
+        target_compile_options(mir-consteval-isolation-test PRIVATE
+            -Wall -Wextra -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+        set_property(TARGET mir-consteval-isolation-test APPEND_STRING PROPERTY
+            LINK_FLAGS " -fprofile-instr-generate")
+        target_compile_options(mir-vla-smooth-isolation-test PRIVATE
+            -Wall -Wextra -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+        set_property(TARGET mir-vla-smooth-isolation-test APPEND_STRING PROPERTY
+            LINK_FLAGS " -fprofile-instr-generate")
+    endif()
+    add_test(NAME mir-verify COMMAND mir-verify-test)
+    add_test(NAME mir-scalar-dag COMMAND mir-scalar-dag-test)
+    add_test(
+        NAME mir-selector-isolation COMMAND mir-selector-isolation-test)
+    add_test(
+        NAME mir-consteval-isolation COMMAND mir-consteval-isolation-test)
+    add_test(
+        NAME mir-vla-smooth-isolation
+        COMMAND mir-vla-smooth-isolation-test)
+endif()

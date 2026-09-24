@@ -1,151 +1,21 @@
-/* peep_pass_minmax.c - application-specific board/game passes.
+/**
+ * @file peep_pass_minmax.c
+ * @brief Optimizes exact board-game and minimax assembly idioms.
  *
- * These passes target patterns emitted by the bundled ttt/chess sample
- * programs (the _MinMax, _FindSolution, board, winner, and posn-function
- * idioms). They are opt-in by pattern match: each declines unless it finds
- * the exact application shape, so they are inert on ordinary programs.
+ * @par Role
+ * Implements the bundled ttt/chess pattern family for MinMax/FindSolution
+ * frames and calls, label-reload elimination, and winner checks.
+ *
+ * @par Key entry points
+ * pass_minmax_pack_frame(), pass_minmax_pack_call(),
+ * pass_minmax_elim_label_reload(), and pass_winner_check_dec_a().
+ *
+ * @par Boundary
+ * Rewrites require exact application symbols, function context, or narrowly
+ * emitted shapes, so unrelated programs remain inert. General loop, branch,
+ * and local-pattern passes belong to their dedicated modules.
  */
 #include "dccpeep_internal.h"
-
-static int peep_is_pos_func_label(const char *s)
-{
-    if (s[0] == '_' &&
-        s[1] == 'p' &&
-        s[2] == 'o' &&
-        s[3] == 's' &&
-        strstr(s, "func:") != NULL)
-        return 1;
-
-    if (strcmp(s, "_LookForWinner:") == 0)
-        return 1;
-
-    return 0;
-}
-
-int pass_posfunc_b_cache(void)
-{
-    int i, j, end;
-    int changed;
-    int has_call;
-    int has_ix1_store_after_setup;
-    int setup_ld_a;
-    int setup_store;
-    int setup_kind;
-
-    changed = 0;
-
-    for (i = 0; i < nlines; i++) {
-        if (!peep_is_pos_func_label(lines[i]))
-            continue;
-
-        end = i + 1;
-        while (end < nlines && !peep_is_public_line(lines[end]))
-            end++;
-
-        /* line_clobbers_bc (not a bare "call " scan) so "call __stchk" -
-         * present in every function's prologue under the default
-         * -fstack-check build - doesn't block this pass on its own; see
-         * line_clobbers_bc's own comment for why that call specifically
-         * never touches B/C. Without this exemption, this pass could
-         * never fire on any stack-checked build at all. */
-        has_call = 0;
-        for (j = i + 1; j < end; j++) {
-            if (line_clobbers_bc(lines[j])) {
-                has_call = 1;
-                break;
-            }
-        }
-        if (has_call)
-            continue;
-
-        /* Two possible preambles land x = *(hl) into (ix-1): the classic
-         * "ld a,(hl); ld (ix-1),a" (2 lines, setup_kind 1), or the
-         * ix-direct declaration-initializer fast path's "ld l,(hl);
-         * ld h,0; ld (ix-1),l" (3 lines, setup_kind 2 - dcc_decl.c emits
-         * a 16-bit-typed load/store even for a byte-sized x, zero-
-         * extending into h - see pass_posfunc_collapse_b_setup's own
-         * comment on the same shape). Both just mean B ends up holding
-         * x's byte value once collapsed. */
-        setup_ld_a = -1;
-        setup_store = -1;
-        setup_kind = 0;
-
-        for (j = i + 1; j + 1 < end; j++) {
-            if (eq(j, "ld a,(hl)") && eq(j + 1, "ld (ix-1),a")) {
-                setup_ld_a = j;
-                setup_store = j + 1;
-                setup_kind = 1;
-                break;
-            }
-            if (j + 2 < end &&
-                eq(j, "ld l,(hl)") && eq(j + 1, "ld h,0") &&
-                eq(j + 2, "ld (ix-1),l")) {
-                setup_ld_a = j;
-                setup_store = j + 2;
-                setup_kind = 2;
-                break;
-            }
-        }
-
-        if (setup_ld_a < 0)
-            continue;
-
-        /* "cp (ix-1)" is a pure read (Z80's CP never writes its operand),
-         * exactly like "ld a,(ix-1)"/"ld l,(ix-1)" - x compared against a
-         * board byte loaded into A is at least as common a source order
-         * as x loaded into A first, once dcc's comparison codegen picks
-         * which operand to load first. */
-        has_ix1_store_after_setup = 0;
-        for (j = setup_store + 1; j < end; j++) {
-            if (strstr(lines[j], "(ix-1)") != NULL &&
-                strcmp(lines[j], "ld a,(ix-1)") != 0 &&
-                strcmp(lines[j], "ld l,(ix-1)") != 0 &&
-                strcmp(lines[j], "cp (ix-1)") != 0) {
-                has_ix1_store_after_setup = 1;
-                break;
-            }
-        }
-        if (has_ix1_store_after_setup)
-            continue;
-
-        /* Remove the one-byte local allocation if present in the prologue. */
-        for (j = i + 1; j < setup_ld_a; j++) {
-            if (eq(j, "dec sp")) {
-                delete_n(j, 1);
-                end--;
-                setup_ld_a--;
-                setup_store--;
-                changed = 1;
-                break;
-            }
-        }
-
-        replace1(setup_ld_a, "ld b,(hl)");
-        if (setup_kind == 1) {
-            delete_n(setup_store, 1);
-            end--;
-        } else {
-            delete_n(setup_ld_a + 1, 2);
-            end -= 2;
-        }
-        changed = 1;
-
-        for (j = setup_ld_a + 1; j < end; j++) {
-            if (eq(j, "ld a,(ix-1)")) {
-                replace1(j, "ld a,b");
-                changed = 1;
-            } else if (eq(j, "ld l,(ix-1)")) {
-                replace1(j, "ld l,b");
-                changed = 1;
-            } else if (eq(j, "cp (ix-1)")) {
-                replace1(j, "cp b");
-                changed = 1;
-            }
-        }
-    }
-
-    return changed;
-}
 
 int peep_in_function_range(const char *func, int *startp, int *endp)
 {
@@ -193,492 +63,59 @@ int peep_range_has_debug_annotations(int start, int end)
     return 0;
 }
 
-int pass_minmax_winner_result_no_temp(void)
+/* Keep MinMax's byte return directly in A while restoring the packed-loop
+ * state.  POP BC, POP HL, the board clear, and BIT do not alter A, so the
+ * two branch-local reloads from E are redundant. */
+int pass_minmax_return_score_in_a(void)
 {
-    int start;
-    int end;
-    int i;
-    int j;
-    int changed;
+    int start, end, i;
 
-    changed = 0;
-
-    if (!peep_in_function_range("_MinMax:", &start, &end))
-        return 0;
-    if (peep_range_has_debug_annotations(start, end))
+    if (!peep_in_function_range("_MinMax:", &start, &end) ||
+        peep_range_has_debug_annotations(start, end))
         return 0;
 
-    /*
-     * The winner-function result is returned in L.  The generated code stores
-     * it into ix-3, tests it, then reloads ix-3 to compare with PieceX.
-     * But ix-3 is later overwritten with the loop variable p=0, and the
-     * zero/PieceX tests do not need the spill.
-     *
-     * Accept both old and new dispatch cleanup shapes:
-     *
-     *     call __call_hl
-     *     ld (ix-3),l
-     *
-     * and:
-     *
-     *     call __call_hl
-     *     pop bc
-     *     ld (ix-3),l
-     */
-    for (i = start; i + 5 < end; ++i) {
-        if (!eq(i, "call __call_hl"))
+    for (i = start; i + 7 < end; ++i) {
+        int j, label_line, refs;
+        char label[128], target[128], before[MAX_LINE];
+
+        if (!eq(i, "ld e,l") || !eq(i + 1, "pop bc") ||
+            !eq(i + 2, "pop hl") || !eq(i + 3, "ld (hl),0") ||
+            !eq(i + 4, "bit 0,(ix+6)"))
+            continue;
+        if (strncmp(lines[i + 5], "jr z,", 5) &&
+            strncmp(lines[i + 5], "jp z,", 5))
+            continue;
+        if (!jump_target_any(lines[i + 5], label) || !eq(i + 6, "ld a,e"))
+            continue;
+        label_line = find_label_line_in_range(label, i + 7, end);
+        if (label_line < 0 || label_line + 1 >= end ||
+            !eq(label_line + 1, "ld a,e"))
             continue;
 
-        j = i + 1;
-        while (j < end && eq(j, "pop bc"))
-            ++j;
-
-        if (j + 4 < end &&
-            eq(j, "ld (ix-3),l") &&
-            eq(j + 1, "ld a,l") &&
-            eq(j + 2, "or a") &&
-            strncmp(lines[j + 3], "jp z,", 5) == 0 &&
-            eq(j + 4, "ld a,(ix-3)")) {
-            delete_n(j, 1);
-            end--;
-            replace1_tagged(j + 3, "ld a,l", "winner_result_no_temp");
-            changed = 1;
-            if (i > start)
-                --i;
-        }
-    }
-
-    return changed;
-}
-
-int pass_minmax_score_b_cache(void)
-{
-    int start;
-    int end;
-    int i;
-    int j;
-    int changed;
-    char tmp[MAX_LINE];
-
-    changed = 0;
-
-    if (!peep_in_function_range("_MinMax:", &start, &end))
-        return 0;
-    if (peep_range_has_debug_annotations(start, end))
-        return 0;
-
-    /*
-     * In the uint8_t MinMax variant, score is stored in the byte local ix-4
-     * immediately after the recursive call:
-     *
-     *     call _MinMax
-     *     pop bc ...
-     *     ld (ix-4),l
-     *
-     * From there until the next recursive call, it is only read as
-     *     ld a,(ix-4)
-     * and no calls occur.  Keep it in E instead (B is reserved for the loop
-     * counter p in pass_minmax_loop_ctr_b).  This also lets the frame shrink
-     * from 4 bytes to 3 bytes after all ix-4 references disappear.
-     */
-    for (i = start; i < end; ++i) {
-        if (!eq(i, "ld (ix-4),l"))
+        /* Only the depth split may enter the even branch, and the odd arm
+         * must not fall through into it after changing A. */
+        refs = 0;
+        for (j = start; j < end; ++j)
+            if (jump_target_any(lines[j], target) && !strcmp(target, label))
+                ++refs;
+        if (refs != 1 || label_line == 0)
             continue;
-
-        /* Make sure this really follows the recursive call cleanup. */
-        j = i - 1;
-        while (j > start && eq(j, "pop bc"))
-            --j;
-        if (!eq(j, "call _MinMax"))
+        strip_peep_comment_copy(before, lines[label_line - 1]);
+        if ((strncmp(before, "jr ", 3) && strncmp(before, "jp ", 3)) ||
+            strchr(before, ',') != NULL)
             continue;
-
-        replace1_tagged(i, "ld e,l", "minmax_score_e");
-
-        for (j = i + 1; j < end; ++j) {
-            if (eq(j, "call _MinMax"))
+        for (j = i + 6; j < label_line; ++j)
+            if (j != i + 6 && line_touches_de(lines[j]))
                 break;
+        if (j < label_line)
+            continue;
 
-            strip_peep_comment_copy(tmp, lines[j]);
-            if (!strcmp(tmp, "ld a,(ix-4)")) {
-                replace1_tagged(j, "ld a,e", "minmax_score_e");
-                changed = 1;
-                continue;
-            }
-
-            /*
-             * Be conservative.  If some future code writes ix-4 or loads it
-             * in a non-A form, stop caching for this region.
-             */
-            if (strstr(tmp, "(ix-4)") != NULL)
-                break;
-        }
-
-        changed = 1;
+        replace1_tagged(i, "ld a,l", "minmax_return_score_a");
+        delete_n(label_line + 1, 1);
+        delete_n(i + 6, 1);
+        return 1;
     }
-
-    return changed;
-}
-
-/*
- * pass_minmax_loop_ctr_b:
- *
- * Move the MinMax blank-cell loop counter p from the IX frame slot (ix-3)
- * into register B.  This drops the loop overhead from ~59T to ~25T per
- * iteration by replacing slow IX-relative loads/stores with register ops.
- *
- * Requires pass_minmax_score_e to have already moved score from B to E,
- * freeing B for the loop counter.
- *
- * Replacements within _MinMax:
- *   ld (ix-3),0  →  ld b,0          (init)
- *   ld e,(ix-3)  →  ld e,b          (address compute: 19T → 4T)
- *   ld l,(ix-3)  →  ld l,b          (push move arg: 19T → 4T)
- *   inc (ix-3)   →  inc b           (loop increment: 23T → 4T)
- *   ld a,(ix-3)  →  ld a,b          (loop test: 19T → 4T)
- *
- * After "call _MinMax; pop bc×N; ld e,l", the 4th pop has already left
- * p in C (the move argument was pushed as L=p, H=0, so pop bc gives C=p).
- * Insert "ld b,c" to restore the loop counter from C.
- */
-int pass_minmax_loop_ctr_b(void)
-{
-    int start, end, i, changed = 0;
-    char tmp[MAX_LINE];
-
-    if (!peep_in_function_range("_MinMax:", &start, &end))
-        return 0;
-    if (peep_range_has_debug_annotations(start, end))
-        return 0;
-
-    /* Only run after:
-     * (a) pass_minmax_score_e committed: ld e,l present, ld b,l absent.
-     * (b) pass_minmax_winner_result_no_temp cleaned up: no ld (ix-3),l store.
-     *     That store is the winner-result spill; until it is removed, some
-     *     ld a,(ix-3) references belong to the winner check, not the loop
-     *     counter, and must not be replaced with ld a,b. */
-    {
-        int has_score_e = 0, has_score_b = 0;
-        for (i = start; i < end; i++) {
-            strip_peep_comment_copy(tmp, lines[i]);
-            if (!strcmp(tmp, "ld e,l"))      has_score_e = 1;
-            if (!strcmp(tmp, "ld b,l"))      has_score_b = 1;
-            if (!strcmp(tmp, "ld (ix-3),l")) return 0; /* winner spill still present */
-        }
-        if (!has_score_e || has_score_b) return 0;
-    }
-
-    /* _MinMax is an ordinary function like any other: dcc's own reg_alloc
-     * could in principle have claimed BC for a whole-function candidate
-     * here too, and this pass has no visibility into that. The whole
-     * [start,end) range is being claimed for B, not just one loop, so the
-     * range form is what is needed - a point query at `end` would now miss
-     * a claim that opens and closes inside the range. */
-    if (bc_regalloc_claimed_in_range(start, end))
-        return 0;
-
-    /* Replace all (ix-3) loop-counter references with B.
-     * All are 1-for-1 replacements so nlines and end are unchanged. */
-    for (i = start; i < end; i++) {
-        strip_peep_comment_copy(tmp, lines[i]);
-
-        if (!strcmp(tmp, "ld (ix-3),0")) {
-            replace1_tagged(i, "ld b,0", "minmax_loop_ctr_b");
-            changed = 1;
-        } else if (!strcmp(tmp, "ld e,(ix-3)")) {
-            replace1_tagged(i, "ld e,b", "minmax_loop_ctr_b");
-            changed = 1;
-        } else if (!strcmp(tmp, "ld l,(ix-3)")) {
-            replace1_tagged(i, "ld l,b", "minmax_loop_ctr_b");
-            changed = 1;
-        } else if (!strcmp(tmp, "inc (ix-3)")) {
-            replace1_tagged(i, "inc b", "minmax_loop_ctr_b");
-            changed = 1;
-        } else if (!strcmp(tmp, "ld a,(ix-3)")) {
-            replace1_tagged(i, "ld a,b", "minmax_loop_ctr_b");
-            changed = 1;
-        }
-    }
-
-    /* After "pop bc × N; ld e,l", insert "ld b,c" to recover the loop
-     * counter from C.  The 4th pop bc left p in C because the move arg
-     * was pushed as L=p, H=0, so pop bc gives B=0, C=p. */
-    for (i = start; i < end - 1; i++) {
-        strip_peep_comment_copy(tmp, lines[i]);
-        if (strcmp(tmp, "ld e,l") != 0) continue;
-
-        if (!eq(i - 1, "pop bc")) continue;   /* must follow a pop bc */
-
-        strip_peep_comment_copy(tmp, lines[i + 1]);
-        if (!strcmp(tmp, "ld b,c")) continue;  /* already inserted */
-        if (!strcmp(tmp, "pop bc")) continue;  /* pass_minmax_value_c replaced it */
-
-        insert_line_tagged(i + 1, "ld b,c", "minmax_loop_ctr_b");
-        end++;
-        changed = 1;
-    }
-
-    return changed;
-}
-
-/*
- * pass_minmax_value_c:
- *
- * Move the MinMax "value" variable from the IX frame slot (ix-1) into
- * register C.  Requires pass_minmax_loop_ctr_b to have already moved the
- * loop counter to B and score to E, freeing C.
- *
- * Replacements within _MinMax:
- *   ld (ix-1),2/9  →  ld c,2/9       (init before loop)
- *   cp (ix-1)      →  cp c            (score vs value: 15T → 4T)
- *   ld (ix-1),a    →  ld c,a          (value = score: 19T → 4T)
- *   ld a,(ix-1)    →  ld a,c          (load value: 19T → 4T)
- *   ld l,(ix-1)    →  ld l,c          (return value: 19T → 4T)
- *
- * Call save/restore: B=p and C=value must survive the recursive call.
- * Insert "push bc" after the board-address push (before arg pushes).
- * Replace the existing "ld b,c" (loop counter recovery) with "pop bc"
- * which simultaneously restores both B=p and C=value.
- *
- * Also shrinks the frame from 2 to 1 byte (only ix-2 = pieceMove remains):
- * pass_shrink_minmax_frame1_after_value_c handles that.
- */
-int pass_minmax_value_c(void)
-{
-    int start, end, i, changed = 0;
-    char tmp[MAX_LINE];
-
-    if (!peep_in_function_range("_MinMax:", &start, &end))
-        return 0;
-    if (peep_range_has_debug_annotations(start, end))
-        return 0;
-
-    /* Guard: pass_minmax_loop_ctr_b must have committed (ld b,c present,
-     * no (ix-3) remaining).  If (ix-1) is already gone, nothing to do. */
-    {
-        int has_bc = 0, has_ix1 = 0;
-        for (i = start; i < end; i++) {
-            strip_peep_comment_copy(tmp, lines[i]);
-            if (!strcmp(tmp, "ld b,c"))        has_bc  = 1;
-            if (strstr(lines[i], "(ix-3)"))    return 0; /* loop_ctr_b not done */
-            if (strstr(lines[i], "(ix-1)"))    has_ix1 = 1;
-        }
-        if (!has_bc || !has_ix1) return 0;
-    }
-
-    /* Transitively covered by pass_minmax_loop_ctr_b's own guard today (the
-     * "ld b,c" this pass requires above only exists if that pass already
-     * committed), but checked explicitly anyway rather than relying on that
-     * chain never changing. Range form: C is claimed across all of
-     * [start,end). */
-    if (bc_regalloc_claimed_in_range(start, end))
-        return 0;
-
-    /* Replace (ix-1) value references with C. */
-    for (i = start; i < end; i++) {
-        strip_peep_comment_copy(tmp, lines[i]);
-
-        if (!strcmp(tmp, "ld (ix-1),2")) {
-            replace1_tagged(i, "ld c,2", "minmax_value_c"); changed = 1;
-        } else if (!strcmp(tmp, "ld (ix-1),9")) {
-            replace1_tagged(i, "ld c,9", "minmax_value_c"); changed = 1;
-        } else if (!strcmp(tmp, "cp (ix-1)")) {
-            replace1_tagged(i, "cp c",   "minmax_value_c"); changed = 1;
-        } else if (!strcmp(tmp, "ld (ix-1),a")) {
-            replace1_tagged(i, "ld c,a", "minmax_value_c"); changed = 1;
-        } else if (!strcmp(tmp, "ld a,(ix-1)")) {
-            replace1_tagged(i, "ld a,c", "minmax_value_c"); changed = 1;
-        } else if (!strcmp(tmp, "ld l,(ix-1)")) {
-            replace1_tagged(i, "ld l,c", "minmax_value_c"); changed = 1;
-        }
-    }
-
-    /* Insert "push bc" (save B=p, C=value) after the board-address push
-     * and before the move-arg setup.  The board-address push is the "push hl"
-     * that is immediately followed by "ld l,b" (move arg setup). */
-    for (i = start; i < end - 1; i++) {
-        strip_peep_comment_copy(tmp, lines[i]);
-        if (strcmp(tmp, "push hl") != 0) continue;
-
-        strip_peep_comment_copy(tmp, lines[i + 1]);
-        if (strcmp(tmp, "ld l,b") != 0) continue;
-
-        insert_line_tagged(i + 1, "push bc", "minmax_value_c");
-        end++;
-        changed = 1;
-        i++;
-    }
-
-    /* Replace "ld b,c" (old loop counter recovery) with "pop bc" which
-     * now restores both B=p and C=value from the "push bc" inserted above.
-     * Pattern: "ld e,l" immediately followed by "ld b,c". */
-    for (i = start; i < end - 1; i++) {
-        strip_peep_comment_copy(tmp, lines[i]);
-        if (strcmp(tmp, "ld e,l") != 0) continue;
-
-        strip_peep_comment_copy(tmp, lines[i + 1]);
-        if (strcmp(tmp, "ld b,c") != 0) continue;
-
-        replace1_tagged(i + 1, "pop bc", "minmax_value_c");
-        changed = 1;
-    }
-
-    return changed;
-}
-
-/*
- * pass_minmax_board_ptr_loop:
- *
- * In _MinMax, after the loop counter has been moved to B, the hot blank-cell
- * scan still recomputes &_g_board[B] at every iteration:
- *
- *   ld b,0
- * Lloop:
- *   ld hl,_g_board
- *   ld e,b
- *   ld d,0
- *   add hl,de
- *   ld a,(hl)
- *   or a
- *   jp nz,Ltail
- *   ... recursive call, with HL saved/restored as the board-cell pointer ...
- * Ltail:
- *   inc b
- *   ld a,b
- *   cp 9
- *   jp c,Lloop
- *
- * HL is the current board-cell pointer on every path reaching Ltail: the
- * occupied-cell path never changes it, and the recursive path restores it via
- * pass_minmax_save_board_addr.  Initialize HL once and walk it with inc hl.
- */
-int pass_minmax_board_ptr_loop(void)
-{
-    int start, end, i, j;
-    char loop_lab[128], tail_lab[128], got_lab[128];
-    char cond[16];
-
-    if (!peep_in_function_range("_MinMax:", &start, &end))
-        return 0;
-    if (peep_range_has_debug_annotations(start, end))
-        return 0;
-
-    for (i = start; i + 8 < end; i++) {
-        if (!eq(i, "ld b,0")) continue;
-        if (!label_name_at(i + 1, loop_lab)) continue;
-        if (!eq(i + 2, "ld hl,_g_board")) continue;
-        if (!eq(i + 3, "ld e,b")) continue;
-        if (!eq(i + 4, "ld d,0")) continue;
-        if (!eq(i + 5, "add hl,de")) continue;
-        if (!eq(i + 6, "ld a,(hl)")) continue;
-        if (!eq(i + 7, "or a")) continue;
-        if (!peep_parse_any_cond_jump(lines[i + 8], cond, tail_lab)) continue;
-        if (strcmp(cond, "nz") != 0) continue;
-
-        for (j = i + 9; j + 4 < end; j++) {
-            if (!label_name_at(j, got_lab) || strcmp(got_lab, tail_lab) != 0)
-                continue;
-            if (!eq(j + 1, "inc b")) continue;
-            if (!eq(j + 2, "ld a,b")) continue;
-            if (!eq(j + 3, "cp 9")) continue;
-            if (!peep_parse_any_cond_jump(lines[j + 4], cond, got_lab)) continue;
-            if (strcmp(cond, "c") != 0 || strcmp(got_lab, loop_lab) != 0) continue;
-
-            insert_line_tagged(j + 1, "inc hl", "minmax_board_ptr_loop");
-            insert_line_tagged(i + 1, "ld hl,_g_board", "minmax_board_ptr_loop");
-            delete_n(i + 3, 4);
-            return 1;
-        }
-    }
-
     return 0;
-}
-
-/*
- * Collapse MinMax's byte-sized return paths, then restore the declared
- * 16-bit int contract once at the shared epilogue. MIR callers can consume
- * the complete HL value even though the recursive hot path only needs L.
- */
-int pass_minmax_byte_returns(void)
-{
-    int start, end, i, changed = 0;
-    char exit_label[128];
-    char tmp[MAX_LINE];
-    int exit_label_line = -1;
-
-    if (!peep_in_function_range("_MinMax:", &start, &end))
-        return 0;
-    if (peep_range_has_debug_annotations(start, end))
-        return 0;
-
-    for (i = end - 1; i >= start; i--) {
-        strip_peep_comment_copy(tmp, lines[i]);
-        if (strcmp(tmp, "ld sp,ix") == 0 && i > start) {
-            int k = i - 1;
-            while (k >= start) {
-                strip_peep_comment_copy(tmp, lines[k]);
-                if (starts_label(lines[k])) {
-                    if (label_name_at(k, exit_label))
-                        exit_label_line = k;
-                    break;
-                }
-                k--;
-            }
-            break;
-        }
-    }
-    if (exit_label_line < 0)
-        return 0;
-
-    for (i = start; i + 1 < end; i++) {
-        if (!eq(i, "ld h,0"))
-            continue;
-        strip_peep_comment_copy(tmp, lines[i + 1]);
-        {
-            char lab[128];
-            if (peep_parse_jp_uncond_label(tmp, lab) &&
-                strcmp(lab, exit_label) == 0) {
-                delete_n(i, 1);
-                end--;
-                exit_label_line--;
-                changed = 1;
-                if (i > start)
-                    i--;
-            }
-        }
-    }
-
-    for (i = start; i + 1 < end; i++) {
-        if (!eq(i, "ld h,0"))
-            continue;
-        if (line_is_label_name(i + 1, exit_label)) {
-            delete_n(i, 1);
-            end--;
-            exit_label_line--;
-            changed = 1;
-            if (i > start)
-                i--;
-        }
-    }
-
-    for (i = start; i + 1 < end; i++) {
-        int imm;
-        char lab[128];
-        if (!peep_parse_ld_hl_0_to_255(lines[i], &imm))
-            continue;
-        strip_peep_comment_copy(tmp, lines[i + 1]);
-        if (!peep_parse_jp_uncond_label(tmp, lab) ||
-            strcmp(lab, exit_label) != 0)
-            continue;
-        sprintf(tmp, "ld l,%d", imm);
-        replace1_tagged(i, tmp, "minmax_byte_ret");
-        changed = 1;
-    }
-
-    if (changed) {
-        insert_line_tagged(
-            exit_label_line + 1, "ld h,0", "minmax_word_return");
-    }
-    return changed;
 }
 
 /* Helper: replace first occurrence of 'from' in 'buf' with 'to' (may differ in length). */
@@ -691,33 +128,53 @@ static void pack_str_replace(char *buf, const char *from, const char *to)
     memcpy(p, to, tl);
 }
 
-/* pass_minmax_pack_frame: Phase 1 only.
- * Translate ix+6→ix+5 (beta), ix+8→ix+6 (depth), ix+10→ix+7 (move)
- * within _MinMax to prepare for the packed 2-word calling convention.
- * Fires only while (ix+10) still exists.
- *
- * This guard alone is NOT sufficient to fire safely: it says nothing
- * about whether pass_minmax_pack_call can actually collapse either call
- * site (the recursive self-call, or FindSolution's call into _MinMax) to
- * match the new packed offsets this pass is about to commit the frame
- * to. If this pass translates the frame while pass_minmax_pack_call
- * can't complete both call sites, the callee ends up reading parameters
- * at the new packed offsets while a caller still pushes the old unpacked
- * layout - a real caller/callee ABI mismatch (every parameter read
- * inside MinMax then comes from the wrong stack slot). Confirmed via a
- * corrupted tests/ttt.c run (radically wrong move counts) caused by an
- * unrelated, individually-correct codegen change that merely inserted
- * one harmless instruction between the recursive call and its cleanup -
- * enough to break pass_minmax_pack_call's exact-adjacency match while
- * this pass's own looser guard still fired.
- *
- * Rather than duplicating pass_minmax_pack_call's shape-matching logic
- * here (which would just create a second place to keep in sync - the
- * same mistake that let this happen in the first place), this pass
- * applies its translation, then immediately tries pass_minmax_pack_call
- * for real. If that fails to change anything, the translation is
- * reverted line-for-line and this pass declines entirely, so the two
- * always commit or decline together. */
+/* After the winner dispatch, MinMax's incoming move byte is dead: recursive
+ * children use the loop counter B as their own move argument.  Reuse that
+ * packed parameter byte for pieceMove and remove the otherwise dedicated
+ * two-byte local frame. */
+int pass_minmax_reuse_dead_move_slot(void)
+{
+    int start, end, i, alloc = -1, last_move_read = -1, first_local = -1;
+    int local_refs = 0, move_refs_after = 0;
+    char rewritten[MAX_LINE];
+
+    if (!peep_in_function_range("_MinMax:", &start, &end) ||
+        peep_range_has_debug_annotations(start, end))
+        return 0;
+
+    for (i = start; i + 1 < end; ++i) {
+        if (eq(i, "dec sp") && eq(i + 1, "dec sp") && alloc < 0)
+            alloc = i;
+        if (strstr(lines[i], "(ix+7)"))
+            last_move_read = i;
+        if (strstr(lines[i], "(ix-2)")) {
+            if (first_local < 0)
+                first_local = i;
+            ++local_refs;
+            if (!eq(i, "ld (ix-2),a") && !eq(i, "ld a,(ix-2)"))
+                return 0;
+        }
+    }
+    if (alloc < 0 || last_move_read < 0 || first_local <= last_move_read ||
+        local_refs != 3)
+        return 0;
+    for (i = first_local; i < end; ++i)
+        if (strstr(lines[i], "(ix+7)"))
+            ++move_refs_after;
+    if (move_refs_after)
+        return 0;
+
+    for (i = start; i < end; ++i) {
+        if (!strstr(lines[i], "(ix-2)"))
+            continue;
+        strcpy(rewritten, lines[i]);
+        pack_str_replace(rewritten, "(ix-2)", "(ix+7)");
+        replace1_tagged(i, rewritten, "minmax_reuse_move_slot");
+    }
+    delete_n(alloc, 2);
+    return 1;
+}
+
 int pass_minmax_pack_frame(void)
 {
     int start, end, i, changed = 0;
@@ -1063,131 +520,6 @@ int pass_minmax_pack_call(void)
     return changed && recursive_changed && find_solution_changed;
 }
 
-/*
- * pass_minmax_save_board_addr:
- *
- * In MinMax's blank-cell loop, &g_board[p] is computed twice: once before
- * storing pieceMove and once after the recursive call to restore the cell.
- * The address is in HL right after the first store, but HL is immediately
- * clobbered by the arg setup for the recursive call.
- *
- * Before:
- *   ld (hl),a                    ; g_board[p] = pieceMove  — HL = &g_board[p]
- *   ld l,(ix-K)                  ; arg setup clobbers HL
- *   ... (push 4 args)
- *   call _MinMax
- *   pop bc (×N)
- *   ld e,l                       ; save score (E, not B — B is loop counter)
- *   ld hl,_g_board               ; recompute &g_board[p]
- *   ld e,(ix-K)
- *   ld d,0
- *   add hl,de
- *   ld (hl),0                    ; g_board[p] = 0
- *
- * After:
- *   ld (hl),a
- *   push hl                      ; save address before arg clobber
- *   ld l,(ix-K)
- *   ... (push 4 args)
- *   call _MinMax
- *   pop bc (×N)
- *   ld b,l
- *   pop hl                       ; restore address — replaces 4-insn recompute
- *   ld (hl),0
- *
- * Saves 47T (recompute) − 21T (push hl + pop hl) = 26T per blank cell visited.
- */
-int pass_minmax_save_board_addr(void)
-{
-    int start, end, i, j, changed = 0;
-    int K, k2, npopcnt;
-    char addr[128], tmp[MAX_LINE];
-
-    if (!peep_in_function_range("_MinMax:", &start, &end))
-        return 0;
-    if (peep_range_has_debug_annotations(start, end))
-        return 0;
-
-    for (i = start; i + 12 < end; i++) {
-        /* ld (hl),a — store pieceMove; HL = &g_board[p] */
-        if (!eq(i, "ld (hl),a")) continue;
-
-        /* Next must be ld l,(ix-K) — arg setup about to clobber HL */
-        if (!stride_parse_ld_r_ix_neg(lines[i + 1], 'l', &K)) continue;
-
-        /* Scan forward for call _MinMax (within 20 lines) */
-        for (j = i + 2; j < end && j < i + 20; j++)
-            if (eq(j, "call _MinMax")) break;
-        if (!eq(j, "call _MinMax")) continue;
-        j++;
-
-        /* Count consecutive pop bc */
-        npopcnt = 0;
-        while (j < end && eq(j, "pop bc")) { j++; npopcnt++; }
-        if (npopcnt == 0) continue;
-
-        /* ld e,l — score save (possibly tagged; E used by pass_minmax_score_e) */
-        strip_peep_comment_copy(tmp, lines[j]);
-        if (strcmp(tmp, "ld e,l") != 0) continue;
-        j++;
-
-        /* Recompute block: ld hl,_g_board; ld e,(ix-K); ld d,0; add hl,de */
-        if (!parse_ld_hl_imm(lines[j], addr, sizeof(addr))) continue;
-        if (strcmp(addr, "_g_board") != 0)                   continue;
-        j++;
-        if (!stride_parse_ld_r_ix_neg(lines[j], 'e', &k2))  continue;
-        if (k2 != K)                                         continue;
-        j++;
-        if (!eq(j, "ld d,0"))                               continue;
-        j++;
-        if (!eq(j, "add hl,de"))                            continue;
-        j++;
-
-        /* ld (hl),0 — restore board cell */
-        if (!eq(j, "ld (hl),0")) continue;
-
-        /* Pattern matched. Transform:
-         * - delete the 4-line recompute (at j-4 .. j-1)
-         * - insert pop hl before ld (hl),0
-         * - insert push hl after ld (hl),a (at i+1)
-         * Apply end-to-start to keep earlier indices valid. */
-        delete_n(j - 4, 4);
-        insert_line_tagged(j - 4, "pop hl", "minmax_save_board_addr");
-        insert_line(i + 1, "push hl");
-        changed = 1;
-    }
-
-    return changed;
-}
-
-int pass_reuse_board_addr_for_zero_store(void)
-{
-    int i;
-    int changed;
-    char lab[128];
-
-    changed = 0;
-
-    for (i = 0; i + 13 < nlines; ++i) {
-        if (eq(i, "ld hl,_g_board") &&
-            eq(i + 1, "ld e,(ix-3)") &&
-            eq(i + 2, "ld d,0") &&
-            eq(i + 3, "add hl,de") &&
-            eq(i + 4, "ld a,(hl)") &&
-            (eq(i + 5, "or a") || eq(i + 5, "cp 0")) &&
-            peep_parse_jp_cond_label(lines[i + 6], "nz", lab) &&
-            eq(i + 7, "ld hl,_g_board") &&
-            eq(i + 8, "ld e,(ix-3)") &&
-            eq(i + 9, "ld d,0") &&
-            eq(i + 10, "add hl,de")) {
-            delete_n(i + 7, 4);
-            changed = 1;
-            if (i > 0) --i;
-        }
-    }
-
-    return changed;
-}
 
 /*
  * pass_minmax_elim_label_reload:
@@ -1400,119 +732,6 @@ int pass_winner_check_dec_a(void)
 
         replace1_tagged(i + 2, "dec a", "winner_dec_a");
         changed = 1;
-    }
-
-    return changed;
-}
-
-int pass_global_board_const_offsets(void)
-{
-    int i;
-    int changed;
-    int incs;
-    int k;
-    int imm;
-    char line[160];
-
-    changed = 0;
-
-    for (i = 0; i < nlines; ++i) {
-        /*
-         * Collapse constant-index global board addressing:
-         *
-         *     ld hl,_g_board
-         *     inc hl
-         *     inc hl
-         *     cp (hl)
-         *
-         * into:
-         *
-         *     ld hl,_g_board+2
-         *     cp (hl)
-         *
-         * and:
-         *
-         *     ld hl,_g_board
-         *     ld de,5
-         *     add hl,de
-         *
-         * into:
-         *
-         *     ld hl,_g_board+5
-         *
-         * This is safe because it only changes address formation; HL still
-         * contains the same address before the following memory operation.
-         */
-        if (eq(i, "ld hl,_g_board")) {
-            incs = 0;
-            k = i + 1;
-            while (k < nlines && eq(k, "inc hl")) {
-                ++incs;
-                ++k;
-            }
-
-            if (incs > 0) {
-                sprintf(line, "ld hl,_g_board+%d", incs);
-                replace1_tagged(i, line, "global_const_offset");
-                delete_n(i + 1, incs);
-                changed = 1;
-                if (i > 0)
-                    --i;
-                continue;
-            }
-
-            if (i + 2 < nlines &&
-                peep_parse_ld_de_0_to_255(lines[i + 1], &imm) &&
-                eq(i + 2, "add hl,de")) {
-                if (imm == 0)
-                    sprintf(line, "ld hl,_g_board");
-                else
-                    sprintf(line, "ld hl,_g_board+%d", imm);
-                replace1_tagged(i, line, "global_const_offset");
-                delete_n(i + 1, 2);
-                changed = 1;
-                if (i > 0)
-                    --i;
-                continue;
-            }
-        }
-
-        /*
-         * Same collapse, mirrored operand order - the constant index
-         * loaded into HL first, the board base into DE second:
-         *
-         *     ld hl,6
-         *     ld de,_g_board
-         *     add hl,de
-         *
-         * into:
-         *
-         *     ld hl,_g_board+6
-         *
-         * "add hl,de" is commutative (hl+de == de+hl), so this forms the
-         * identical address; only which operand the front-end happened to
-         * evaluate first differs. This is the shape a constant array
-         * index typically compiles to (index in HL, base loaded after and
-         * added) - the base-first form above is comparatively rare, so
-         * every occurrence of this mirrored form was previously left as
-         * the full 3-instruction computation instead of the one-line
-         * direct-address form.
-         */
-        if (peep_parse_ld_hl_0_to_255(lines[i], &imm) &&
-            i + 2 < nlines &&
-            eq(i + 1, "ld de,_g_board") &&
-            eq(i + 2, "add hl,de")) {
-            if (imm == 0)
-                sprintf(line, "ld hl,_g_board");
-            else
-                sprintf(line, "ld hl,_g_board+%d", imm);
-            replace1_tagged(i, line, "global_const_offset");
-            delete_n(i + 1, 2);
-            changed = 1;
-            if (i > 0)
-                --i;
-            continue;
-        }
     }
 
     return changed;

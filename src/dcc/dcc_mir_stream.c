@@ -1,6 +1,10 @@
-/*
- * dcc_mir_stream.c - implementation of the portable in-memory scratch
- * stream declared in dcc_mir_stream.h. See that header for rationale.
+/**
+ * @file dcc_mir_stream.c
+ * @brief Implements the in-memory stream used for isolated MIR candidates.
+ *
+ * @par Role
+ * Owns the growable buffer and the FILE-like read, write, seek, rewind, copy,
+ * and final-file transfer operations declared in dcc_mir_stream.h.
  */
 
 #include "dcc_mir_stream.h"
@@ -146,19 +150,28 @@ int mir_stream_getc(MirStream *stream)
 
 int mir_stream_seek(MirStream *stream, long offset, int whence)
 {
-    long base;
-    long target;
+    size_t base;
+    size_t target;
+    uintmax_t distance;
 
     switch (whence) {
     case SEEK_SET: base = 0; break;
-    case SEEK_CUR: base = (long)stream->position; break;
-    case SEEK_END: base = (long)stream->length; break;
+    case SEEK_CUR: base = stream->position; break;
+    case SEEK_END: base = stream->length; break;
     default: return -1;
     }
-    target = base + offset;
-    if (target < 0)
-        return -1;
-    stream->position = (size_t)target;
+    if (offset < 0) {
+        distance = (uintmax_t)(-(offset + 1)) + 1;
+        if (distance > (uintmax_t)base)
+            return -1;
+        target = base - (size_t)distance;
+    } else {
+        distance = (uintmax_t)offset;
+        if (distance > (uintmax_t)(stream->length - base))
+            return -1;
+        target = base + (size_t)distance;
+    }
+    stream->position = target;
     return 0;
 }
 

@@ -1,5 +1,20 @@
-/*
- * dcc_ast_stmt_meta.c - statement parsing, sizing, and metadata analysis.
+/**
+ * @file dcc_ast_stmt_meta.c
+ * @brief Coordinates statement acceptance, MIR capture, and metadata analysis.
+ *
+ * @par Role
+ * Builds and support-checks one statement, captures accepted semantics into
+ * MIR, runs the non-emitting metadata walk, and tracks fallthrough/re-entry
+ * behavior. It also owns scan-mode statement sizing and loop metadata plans
+ * that reserve safe optimization temporaries.
+ *
+ * @par Key entry points
+ * ast_process_statement(), ast_scan_for_stmt(), ast_stmt_exits(),
+ * ast_stmt_has_reentry_label(), and ast_plan_for_metadata().
+ *
+ * @par Boundary
+ * Statement legality classifiers live in dcc_ast_gen_cond.c; final body Z80
+ * comes from a selected MIR candidate rather than this orchestration layer.
  */
 #include <string.h>
 #include "dcc_ast_gen_internal.h"
@@ -365,6 +380,16 @@ int ast_stmt_exits(const struct AstNode *n)
     case AST_CONTINUE:
     case AST_GOTO:
         return 1;
+    case AST_EXPR_STMT:
+        /* These C library functions do not return to their caller.  Treat a
+         * direct call used as the final statement like a return so valid
+         * wrappers around longjmp/exit/abort do not receive a false
+         * "control reaches end" warning. */
+        return n->a != NULL && n->a->kind == AST_CALL &&
+               n->a->a != NULL && n->a->a->kind == AST_IDENT &&
+               (!strcmp(n->a->a->sval, "longjmp") ||
+                !strcmp(n->a->a->sval, "exit") ||
+                !strcmp(n->a->a->sval, "abort"));
     case AST_SWITCH: {
         /* Exits only when every path through the body is forced to reach a
          * point that itself exits: a default case must exist (otherwise an
@@ -440,7 +465,7 @@ void ast_record_debug_location(const char *file, int line)
 {
     const char *p;
 
-    if (!opt_debug || scan_mode || line <= 0)
+    if (!DEBUG_METADATA_ENABLED || scan_mode || line <= 0)
         return;
     if (mir_capture_debug_location(file, line))
         return;

@@ -9,9 +9,26 @@ Include [`string.h`](14-string.md) for byte-string and raw memory operations.
 ## Runtime model
 
 The string and memory functions operate on byte strings and raw byte buffers.
-`strcoll` is equivalent to `strcmp`; the DCC C Compiler has no locale model.
+In the fixed [`C` locale](17-locale.md), `strcoll` is equivalent to `strcmp`
+and `strxfrm` uses the identity transform.
 
 ## String and memory operations
+
+String functions require NUL-terminated input and sufficient destination
+storage. `strlen` excludes the NUL. Comparisons promise a negative, zero, or
+positive result, not specifically `-1`, `0`, or `1`.
+
+- Use `memmove` when source and destination overlap; `memcpy` requires
+    non-overlapping objects. Memory functions operate on exact byte counts and
+    do not stop at NUL.
+- `strcpy` and `strcat` have no capacity argument. Include space for the
+    terminating NUL when allocating the destination.
+- `strncpy(dst, src, n)` pads a short source with NULs, but does **not**
+    terminate the result when the source has at least `n` characters.
+- `strncat` limits characters appended, not total destination capacity. It
+    still writes a terminating NUL after them.
+- `strchr`, `strrchr`, `strstr`, and `memchr` return pointers into the input
+    object or `NULL`; they do not allocate a copy.
 
 ```c
 #include <string.h>
@@ -41,3 +58,8 @@ while (tok) {
     Most string routines link nothing extra, but `strdup` allocates, so it
     inherits the whole `malloc` chain. See the
     [appendix](../appendix/01-dccrtlstrip.md).
+
+`strdup` and ASCII-only `stricmp` are extensions, not C89 functions. Check
+`strdup` for `NULL` and release successful copies with `free`. `strtok` keeps
+one internal parsing cursor, so interleaving tokenization of separate strings
+overwrites the earlier scan state.

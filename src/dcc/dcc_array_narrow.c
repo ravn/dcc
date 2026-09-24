@@ -1,14 +1,21 @@
-/*
- * dcc_array_narrow.c - conservative proof engine for narrowing eligible local
- * int arrays, register scalars, and for-loop counters to unsigned char.
+/**
+ * @file dcc_array_narrow.c
+ * @brief Proves when selected local integers can use unsigned-byte storage.
  *
- * The proof checks that every stored value is non-negative and <=255 and that
- * no writable alias escapes its scope. Dependencies are discovered
- * coinductively, then every write is verified against the small supported rule
- * set (literals, bounded arithmetic, group references, array reads, and simple
- * no-argument calls). Unknown shapes, aliases, recursive calls, or exhausted
- * limits decline narrowing; they never guess. Normal byte codegen then handles
- * accepted candidates without a separate lowering path.
+ * @par Role
+ * Conservatively analyzes function-local ASTs for bounded writes, dependency
+ * groups, alias escape, simple call results, and exact counting-loop shapes.
+ * It covers eligible arrays, register scalars, and for-loop counters and
+ * declines unknown, recursive, aliased, or over-limit cases.
+ *
+ * @par Key entry points
+ * narrow_array_is_byte_safe(), narrow_scalar_is_byte_safe(), and
+ * narrow_for_counter_is_byte_safe().
+ *
+ * @par Boundary
+ * This module proves safety only; callers choose storage and perform normal
+ * byte lowering. It neither mutates the source tree nor emits a production
+ * function body.
  */
 
 #include "dcc.h"
@@ -941,6 +948,27 @@ static void narrow_collect_deps(const struct AstNode *n, struct NarrowGroup *kno
  * check (narrow_name_escapes): a bare, non-indexed occurrence of an array
  * name decays to a pointer and is an escape, but a bare occurrence of a
  * scalar name is an ordinary read/use, not an escape. */
+static int narrow_name_used_by_sizeof(const struct AstNode *n,
+                                      const char *name)
+{
+    int i;
+
+    if (n == NULL)
+        return 0;
+    if (n->kind == AST_SIZEOF_EXPR && n->a != NULL &&
+        n->a->kind == AST_IDENT && !strcmp(n->a->sval, name))
+        return 1;
+    if (narrow_name_used_by_sizeof(n->a, name) ||
+        narrow_name_used_by_sizeof(n->b, name) ||
+        narrow_name_used_by_sizeof(n->c, name) ||
+        narrow_name_used_by_sizeof(n->d, name))
+        return 1;
+    for (i = 0; i < n->list_len; ++i)
+        if (narrow_name_used_by_sizeof(n->list[i], name))
+            return 1;
+    return 0;
+}
+
 static int narrow_is_byte_safe_impl(const struct AstNode *scope, const char *name,
                                     int is_array)
 {
@@ -951,6 +979,8 @@ static int narrow_is_byte_safe_impl(const struct AstNode *scope, const char *nam
     int i;
 
     if (scope == NULL || scope->kind != AST_COMPOUND)
+        return 0;
+    if (is_array && narrow_name_used_by_sizeof(scope, name))
         return 0;
 
     group.n = 0;

@@ -1,26 +1,38 @@
-/*
- * dcc_ast.h - function-local abstract syntax tree for dcc.
+/**
+ * @file dcc_ast.h
+ * @brief Defines dcc's function-local AST and its shared frontend API.
  *
- * dcc now lowers function bodies through a function-local AST.  The parser
- * builds one statement/expression tree at a time, then hands it to the AST
- * codegen walker.  Nothing outside a function is represented here (top-level
- * declarations, types, structs and the preprocessor keep using the existing
- * tables) - hence "function-local".
+ * @par Role
+ * Declares arena storage, node kinds and payloads, constructors, parsers,
+ * semantic classifiers, statement analysis, and metadata entry points. The
+ * parser builds one statement or expression tree at a time; production
+ * function semantics are captured into MIR, while post-parse AST traversal
+ * preserves declarations, scopes/VLAs, inline temporaries, strings, labels,
+ * diagnostics, and debug events.
  *
- * Design constraints:
- *   - Portable C11 source for modern Clang, GCC, and MSVC host compilers.
- *   - Must be able to drive the shared emit_* helpers,
- *     so the AST records exactly the information those helpers need (resolved
- *     struct Sym*, dcc type codes, operator token kinds, folded literals).
- *   - Arena-allocated and reset per function so there is no per-node free and
- *     no long-lived heap growth across a translation unit.
+ * @par Design
+ * Nodes are arena-allocated and use fixed generic child slots plus optional
+ * child lists. They carry resolved symbols, dcc type codes, operators, folded
+ * literals, and source locations needed by MIR lowering and metadata replay.
+ * Top-level declarations, types, structs, and preprocessing remain outside
+ * this function-local representation.
  *
- * The node payload is a deliberately small, fixed struct with a handful of
- * generic child slots (a..d) plus an optional child LIST (for compound-
- * statement bodies and call argument lists).  This keeps construction cheap
- * and avoids a sprawling tagged union while still expressing every C89
- * construct dcc accepts, including its C99 extensions (for-init declarations,
- * mid-block declarations, // comments are a lexer concern and need no node).
+ * @par Module map
+ * - dcc_ast.c: arena ownership, node construction, and small tree queries.
+ * - dcc_ast_build.c: token-to-AST expression and statement parsing.
+ * - dcc_ast_stmt_meta.c: statement gating, MIR capture, sizing, exit analysis.
+ * - dcc_ast_metadata.c: non-emitting declaration/scope/debug metadata replay.
+ * - dcc_ast_gen.c: type, lvalue, pointer, member, and index classifiers.
+ * - dcc_ast_gen_support.c: support gates, constant folds, structural proofs.
+ * - dcc_ast_gen_expr.c: initializer capture, inline metadata, expression
+ *   helpers.
+ * - dcc_ast_gen_cond.c: statement/condition gates and branch-shape helpers.
+ * - dcc_ast_gen_internal.h: private contract shared by the split modules.
+ *
+ * @par Boundary
+ * The dcc_ast_gen* helpers do not provide a production body-codegen fallback.
+ * dcc_mir.h exposes function capture; dcc_mir_select.c owns generated
+ * candidate selection.
  */
 #ifndef DCC_AST_H
 #define DCC_AST_H
@@ -94,6 +106,7 @@ enum AstKind {
 struct AstNode {
     int kind;               /* enum AstKind                                */
     int type;               /* dcc type code of an expression's result     */
+    unsigned int pointee_volatile_mask;
     int op;                 /* operator token kind (unary/binary/assign)   */
     long ival;              /* integer/char literal, case value, label id  */
     unsigned long uval;     /* float bits or other unsigned payload        */
@@ -213,21 +226,26 @@ int ast_for_mod_fill_supported(const struct AstNode *n, struct Sym **out_arr,
 int ast_expr_references_ident(const struct AstNode *n, const char *name);
 int ast_expr_has_side_effects(const struct AstNode *n);
 
+/* True if `n` provably yields exactly 0 or 1 on its own: a bool-typed
+ * subexpression, a 0/1 integer literal, `!`, a comparison operator, `&&`/
+ * `||`, or a cast to bool - the same proof dcc_ast_gen_expr.c trusts
+ * elsewhere for an RHS being stored into a bool. Used by dcc_func.c to gate
+ * inlining a bool-returning function's return expression, since splicing it
+ * directly at a call site bypasses AST_RETURN's own 0/1 canonicalization. */
+int ast_expr_yields_bool01(const struct AstNode *n);
+
 /* Byte-memory word-packing idiom (mem_get_word/mem_set_word-shaped code -
  * see dcc_ast_gen_support.c for the full rationale): `arr[E] | (arr[E+1]
  * << 8)` for a read, `arr[E] = lo; arr[E+1] = hi;` for a write, where E is
  * a non-trivial shared index expression currently recomputed twice. */
-int ast_index_exprs_structurally_equal(const struct AstNode *a, const struct AstNode *b);
-int ast_index_expr_is_plus_one(const struct AstNode *base_expr, const struct AstNode *plus_one);
-const struct AstNode *ast_byte_pair_word_read_match(const struct AstNode *n);
-int ast_byte_pair_word_write_match(const struct AstNode *s1, const struct AstNode *s2,
-                                   const struct AstNode **out_lo, const struct AstNode **out_s2_assign);
 
 /* Recursive, side-effect-free static type inference for an expression node -
  * originally written for sizeof, general-purpose enough to reuse anywhere a
  * node's result type is needed before/without running its codegen (e.g.
  * deciding whether a multiply subexpression is float-valued for fusion). */
 int ast_expr_type_for_sizeof(const struct AstNode *n);
+int ast_call_result_type(const struct AstNode *n);
+struct Sym *ast_indirect_call_proto_sym(const struct AstNode *n);
 
 /* Compute the constant byte size of a `sizeof expr` operand, and (separately)
  * detect when that operand is a whole variable-length array.  Both resolve
@@ -328,13 +346,14 @@ const char *ast_kind_name(int kind);
 void ast_dump(const struct AstNode *n, int depth);
 
 /* ------------------------------------------------------------------------- *
- * AST-driven code generation.
+ * AST support/classification queries.
  *
- * AST codegen is the compiler's only codegen path.  Set DCC_AST_REPORT to log
- * per-statement emit/unsupported diagnostics to stderr.
+ * Production function bodies come only from selected, verified MIR. These
+ * queries classify supported source shapes and gate diagnostics; they do not
+ * emit code. Set DCC_AST_REPORT to log per-statement classification
+ * diagnostics to stderr.
  * ------------------------------------------------------------------------- */
 int ast_gen_supported(const struct AstNode *n);
-void ast_gen_expr(const struct AstNode *n);   /* emit; sets g_expr_type        */
 int ast_stmt_supported(const struct AstNode *n);
 int ast_stmt_has_reentry_label(const struct AstNode *n);
 int ast_stmt_exits(const struct AstNode *n);
@@ -349,6 +368,7 @@ void ast_support_cache_begin(void);
 /* Pure-AST emission of a declaration initializer's assignment-expression.
  * Builds into the isolated g_ast_init_arena; fatal on unsupported constructs. */
 void ast_emit_init_expr(void);
+void ast_emit_discarded_expr(void);
 void ast_emit_struct_init_expr_assign(struct Sym *s);
 
 /* Statement hook.  Called from gen_statement to build the next statement from

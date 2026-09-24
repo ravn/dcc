@@ -15,7 +15,12 @@ DCCRTL.MAC is the dcc C Runtime Library. It's written in Z80 assembly for size a
 
 dccrtlstrip.c is an app that examines the code of your .c file and strips portions of the DCCRTL.MAC C runtime so only the parts needed are linked into the .COM file. It's not necessary to run this program for your app to work. But the resulting .COM file may be smaller if you do.
 
-The 3 compiler apps dcc, dccpeep, and dccrtlstrip all build and run on Windows, Linux, and MacOS. They are too big to run on CP/M. Use m.bat, m.sh, mmacos.sh to build these apps using msvc (Windows), gcc (Linux), or clang (MacOS) respectively. You may need to chmod 777 *.sh on Linux and MacOS prior to running dcc's scripts.
+The complete host toolchain builds and runs on Windows, Linux, and macOS with
+`pwsh ./scripts/build-dcc.ps1`. It builds `dcc`, `dccpeep`, `dccrtlstrip`,
+`dccmake`, `m80c`, `l80c`, `dcc-debug-host`, and the example debugger I/O
+adapter. The host tools are too large to run on CP/M. On Linux platforms
+without a PowerShell package (RISC-V64 boards, Raspberry Pi OS, etc.),
+`sh m-posix.sh` builds the same tools using only `/bin/sh` and a C compiler.
 
 Dcc has been built and had regression tests run on AMD64 (Linux and Windows), Arm64(Linux, Windows, MacOS), Arm32 (Linux), and RISC-V 64 (Linux).
 
@@ -35,7 +40,7 @@ Two reference documents in the [docs](docs) directory cover the runtime in depth
 ## Development machine for modifying dcc
 DCC is intended to be updated by app-writers to better optimize their apps. Typically a dev would point an AI at the code for their app and the code for dcc then ask the AI to profile the app and change dcc to generate better code for the app's scenario.
 
-The inner loop of iterating on improving performance is governed by the speed of your dev machine. Running the full regression suite to ensure nothing was broken can take seconds or minuted depending on your hardware and OS choice. Not surprisingly, more cores really help. And using Linux instead of Windows (which has slower process creation times, anti-virus scanning, indexing, and more) works much better.
+The inner loop of iterating on improving performance is governed by the speed of your dev machine. Running the full regression suite to ensure nothing was broken can take seconds or minutes depending on your hardware and OS choice. Not surprisingly, more cores really help. And using Linux instead of Windows (which has slower process creation times, anti-virus scanning, indexing, and more) works much better.
 
 <img alt="table" src="images/tests.jpg" />
 
@@ -162,14 +167,34 @@ Memory layout is what you would expect; CP/M loads .COM files in just one way. B
 
 ## Time functions
 
-`time()`, `difftime()`, `mktime()`, `asctime()`, `ctime()`, `gmtime()`, and `localtime()` are fully implemented (see `time.h`). `clock()` and `strftime()` remain stubs - `clock()` always returns `(clock_t)-1`, and `strftime()` always writes nothing and returns 0.
+`time()`, `difftime()`, `mktime()`, `asctime()`, `ctime()`, `gmtime()`,
+`localtime()`, and `strftime()` are fully implemented (see `time.h`).
+`clock()` remains unavailable and always returns `(clock_t)-1`.
 
 A few characteristics worth knowing about before relying on the implemented ones:
 
-- **`time()` is the only one that can fail; the rest are pure calendar arithmetic.** `gmtime()`, `localtime()`, `asctime()`, `ctime()`, `mktime()`, and `difftime()` all operate purely on `time_t`/`struct tm` values you already have - they always work, with or without a real clock. Only `time()` itself depends on the underlying BDOS actually having a clock to read (see below); it returns `(time_t)-1` when it doesn't, the same "no clock" value every one of these functions returned before this support existed.
+- **`time_t` is a signed 32-bit `long`.** The representable Unix range is
+  1970-01-01 through 2038-01-19 03:14:07. `time()` returns/stores `-1` for a
+  later BDOS clock value; `mktime()` returns `-1` without changing its input
+  when normalization lands outside that range. `gmtime()`/`localtime()` reject
+  negative bit patterns. `asctime()` also returns `NULL` for invalid table
+  indices, date/clock fields, or years outside 0000..9999 rather than risking
+  its fixed 26-byte buffer.
+- **Calendar arithmetic is deterministic without a real clock.** `gmtime()`,
+  `localtime()`, `asctime()`, `ctime()`, `mktime()`, and `difftime()` operate
+  only on values supplied by the caller. Their documented range checks still
+  apply, but they do not depend on BDOS clock availability. `gmtime()` and
+  `localtime()` share one returned object; an unrelated `mktime()` call does
+  not overwrite it.
 - **Seconds resolution only.** The underlying BDOS call reports whole seconds, with no sub-second component - anything needing finer timing (benchmarking, frame pacing) needs its own mechanism, not these functions.
 - **No timezone concept.** CP/M has no timezone database, so `localtime()` is simply `gmtime()` under another name, and the `time_t` `time()` returns is exactly the BDOS clock's raw wall-clock reading with no UTC offset applied in either direction. In practice, the "UTC" `time_t` this runtime produces is really just the host/emulator's local wall clock, relabeled - if your app genuinely needs UTC, correct for the local offset yourself.
-- **Availability depends on the specific emulator/BIOS, not the CP/M version it reports.** `time()` calls BDOS function 105 ("Get Date and Time", introduced in CP/M 3.0) unconditionally, with no BDOS-12 version check first - deliberately, since ntvcm and RunCPM both answer it correctly while still reporting themselves as CP/M 2.2 (a version check would just disable the real clock on the two emulators that matter most here). When the underlying BDOS genuinely doesn't implement the call, `time()` detects that (a sentinel byte written before the call, checked after) and returns `(time_t)-1` rather than a fabricated-looking but wrong timestamp. See the "Other CP/M emulators" section above for which ones were actually confirmed to support this, and `tests/ttime.c` for the regression coverage (its expected output doesn't depend on which case a given run hits).
+- **Fixed C-locale formatting.** `strftime()` supports all C89 conversions
+  available from `struct tm` plus `%C` for the calendar century, uses
+  deterministic C-locale names and composite forms, and emits an empty `%Z`.
+  It rejects malformed formats and invalid fields, preserves NUL termination
+  at every positive bound, and does not normalize or cross-check the supplied
+  fields.
+- **Availability depends on the specific emulator/BIOS, not the CP/M version it reports.** `time()` calls BDOS function 105 ("Get Date and Time", introduced in CP/M 3.0) unconditionally, with no BDOS-12 version check first - deliberately, since ntvcm and RunCPM both answer it correctly while still reporting themselves as CP/M 2.2 (a version check would just disable the real clock on the two emulators that matter most here). When the underlying BDOS genuinely doesn't implement the call, `time()` detects that (a sentinel byte written before the call, checked after) and returns `(time_t)-1` rather than a fabricated-looking but wrong timestamp. CP/M day 1 is 1978-01-01; dcc maps day 0 to Unix day 2921 (1977-12-31) and range-checks the resulting signed `time_t`. See the "Other CP/M emulators" section above for confirmed support and `tests/ttime.c` / `tests/tcalb11.c` for regression coverage.
 
 ## Benchmarks
 
@@ -218,28 +243,19 @@ git clone https://github.com/davidly/ntvcm.git
 
 ### Building dcc
 
-dcc compiles on Windows, Linux, and macOS. The build scripts are in the root directory:
+dcc compiles on Windows, Linux, and macOS. The canonical build uses
+PowerShell 7 (`pwsh`) and CMake, and builds the complete host toolchain:
 
-**macOS:**
-```bash
-chmod +x mmacos.sh
-./mmacos.sh
+```powershell
+pwsh ./scripts/build-dcc.ps1
 ```
-This produces `dcc`, `dccpeep`, `dccrtlstrip`, `dccmake`, and `m80c` in the dcc directory.
-Requires the clang compiler from the Xcode Command Line Tools (install with `xcode-select --install`).
 
-**Linux:**
-```bash
-chmod +x m.sh
-./m.sh
-```
-Requires gcc (install with `sudo apt install build-essential` on Debian/Ubuntu, or the equivalent for your distribution).
+This produces `dcc`, `dccpeep`, `dccrtlstrip`, `dccmake`, `m80c`, and `l80c` in
+the repository root, together with `dcc-debug-host` and the platform-specific
+example I/O adapter library.
 
-**Windows:**
-```batch
-m.bat
-```
-Requires Visual Studio with C++ build tools installed.
+
+
 
 ### Building ntvcm
 

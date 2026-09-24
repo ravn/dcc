@@ -1,21 +1,26 @@
-/*
- * dcc_global_init.c - file-scope (global/static) object initializer parsing.
+/**
+ * @file dcc_global_init.c
+ * @brief Records file-scope object initializers for later data emission.
  *
- * Parses a global object's initializer from the token stream and records the
- * initialized-data image (bytes + relocatable label references) on the symbol,
- * for later emission by the data section. It is the "record" counterpart to
- * dcc_decl.c's "emit" path for automatic (local) initializers.
+ * @par Role
+ * Parses scalar, array, struct/union, bitfield, string, compound-literal, and
+ * designated initializers into each symbol's byte-and-relocation image,
+ * including padding, overwrites, and inferred array bounds.
  *
- * Entry points (declared in dcc.h): parse_global_init_type / _array / _struct
- * / _list, the parse_global_scalar_array_* helpers, parse_global_init_atom,
- * and the append_global_* image builders. Everything else here is file-local.
+ * @par Key entry points
+ * parse_global_init_list(), parse_global_init_type(),
+ * parse_global_init_array(), parse_global_init_struct(),
+ * parse_global_init_atom(), and append_global_init().
  *
- * MODULE: compiled as its own translation unit; shared declarations are in dcc.h.
+ * @par Boundary
+ * dcc_data.c serializes the recorded image, while dcc_decl.c handles automatic
+ * objects. This module records data and emits no function body.
  */
 #include "dcc.h"
 
 static void parse_global_init_type_at(struct Sym *s, int type, int size, int baseoff);
 static void parse_global_init_array_at(struct Sym *s, int elem_type, int count, int elem_size, int baseoff);
+static void parse_global_init_field_array_at(struct Sym *s, struct FieldDef *fd, int level, int baseoff);
 static void parse_global_init_struct_at(struct Sym *s, int type, int baseoff);
 
 static int global_compound_literal_seq;
@@ -56,21 +61,32 @@ static int parse_global_compound_literal_address(char *label, int labelsz)
     return 1;
 }
 
-static int parse_global_addr_suffix(int base_type, long *offset)
+static int parse_global_addr_suffix(int base_type, struct Sym *base_sym,
+                                    long *offset)
 {
     int cur_type;
+    int index_count;
     long idx;
 
     cur_type = base_type;
+    index_count = 0;
     while (g_lex.tok.kind == '[' || g_lex.tok.kind == '.' || g_lex.tok.kind == TOK_ARROW) {
         if (g_lex.tok.kind == '[') {
             int elem_size;
             next_token();
             idx = parse_typed_const_long_expr();
             expect(']');
-            elem_size = type_size(cur_type);
+            if (base_sym != NULL && base_sym->is_array)
+                elem_size = sym_array_index_elem_size(base_sym, index_count);
+            else if (base_sym != NULL && base_sym->dim_count > 0)
+                elem_size = sym_pointer_array_index_elem_size(base_sym,
+                                                               cur_type,
+                                                               index_count);
+            else
+                elem_size = type_size(cur_type);
             if (elem_size <= 0) elem_size = 2;
             *offset += idx * elem_size;
+            ++index_count;
             continue;
         }
         if (g_lex.tok.kind == TOK_ARROW)
@@ -108,6 +124,8 @@ static int parse_global_cast_null_member_address(long *val)
     if (g_lex.tok.kind != '(')
         return 0;
     next_token();
+    if (!starts_type())
+        return 0;
     base_type = parse_type();
     expect(')');
     if (g_lex.tok.kind != TOK_NUM || g_lex.tok.val != 0)
@@ -117,7 +135,7 @@ static int parse_global_cast_null_member_address(long *val)
     if (g_lex.tok.kind != TOK_ARROW)
         return 0;
     offset = 0;
-    if (!parse_global_addr_suffix(base_type, &offset))
+    if (!parse_global_addr_suffix(base_type, NULL, &offset))
         return 0;
     *val = offset;
     return 1;
@@ -140,7 +158,7 @@ static int parse_global_symbol_member_address(char *label, int labelsz)
     next_token();
 
     offset = 0;
-    if (!parse_global_addr_suffix(base_type, &offset))
+    if (!parse_global_addr_suffix(base_type, ls, &offset))
         return 0;
 
     if (label && labelsz > 0) {
@@ -157,11 +175,256 @@ static int parse_global_symbol_member_address(char *label, int labelsz)
     return 1;
 }
 
+/* Parse the address of an element of a string literal, with optional grouping:
+ *
+ *     &"text"[1]
+ *     &("text"[1])
+ *
+ * A string literal already has a relocatable S<n> label in the global data
+ * stream.  Taking the address of one of its constant-index elements therefore
+ * differs only by a byte offset (or a two-byte offset for a wide literal). */
+static int parse_global_string_element_address(char *label, int labelsz)
+{
+    LexState saved;
+    char *lit;
+    long index;
+    long offset;
+    int grouping;
+    int is_wide;
+    int litlen;
+    int sid;
+
+    saved = lex_save();
+    grouping = 0;
+    while (g_lex.tok.kind == '(') {
+        next_token();
+        ++grouping;
+    }
+    if (g_lex.tok.kind != TOK_STR && g_lex.tok.kind != TOK_WSTR) {
+        lex_restore(&saved);
+        return 0;
+    }
+
+    lit = read_adjacent_string_literals_ex(&is_wide, &litlen);
+    if (g_lex.tok.kind != '[') {
+        free(lit);
+        lex_restore(&saved);
+        return 0;
+    }
+    next_token();
+    index = parse_typed_const_long_expr();
+    expect(']');
+    while (grouping-- > 0)
+        expect(')');
+
+    sid = add_string_ex(lit, litlen, is_wide);
+    free(lit);
+    offset = index * (is_wide ? 2L : 1L);
+    if (label != NULL && labelsz > 0) {
+        if (offset == 0)
+            snprintf(label, (size_t)labelsz, "S%d", sid);
+        else
+            snprintf(label, (size_t)labelsz, "S%d%+ld", sid, offset);
+    }
+    return 1;
+}
+
+/* Parse a grouped address whose base uses pointer arithmetic before a member
+ * suffix, for example `&((items + 1)->field)`.  This is still a link-time
+ * address constant: symbol + scaled element offset + field offset. */
+static int parse_global_grouped_symbol_member_address(char *label, int labelsz)
+{
+    LexState saved;
+    struct Sym *symbol;
+    const char *name;
+    long offset;
+    int base_type;
+    int grouping;
+
+    if (g_lex.tok.kind != '(')
+        return 0;
+    saved = lex_save();
+    grouping = 0;
+    while (g_lex.tok.kind == '(') {
+        next_token();
+        ++grouping;
+    }
+    if (g_lex.tok.kind != TOK_ID ||
+        (symbol = find_sym(g_lex.tok.text)) == NULL) {
+        lex_restore(&saved);
+        return 0;
+    }
+    name = sym_asm_name(symbol);
+    base_type = symbol->type;
+    next_token();
+    offset = 0;
+
+    if (g_lex.tok.kind == '+' || g_lex.tok.kind == '-') {
+        int negative = g_lex.tok.kind == '-';
+        int element_type = base_type;
+        int element_size;
+        long delta;
+
+        next_token();
+        delta = parse_typed_const_long_expr();
+        if (!symbol->is_array && type_ptr_depth(element_type) > 0)
+            element_type = type_decay_ptr(element_type);
+        element_size = type_size(element_type);
+        if (element_size <= 0)
+            element_size = 1;
+        offset = delta * element_size;
+        if (negative)
+            offset = -offset;
+    }
+
+    /* Parentheses around the pointer-arithmetic base close before `->`; the
+     * outer grouping around the complete member expression closes after it. */
+    while (grouping > 0 && g_lex.tok.kind == ')') {
+        next_token();
+        --grouping;
+        if (g_lex.tok.kind == TOK_ARROW || g_lex.tok.kind == '.')
+            break;
+    }
+    if (g_lex.tok.kind != TOK_ARROW && g_lex.tok.kind != '.') {
+        lex_restore(&saved);
+        return 0;
+    }
+    if (!parse_global_addr_suffix(type_add_ptr(base_type), NULL, &offset)) {
+        lex_restore(&saved);
+        return 0;
+    }
+    while (grouping-- > 0) {
+        if (g_lex.tok.kind != ')') {
+            lex_restore(&saved);
+            return 0;
+        }
+        next_token();
+    }
+
+    if (label != NULL && labelsz > 0) {
+        if (offset == 0)
+            snprintf(label, (size_t)labelsz, "%s", name);
+        else
+            snprintf(label, (size_t)labelsz, "%s%+ld",
+                     asm_name_for(name), offset);
+    }
+    return 1;
+}
+
+/* Parse a relocatable symbol address hidden behind optional grouping and
+ * pointer casts, for example `(char *)(buf + 1)`, `(char *)buf + 1`, or
+ * `((char *)buf + 1)`.  The ordinary constant-expression parser cannot fold a
+ * symbol, and treating every leading '(' as numeric used to desynchronise the
+ * lexer on these standard address constants. */
+static int parse_global_grouped_symbol_address(char *label, int labelsz)
+{
+    LexState saved;
+    struct Sym *symbol;
+    const char *name;
+    long offset;
+    int grouping = 0;
+    int saw_wrapper = 0;
+    int base_type;
+
+    if (g_lex.tok.kind != '(')
+        return 0;
+    saved = lex_save();
+    while (g_lex.tok.kind == '(') {
+        if (paren_starts_cast()) {
+            int cast_type;
+            int cast_size;
+
+            next_token();
+            parse_type_name_decl(&cast_type, &cast_size);
+            if (g_lex.tok.kind != ')' || type_ptr_depth(cast_type) <= 0) {
+                lex_restore(&saved);
+                return 0;
+            }
+            next_token();
+            saw_wrapper = 1;
+        } else {
+            next_token();
+            ++grouping;
+            saw_wrapper = 1;
+        }
+    }
+    if (!saw_wrapper || g_lex.tok.kind != TOK_ID ||
+        find_enum_const(g_lex.tok.text) >= 0) {
+        lex_restore(&saved);
+        return 0;
+    }
+    symbol = find_sym(g_lex.tok.text);
+    name = symbol != NULL ? sym_asm_name(symbol) : g_lex.tok.text;
+    base_type = symbol != NULL ? symbol->type : TYPE_CHAR;
+    next_token();
+    offset = 0;
+    if (g_lex.tok.kind == '+' || g_lex.tok.kind == '-') {
+        int negative = g_lex.tok.kind == '-';
+        int element_size;
+
+        next_token();
+        if (g_lex.tok.kind != TOK_NUM) {
+            lex_restore(&saved);
+            return 0;
+        }
+        element_size = type_size(base_type);
+        if (element_size <= 0)
+            element_size = 1;
+        offset = g_lex.tok.val * element_size;
+        if (negative)
+            offset = -offset;
+        next_token();
+    }
+    while (grouping-- > 0) {
+        if (g_lex.tok.kind != ')') {
+            lex_restore(&saved);
+            return 0;
+        }
+        next_token();
+    }
+    if (label != NULL && labelsz > 0) {
+        const char *asm_name = asm_name_for(name);
+        if (offset == 0)
+            snprintf(label, (size_t)labelsz, "%s", name);
+        else
+            snprintf(label, (size_t)labelsz, "%s%+ld", asm_name, offset);
+    }
+    return 1;
+}
+
 int parse_global_init_atom(long *val, char *label, int labelsz)
 {
     int sign;
 
     sign = 1;
+
+    /*
+     * A pointer cast of an address, e.g. `(char *) "Plain"` or
+     * `(void *)&("X"[0])`, names a relocation, not an arithmetic constant - the
+     * constant-expression evaluator the numeric branch below uses only folds
+     * numeric casts, and silently desyncs the lexer on a string operand
+     * (DCC-E1102 "expected ';'" at the string, immediately followed by
+     * DCC-E1101).  Detect this one shape up front and consume just the cast,
+     * so control falls through to the ordinary string/address handling below
+     * as if the cast were never there - it only changes the static type, not
+     * which label the initializer resolves to.
+     */
+    if (g_lex.tok.kind == '(' && paren_starts_cast()) {
+        LexState _ls = lex_save();
+        int cast_type;
+        int cast_size;
+
+        next_token();
+        parse_type_name_decl(&cast_type, &cast_size);
+        expect(')');
+        if (!(type_ptr_depth(cast_type) > 0 &&
+              (g_lex.tok.kind == TOK_STR || g_lex.tok.kind == TOK_WSTR ||
+               g_lex.tok.kind == '&')))
+            lex_restore(&_ls);
+    }
+
+    if (parse_global_grouped_symbol_address(label, labelsz))
+        return 2;
 
     /*
      * Numeric scalar initializers may be full C constant expressions, not just
@@ -172,7 +435,8 @@ int parse_global_init_atom(long *val, char *label, int labelsz)
      * and array bounds using parenthesized macro expressions.
      */
     if (g_lex.tok.kind == TOK_NUM || g_lex.tok.kind == TOK_CHARLIT ||
-        g_lex.tok.kind == '-' || g_lex.tok.kind == '+' || g_lex.tok.kind == '(' ||
+        g_lex.tok.kind == '-' || g_lex.tok.kind == '+' || g_lex.tok.kind == '~' ||
+        g_lex.tok.kind == '!' || g_lex.tok.kind == '(' ||
         g_lex.tok.kind == TOK_SIZEOF) {
         val[0] = parse_typed_const_expr_long();
         if (label) label[0] = 0;
@@ -236,21 +500,24 @@ int parse_global_init_atom(long *val, char *label, int labelsz)
              * Emit as a raw asm arithmetic expression so M80 can relocate it. */
             if (label && (g_lex.tok.kind == '-' || g_lex.tok.kind == '+')) {
                 int neg = (g_lex.tok.kind == '-');
-                LexState _ls = lex_save();
+                long delta;
+                int element_size = 1;
+
                 next_token();
-                if (g_lex.tok.kind == TOK_NUM) {
-                    char tmp[64];
-                    const char *aname = asm_name_for(lname);
-                    if (neg)
-                        sprintf(tmp, "%s-%ld", aname, g_lex.tok.val);
-                    else
-                        sprintf(tmp, "%s+%ld", aname, g_lex.tok.val);
-                    strncpy(label, tmp, labelsz - 1);
-                    label[labelsz - 1] = 0;
-                    next_token();
-                } else {
-                    lex_restore(&_ls);
+                delta = parse_typed_const_expr_long();
+                if (ls != NULL) {
+                    int element_type = ls->type;
+
+                    if (!ls->is_array && type_ptr_depth(element_type) > 0)
+                        element_type = type_decay_ptr(element_type);
+                    element_size = type_size(element_type);
+                    if (element_size <= 0)
+                        element_size = 1;
                 }
+                delta *= element_size;
+                if (neg) delta = -delta;
+                snprintf(label, (size_t)labelsz, delta >= 0 ? "%s+%ld" : "%s%ld",
+                         asm_name_for(lname), delta);
             }
         }
         return 2;       /* symbolic address */
@@ -267,6 +534,10 @@ int parse_global_init_atom(long *val, char *label, int labelsz)
             lex_restore(&_ls);
         }
         if (parse_global_compound_literal_address(label, labelsz))
+            return 2;
+        if (parse_global_string_element_address(label, labelsz))
+            return 2;
+        if (parse_global_grouped_symbol_member_address(label, labelsz))
             return 2;
         if (parse_global_symbol_member_address(label, labelsz))
             return 2;
@@ -647,6 +918,85 @@ void parse_global_init_array(struct Sym *s, int elem_type, int count, int elem_s
     parse_global_init_array_at(s, elem_type, count, elem_size, global_init_used_bytes(s));
 }
 
+static int field_array_stride(struct FieldDef *fd, int level)
+{
+    int i;
+    int stride;
+
+    stride = fd->elem_size;
+    if (stride <= 0) stride = type_size(fd->elem_type);
+    if (stride <= 0) stride = 2;
+    for (i = level + 1; i < fd->dim_count; ++i)
+        stride *= fd->dims[i];
+    return stride;
+}
+
+/* FieldDef keeps every array bound, while parse_global_init_array_at() is a
+ * one-dimensional primitive.  Preserve the brace nesting and compute each
+ * row's stride here so arrays such as char a[2][2] and struct S a[2][3]
+ * initialize their scalar/aggregate leaves at the correct offsets. */
+static void parse_global_init_field_array_at(struct Sym *s, struct FieldDef *fd, int level, int baseoff)
+{
+    int count;
+    int stride;
+    int n;
+    int had_brace;
+
+    count = fd->dims[level];
+    stride = field_array_stride(fd, level);
+
+    if (level + 1 == fd->dim_count &&
+        (fd->elem_type & 15) == TYPE_CHAR && type_ptr_depth(fd->elem_type) == 0 &&
+        g_lex.tok.kind == TOK_STR) {
+        char *lit;
+        int is_wide;
+        int litlen;
+        lit = read_adjacent_string_literals_ex(&is_wide, &litlen);
+        if (is_wide)
+            error_here("wide string cannot initialize char array field");
+        else
+            global_init_write_char_array_string_at(s, baseoff, count, lit, litlen);
+        free(lit);
+        return;
+    }
+
+    had_brace = accept('{');
+    n = 0;
+    while (g_lex.tok.kind != TOK_EOF &&
+           (!had_brace || g_lex.tok.kind != '}')) {
+        if (had_brace && g_lex.tok.kind == '[') {
+            next_token();
+            n = parse_typed_designator_index_expr();
+            expect(']');
+            expect('=');
+        }
+        if (n < 0 || n >= count) {
+            error_here("array initializer designator out of range");
+            skip_initializer_or_decl_tail();
+            break;
+        }
+        if (level + 1 < fd->dim_count)
+            parse_global_init_field_array_at(s, fd, level + 1, baseoff + n * stride);
+        else
+            parse_global_init_type_at(s, fd->elem_type, fd->elem_size, baseoff + n * stride);
+        n++;
+        /* A braceless array member consumes only this subobject.  Preserve
+         * the comma after its last element for the enclosing struct so the
+         * following initializer is assigned to the following member. */
+        if (!had_brace && n >= count)
+            break;
+        if (!accept(',')) break;
+        if (had_brace && g_lex.tok.kind == '}') break;
+    }
+    if (had_brace) {
+        if (n >= count && g_lex.tok.kind != '}') {
+            error_here("too many initializer elements");
+            skip_initializer_or_decl_tail();
+        }
+        expect('}');
+    }
+}
+
 static int field_def_index(struct FieldDef *fd)
 {
     if (fd == NULL)
@@ -690,7 +1040,7 @@ static void parse_global_init_struct_at(struct Sym *s, int type, int baseoff)
 
         if (first && g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}') {
             if (first->is_array)
-                parse_global_init_array_at(s, first->elem_type, first->array_len, first->elem_size, baseoff);
+                parse_global_init_field_array_at(s, first, 0, baseoff);
             else
                 parse_global_init_type_at(s, first->type, first->size, baseoff);
 
@@ -761,8 +1111,7 @@ static void parse_global_init_struct_at(struct Sym *s, int type, int baseoff)
         }
 
         if (fd->is_array)
-            parse_global_init_array_at(s, fd->elem_type, fd->array_len, fd->elem_size,
-                                       baseoff + fd->offset);
+            parse_global_init_field_array_at(s, fd, 0, baseoff + fd->offset);
         else
             parse_global_init_type_at(s, fd->type, fd->size, baseoff + fd->offset);
 
@@ -828,6 +1177,17 @@ void parse_global_scalar_array_init_scalar(struct Sym *s, int *np)
     int n;
     int elem_bytes;
 
+    /* Optional braces may wrap a scalar array element, including a string
+     * literal used to initialize a pointer element.  Real array-dimension
+     * braces are handled by parse_global_scalar_array_init_level before it
+     * delegates here. */
+    if (accept('{')) {
+        parse_global_scalar_array_init_scalar(s, np);
+        accept(',');
+        expect('}');
+        return;
+    }
+
     n = np[0];
     grow_init_cap(s, n + 1);
 
@@ -887,14 +1247,57 @@ void parse_global_scalar_array_init_level(struct Sym *s, int *np, int level)
 {
     int start;
     int limit;
-
-    if (!accept('{')) {
-        parse_global_scalar_array_init_scalar(s, np);
-        return;
-    }
+    int had_brace;
 
     start = np[0];
     limit = start + sym_array_elems_from_level(s, level);
+    had_brace = accept('{');
+
+    /* A string literal initializes one complete row of a multidimensional
+     * character array.  It is not a pointer-valued scalar atom: copy its
+     * bytes (and terminating NUL when it fits) inline, then zero-fill the
+     * rest of this row.  C's brace elision permits both { { "a" }, { "b" } }
+     * and { "a", "b" }, so the row need not have its own opening brace. */
+    if ((s->type & 15) == TYPE_CHAR && type_ptr_depth(s->type) == 0 &&
+        g_lex.tok.kind == TOK_STR && level + 1 >= s->dim_count) {
+        char *lit;
+        int is_wide;
+        int litlen;
+        int i;
+
+        lit = read_adjacent_string_literals_ex(&is_wide, &litlen);
+        if (is_wide) {
+            error_here("wide string cannot initialize char array row");
+        } else {
+            if (litlen > limit - start)
+                error_here("string initializer too long for char array row");
+            for (i = 0; i < litlen && np[0] < limit; ++i) {
+                grow_init_cap(s, np[0] + 1);
+                sprintf(s->init_labels[np[0]], "%u",
+                        (unsigned char)lit[i]);
+                s->init_sizes[np[0]] = 1;
+                np[0] = np[0] + 1;
+            }
+            if (np[0] < limit) {
+                grow_init_cap(s, np[0] + 1);
+                sprintf(s->init_labels[np[0]], "0");
+                s->init_sizes[np[0]] = 1;
+                np[0] = np[0] + 1;
+            }
+            parse_global_scalar_array_zero_to(s, np, limit);
+        }
+        free(lit);
+        if (had_brace) {
+            accept(',');
+            expect('}');
+        }
+        return;
+    }
+
+    if (!had_brace) {
+        parse_global_scalar_array_init_scalar(s, np);
+        return;
+    }
 
     while (g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '}') {
         if (g_lex.tok.kind == '[') {
@@ -918,7 +1321,10 @@ void parse_global_scalar_array_init_level(struct Sym *s, int *np, int level)
                     np[0] = target;
             }
         }
-        if (g_lex.tok.kind == '{' && s->dim_count > 0 && level + 1 < s->dim_count)
+        if ((g_lex.tok.kind == '{' ||
+             (g_lex.tok.kind == TOK_STR && (s->type & 15) == TYPE_CHAR &&
+              type_ptr_depth(s->type) == 0)) &&
+            s->dim_count > 0 && level + 1 < s->dim_count)
             parse_global_scalar_array_init_level(s, np, level + 1);
         else
             parse_global_scalar_array_init_scalar(s, np);
@@ -959,7 +1365,7 @@ void parse_global_init_list(struct Sym *s)
         n = 0;
         while (g_lex.tok.kind == TOK_STR) {
             int si;
-            for (si = 0; g_lex.tok.text[si]; ++si) {
+            for (si = 0; si < g_lex.tok.text_len; ++si) {
                 grow_init_cap(s, n + 1);
                 sprintf(s->init_labels[n], "%u", (unsigned char)g_lex.tok.text[si]);
                 s->init_sizes[n] = 1;
@@ -1084,7 +1490,9 @@ void parse_global_init_list(struct Sym *s)
                     n = target;
             }
         }
-        if (g_lex.tok.kind == '{' && s->dim_count > 1)
+        if ((g_lex.tok.kind == '{' ||
+             (g_lex.tok.kind == TOK_STR && (s->type & 15) == TYPE_CHAR &&
+              type_ptr_depth(s->type) == 0)) && s->dim_count > 1)
             parse_global_scalar_array_init_level(s, &n, 1);
         else
             parse_global_scalar_array_init_scalar(s, &n);

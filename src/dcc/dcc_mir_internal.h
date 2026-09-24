@@ -1,11 +1,52 @@
+/**
+ * @file dcc_mir_internal.h
+ * @brief Defines the private data model and cross-module contracts of MIR.
+ *
+ * @par Role
+ * Central source of truth for MIR opcodes, instructions, objects, functions,
+ * liveness/allocation records, target constraints, shared state, and helpers
+ * used by more than one MIR translation unit. Frontend code must use
+ * dcc_mir.h instead.
+ *
+ * @par Module map
+ * - dcc_mir.c: lowering, metadata repair, CFG/dataflow, allocation, verifier.
+ * - dcc_mir_verify.c: independent CFG dominance and PHI-edge verification.
+ * - dcc_mir_select.c: candidate orchestration, cost policy, output commit.
+ * - dcc_mir_emit_common.c: shared scalar/home emission and DAG candidates,
+ *   plus a handful of exact-schedule proof helpers shared by more than one
+ *   dcc_mir_machine_*.c family.
+ * - dcc_mir_homed_cfg.c: fixed-home CFG candidate.
+ * - dcc_mir_spilled_cfg.c: general spill-slot CFG candidate.
+ * - dcc_mir_target.c: diagnostic Z80 constraint model.
+ * - dcc_mir_schedule.c: diagnostic sparse schedule model.
+ * - dcc_mir_stream.c/.h: transactional in-memory candidate streams.
+ * - dcc_mir_machine_emit.c: exact-schedule coordinator; calls each family
+ *   dispatcher below in original selector-policy order.
+ * - dcc_mir_machine_internal.h: private exact-schedule family interface.
+ * - dcc_mir_machine_attention.c: attention and softmax kernels.
+ * - dcc_mir_machine_aggregate_checks.c: aggregate/data-layout kernels.
+ * - dcc_mir_machine_byte_scans.c: byte/row scanning and fill kernels.
+ * - dcc_mir_machine_call_runners.c: call-heavy orchestration kernels.
+ * - dcc_mir_machine_constant_folding.c: constant-folding and result-switch
+ *   kernels, plus the final fallback kernel.
+ * - dcc_mir_machine_containers.c: array/stack/append/row-store kernels plus
+ *   early float and constant comparison checks.
+ * - dcc_mir_machine_endgame.c: late and no-stack schedule bands.
+ * - dcc_mir_machine_float_reports.c: floating-point kernels and reports.
+ * - dcc_mir_machine_float_recursion.c: float polynomial and recursive
+ *   frame/product/tree-sum kernels.
+ * - dcc_mir_machine_interpreter_runners.c: interpreter and lexer kernels.
+ * - dcc_mir_machine_numeric.c: numeric and algorithmic kernels.
+ * - dcc_mir_machine_runtime_runners.c: runtime, file, and system kernels.
+ * - dcc_mir_machine_scanners.c: scanner, parser, and text kernels.
+ * - dcc_mir_machine_structural_checks.c: bitfield/literal/struct/type/sort
+ *   validation kernels.
+ * - dcc_mir_machine_validation_runners.c: validation-harness kernels.
+ * - dcc_mir_machine_wide_records.c: wide-value and aggregate-member
+ *   arithmetic, record append, and byte mismatch/arithmetic report kernels.
+ */
 #ifndef DCC_MIR_INTERNAL_H
 #define DCC_MIR_INTERNAL_H
-
-/* Internal MIR module header: shared IR types, global compiler state,
- * and prototypes for helpers that cross the dcc_mir_*.c file split.
- * Not part of the public dcc_mir.h API - only the dcc_mir_*.c
- * translation units that implement the MIR backend include this.
- */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,10 +104,12 @@ enum MirCallFlag {
     MIR_CALL_FLAG_FORMAT_RUNTIME =
         MIR_CALL_FLAG_FORMAT_HEX | MIR_CALL_FLAG_FORMAT_OCTAL,
     MIR_CALL_FLAG_INLINE_SUBSTITUTABLE = 2048,
-    MIR_CALL_FLAG_VARIADIC = 4096
+    MIR_CALL_FLAG_VARIADIC = 4096,
+    MIR_CALL_FLAG_REVERSE_CONDITIONAL_ARGS = 32768
 };
 
 enum MirMemoryFlag {
+    MIR_MEMORY_FLAG_VOLATILE = 1,
     MIR_MEMORY_FLAG_DEREFERENCED_POINTER_ARRAY = 8192,
     MIR_MEMORY_FLAG_DEFERRED_WIDE_CONST = 16384
 };
@@ -86,11 +129,15 @@ struct MirInsn {
     int object;
     int memory_size;
     int memory_flags;
+    unsigned int pointee_volatile_mask;
+    int has_pointer_qualifiers;
     int bit_width;
     int bit_shift;
     unsigned int bit_mask;
     int secondary_offset;
     int inline_temp_id;
+    /* Low/high bytes retain direct left/right 32-bit div/mod cast types. */
+    int divmod_cast_types;
     char name[64];
     char base_name[64];
 };
@@ -117,6 +164,19 @@ struct MirDebugEvent {
     char *text;
 };
 
+struct MirCallSignature {
+    int present;
+    int has_proto;
+    int parameter_count;
+    int variadic;
+    int return_type;
+    int parameter_types[MAX_PROTO_PARAMS];
+};
+
+#define MIR_OBJECT_UNDEFINED (-1)
+#define MIR_OBJECT_AMBIGUOUS (-2)
+#define MIR_OBJECT_UNREACHED (-3)
+
 struct MirFunction {
     struct MirInsn *insns;
     int count;
@@ -124,6 +184,8 @@ struct MirFunction {
     int next_value;
     int next_label;
     int next_call_id;
+    struct MirCallSignature *call_signatures;
+    int call_signature_capacity;
     int next_inline_temp_id;
     int active;
     int sink_purpose;
@@ -218,11 +280,15 @@ struct MirFunction {
     struct MirDebugEvent *debug_events;
     int debug_event_count;
     int debug_event_capacity;
+    int *debug_object_in;
+    int *debug_object_out;
+    int debug_object_state_count;
     struct MirObject objects[256];
     int object_count;
     int has_declared_register_object;
     char declared_names[MAX_LOCALS][64];
     int declared_types[MAX_LOCALS];
+    int declared_type_unstable[MAX_LOCALS];
     int declared_storage[MAX_LOCALS];
     int declared_offsets[MAX_LOCALS];
     int declared_sizes[MAX_LOCALS];
@@ -235,19 +301,23 @@ struct MirFunction {
     int declared_is_array[MAX_LOCALS];
     int declared_is_volatile[MAX_LOCALS];
     int declared_pointee_is_volatile[MAX_LOCALS];
+    unsigned int declared_pointee_volatile_masks[MAX_LOCALS];
     int declared_dynamic_strides[MAX_LOCALS];
     char declared_runtime_stride_names[MAX_LOCALS][64];
     int declared_is_const[MAX_LOCALS];
     unsigned long declared_const_values[MAX_LOCALS];
     int declared_is_funcptr[MAX_LOCALS];
+    int declared_funcptr_return_types[MAX_LOCALS];
     int declared_has_proto[MAX_LOCALS];
     int declared_proto_nargs[MAX_LOCALS];
+    int declared_proto_variadic[MAX_LOCALS];
     int declared_proto_types[MAX_LOCALS][MAX_PROTO_PARAMS];
     int declared_count;
     char alias_source_names[MAX_LOCALS][64];
     char alias_internal_names[MAX_LOCALS][64];
     int alias_declaration_indices[MAX_LOCALS];
     int alias_count;
+    char debug_assembly_name[64];
     struct Sym *initializer_target;
     int initializer_capture_start;
     struct Sym *init_expression_target;
@@ -444,7 +514,9 @@ int mir_call_is_de_hl_fastcall(int call_index, const char **rtl_name,
 int mir_call_is_memchr_fastcall(int call_index, int *s_value,
                                       int *c_value, int *n_value);
 int mir_call_is_memcmp_fastcall(int call_index, int *s1_value,
-                                       int *s2_value, int *n_value);
+                                int *s2_value, int *n_value);
+int mir_call_is_strncmp_fastcall(int call_index, int *s1_value,
+                                 int *s2_value, int *n_value);
 int mir_call_is_memcpy_fastcall(int call_index, int *dst_value,
                                       int *src_value, int *n_value);
 int mir_call_is_memset_fastcall(int call_index, int *dest_value,
@@ -452,8 +524,12 @@ int mir_call_is_memset_fastcall(int call_index, int *dest_value,
 int mir_call_is_strchr_fastcall(int call_index, int *s_value,
                                       int *c_value);
 int mir_call_is_strlen_fastcall(int call_index, int *s_value);
+int mir_call_is_heap_fastcall(int call_index, const char **rtl_name,
+                              int *argument_value);
 int mir_call_is_strrchr_fastcall(int call_index, int *s_value,
                                        int *c_value);
+int mir_call_is_user_fastcall(int call_index, struct Sym *callee,
+                                    int *values);
 int mir_call_uses_value(const struct MirInsn *call, int value);
 int mir_compare_definition_for_branch(int instruction);
 int mir_direct_branch_for_unary_not(int instruction);
@@ -466,6 +542,7 @@ int mir_declared_is_vla_object(const char *name);
 const char *mir_declared_link_name(const char *name);
 int mir_declared_location(const char *name, int *type, int *storage,
                                  int *offset);
+int mir_declared_type_is_unstable(const char *name);
 int mir_direct_branch_for_comparison(int instruction);
 int mir_edge_phi_names_predecessor(int predecessor, int successor);
 void mir_begin_strict_phi_fallthrough(void);
@@ -481,8 +558,16 @@ void mir_extrn_begin_attempt(void);
 int mir_extrn_should_emit(struct Sym *sym);
 int mir_extrn_should_emit_name(const char *name);
 void mir_emit_runtime_call(MirStream *out, const char *name);
+int mir_try_selector(MirStream *out, int (*selector)(MirStream *));
+int mir_try_emit_affine_return(MirStream *out);
+int mir_try_emit_repeated_invariant_add_loop(MirStream *out);
+int mir_try_emit_z80(MirStream *out);
+int mir_select_report_enabled(void);
 void mir_clear_debug_events(void);
 void mir_emit_debug_events(MirStream *out, int point);
+void mir_emit_first_debug_location(MirStream *out);
+void mir_prepare_debug_object_states(void);
+void mir_emit_debug_locations(MirStream *out, int point, int allow_registers);
 void mir_emit_home_epilogue(MirStream *out, int uses_iy);
 void mir_emit_home_prologue(MirStream *out, int uses_iy);
 int mir_emit_home_push(MirStream *out, int value);
@@ -538,6 +623,7 @@ int mir_emit_wide_home_to_hl_de(MirStream *out, int value);
 int mir_emit_hl_de_to_wide_home(MirStream *out, int value);
 int mir_emit_wide_home_to_stack(MirStream *out, int value);
 int mir_emit_cast(MirStream *out, int source_type, int target_type);
+int mir_value_is_normalized_byte(int value, int type, int depth);
 int mir_emit_word_param_to_home(MirStream *out, int value, int offset);
 int mir_emit_byte_param_to_home(MirStream *out, int value, int offset, int type);
 int mir_find_label(int label);
@@ -581,6 +667,9 @@ const char *mir_opcode_name(int opcode);
 int mir_phi_source_for_edge(const struct MirInsn *phi,
                                    int predecessor_label, int edge_label,
                                    int successor, int phi_instruction);
+int mir_phi_slot_for_edge(const struct MirInsn *phi,
+                          int predecessor_label, int edge_label,
+                          int successor, int phi_instruction);
 int mir_begin_lazy_parameter_allocation(void);
 void mir_end_lazy_parameter_allocation(void);
 int mir_begin_rematerialized_home_allocation(void);
@@ -610,6 +699,7 @@ void mir_regional_begin_emission(void);
 int mir_regional_before_instruction(MirStream *out, int instruction);
 void mir_regional_after_instruction(int instruction);
 void mir_resolve_deferred_metadata(void);
+void mir_record_call_signature(int call_id, const struct Sym *prototype);
 int mir_prune_constant_unreachable(void);
 int mir_extended_integer_constant_conversion_folds(void);
 int mir_scalar_memory_location(const struct MirInsn *insn, int *type,
@@ -707,7 +797,9 @@ void mir_begin_block_cse_address_rematerialization(void);
 void mir_end_block_cse_address_rematerialization(void);
 int mir_address_rematerialization_candidate_count(void);
 void mir_begin_phi_slot_cleanup(void);
+void mir_begin_boolean_phi_branch_folding(void);
 void mir_end_phi_slot_cleanup(void);
+void mir_end_boolean_phi_branch_folding(void);
 int mir_spilled_cfg_depends_on_indirect_store_address_forwarding(void);
 int mir_spilled_cfg_indirect_store_address_forwarding_uses(void);
 void mir_begin_indirect_store_address_forwarding(void);
@@ -735,16 +827,19 @@ int mir_spilled_cfg_depends_on_promoted_local_slot_reuse(void);
 int mir_spilled_cfg_depends_on_wide_store_forwarding(void);
 int mir_try_emit_spilled_scalar_cfg(MirStream *out);
 int mir_spilled_cfg_depends_on_dead_store_forwarding(void);
+int mir_spilled_cfg_emitted_frame_bytes(void);
 int mir_value_has_use(int value);
 int mir_value_has_use_after(int value, int instruction);
 int mir_value_use_count(int value);
 int mir_verify_and_dump(void);
+int mir_verify_dominance(void);
 int mir_target_constraint_for_insn(
     const struct MirInsn *insn, struct MirTargetConstraint *out);
 void mir_target_report_shadow_plan(void);
 int mir_build_shadow_schedule(struct MirScheduleSummary *summary);
 void mir_schedule_report_shadow_plan(void);
 const struct MirInsn *mir_definition(int value);
+void mir_invalidate_use_cache(void);
 struct MirInsn *mir_mutable_definition(int value);
 int mir_load_is_single_call_argument(int value, int size);
 void mir_emit_virtual_load(MirStream *out, int value);

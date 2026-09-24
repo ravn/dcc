@@ -15,9 +15,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  tests:
-    name: Unit tests and extended suite
-    runs-on: ubuntu-latest
+  full-regressions:
+    name: Standard regressions (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
 
     steps:
@@ -32,21 +40,50 @@ jobs:
           repository: davidly/ntvcm
           path: ntvcm
 
-      - name: Build ntvcm emulator
+      - name: Build ntvcm emulator on Linux
+        if: runner.os == 'Linux'
         run: |
           chmod +x ./m.sh
           ./m.sh
         working-directory: ntvcm
 
-      - name: Add tool directories to PATH
+      - name: Build ntvcm emulator on macOS
+        if: runner.os == 'macOS'
         run: |
-          echo "$GITHUB_WORKSPACE" >> "$GITHUB_PATH"
-          echo "$GITHUB_WORKSPACE/ntvcm" >> "$GITHUB_PATH"
+          chmod +x ./mmac.sh
+          ./mmac.sh
+        working-directory: ntvcm
+
+      - name: Build ntvcm emulator on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ntvcm
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $installPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installPath) { throw 'Visual Studio C++ tools not found' }
+
+          $vcvars = Join-Path $installPath 'VC\Auxiliary\Build\vcvars64.bat'
+          $buildBat = Join-Path $env:RUNNER_TEMP 'build-ntvcm.bat'
+          @(
+            "call `"$vcvars`"",
+            'if errorlevel 1 exit /b %errorlevel%',
+            'cl /nologo ntvcm.cxx x80.cxx /I. /GS- /O2 /EHsc /link user32.lib /OUT:ntvcm.exe',
+            'exit /b %errorlevel%'
+          ) | Set-Content -LiteralPath $buildBat -Encoding ascii
+          & cmd /c "`"$buildBat`""
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Add tool directories to PATH
+        shell: pwsh
+        run: |
+          (Resolve-Path '.').ProviderPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          (Resolve-Path 'ntvcm').ProviderPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Build dcc host tools
         shell: pwsh
         run: ./scripts/build-dcc.ps1
 
-      - name: Run unit tests and extended suite
+      - name: Run main regression suite in both optimization modes
         shell: pwsh
-        run: ./scripts/runall.ps1 -Mode full -Extended -RunTimeout 30
+        run: ./scripts/runall.ps1 -Mode full -RunTimeout 60

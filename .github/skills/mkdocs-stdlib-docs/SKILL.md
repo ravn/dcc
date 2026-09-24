@@ -76,11 +76,14 @@ For new library hooks, prefer the same pattern with the uppercase header stem:
 <!-- ERRNO-SYMBOL-TABLE: all -->
 <!-- FLOAT-SYMBOL-TABLE: all -->
 <!-- LIMITS-SYMBOL-TABLE: all -->
+<!-- LOCALE-SYMBOL-TABLE: all -->
 <!-- SETJMP-SYMBOL-TABLE: all -->
+<!-- SIGNAL-SYMBOL-TABLE: all -->
 <!-- STDARG-SYMBOL-TABLE: all -->
 <!-- STDBOOL-SYMBOL-TABLE: all -->
 <!-- STDDEF-SYMBOL-TABLE: all -->
 <!-- STDINT-SYMBOL-TABLE: all -->
+<!-- TIME-SYMBOL-TABLE: all -->
 ```
 
 Marker behavior should be consistent across libraries:
@@ -194,8 +197,8 @@ Also check:
 - Generated tables render in `docs/site/...` when marker behavior changed.
 - User docs do not mention hook internals except where intentionally linked from
   `docs/docs/README.md`.
-- If compiler help or mappings changed, rebuild host tools with `./mmacos.sh` on
-  macOS or the platform-appropriate build script.
+- If compiler help or mappings changed, rebuild all host tools with
+  `pwsh ./scripts/build-dcc.ps1`.
 
 ## Files To Update Together
 

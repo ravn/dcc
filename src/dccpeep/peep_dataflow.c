@@ -1,4 +1,20 @@
-/* peep_dataflow.c - versioned CFG, basic blocks, and backwards liveness. */
+/**
+ * @file peep_dataflow.c
+ * @brief Builds dccpeep's versioned CFG and backward liveness solution.
+ *
+ * @par Role
+ * Derives per-function successors and basic blocks, then solves register and
+ * flag liveness against the current line-program version for safety queries.
+ *
+ * @par Key entry points
+ * peep_flow_line(), peep_basic_block(), peep_basic_block_count(),
+ * peep_registers_dead_after(), and peep_flags_dead_after().
+ *
+ * @par Boundary
+ * peep_effects.c classifies individual instructions and
+ * peep_control_flow.c owns shared textual label indexes. This module never
+ * mutates the line program, and unknown effects remain fully live.
+ */
 #include "dccpeep_internal.h"
 
 #define PEEP_ALL_REGISTERS ((1u << 10) - 1u)
@@ -65,8 +81,50 @@ static void add_successor(PeepFlowLine *flow, int line)
     for (i = 0; i < flow->successor_count; ++i)
         if (flow->successors[i] == line)
             return;
-    if (flow->successor_count < 2)
+    if (flow->successor_count < 256)
         flow->successors[flow->successor_count++] = line;
+}
+
+/* Recover the targets of dcc's canonical adjacent jump table:
+ *
+ *     ld de,Ltable
+ *     ...
+ *     jp (hl)
+ * Ltable:
+ *     dw Lcase0
+ *     ...
+ *
+ * The indirect jump otherwise looks like an unknown function exit and makes
+ * every register artificially live. The table is data, not executable
+ * fallthrough, and every entry names a label in the same function. */
+static int add_local_jump_table_successors(
+    PeepFlowLine *flow, int line, int start, int end,
+    unsigned char *leaders)
+{
+    char clean[MAX_LINE];
+    int scan;
+    int entries = 0;
+
+    if (!peep_local_jump_table_dispatch(line, start, end))
+        return 0;
+    for (scan = line + 2; scan < end; ++scan) {
+        char target[128];
+        int target_line;
+
+        strip_peep_comment_copy(clean, lines[scan]);
+        if (strncmp(clean, "dw ", 3) != 0)
+            break;
+        if (strlen(clean + 3) >= sizeof(target))
+            return 0;
+        strcpy(target, clean + 3);
+        target_line = find_label_line_in_range(target, start, end);
+        if (target_line < 0)
+            return 0;
+        add_successor(flow, target_line);
+        leaders[target_line] = 1;
+        ++entries;
+    }
+    return entries > 0;
 }
 
 static void build_function_flow(int start, int end, unsigned char *leaders)
@@ -83,7 +141,11 @@ static void build_function_flow(int start, int end, unsigned char *leaders)
         int conditional;
         int target_line;
 
-        if (parse_branch(lines[i], target, &conditional)) {
+        if (add_local_jump_table_successors(
+                flow, i, start, end, leaders)) {
+            if (i + 1 < end)
+                leaders[i + 1] = 1;
+        } else if (parse_branch(lines[i], target, &conditional)) {
             target_line = find_label_line_in_range(target, start, end);
             if (target_line >= 0) {
                 add_successor(flow, target_line);
@@ -151,10 +213,20 @@ static void solve_liveness(int start, int end)
             flags_read = info->effects.flags_read;
             flags_written = info->effects.flags_written;
             if (info->effects.unknown) {
-                reads |= PEEP_ALL_REGISTERS;
-                writes |= PEEP_ALL_REGISTERS;
-                flags_read |= PEEP_ALL_FLAGS;
-                flags_written |= PEEP_ALL_FLAGS;
+                char clean[MAX_LINE];
+
+                strip_peep_comment_copy(clean, lines[i]);
+                if (flow->successor_count > 0 &&
+                    strcmp(clean, "jp (hl)") == 0) {
+                    /* A recovered local jump table is an ordinary indirect
+                     * branch through HL, not an unknown call boundary. */
+                    reads |= PEEP_REG_H | PEEP_REG_L;
+                } else {
+                    reads |= PEEP_ALL_REGISTERS;
+                    writes |= PEEP_ALL_REGISTERS;
+                    flags_read |= PEEP_ALL_FLAGS;
+                    flags_written |= PEEP_ALL_FLAGS;
+                }
             }
             live_in = reads | (live_out & ~writes);
             flags_in = flags_read | (flags_out & ~flags_written);

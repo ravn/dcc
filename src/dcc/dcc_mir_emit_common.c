@@ -1,10 +1,20 @@
-/* dcc_mir_emit_common.c - shared scalar-value emission helpers used by
- * more than one MIR selector (homed prologue/epilogue, home<->HL/DE
- * moves, PHI copies, comparison fusion helpers) plus the
- * mir_try_emit_scalar_dag / mir_try_emit_homed_scalar_dag selectors
- * that are built directly on top of them.
+/**
+ * @file dcc_mir_emit_common.c
+ * @brief Provides scalar Z80 emission shared by multiple MIR candidates.
  *
- * Part of the dcc_mir.c MIR backend split; see dcc_mir_internal.h.
+ * @par Role
+ * Implements home/register moves, prologues and epilogues, address
+ * resolution, casts, arithmetic, comparisons, PHI copies, and other reusable
+ * scalar operations. It also owns the straight-line scalar DAG candidates.
+ * Also holds a handful of exact-schedule proof helpers (and their plan
+ * types) that are used by more than one dcc_mir_machine_*.c family, moved
+ * here from dcc_mir_machine_emit.c during the family split so they have one
+ * shared, non-static home instead of being duplicated per family.
+ *
+ * @par Key entry points
+ * mir_try_emit_scalar_dag(), mir_try_emit_homed_scalar_dag(), and the
+ * mir_emit_ and mir_machine_ helpers declared in dcc_mir_internal.h and
+ * dcc_mir_machine_internal.h.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +23,34 @@
 #include "dcc_ast.h"
 #include "dcc_mir.h"
 #include "dcc_mir_internal.h"
+#include "dcc_mir_machine_internal.h"
+
+/* Enum tag paired with the plan structs above (moved verbatim
+ * from dcc_mir_machine_emit.c). */
+
+enum MirMachineFormKind {
+    MIR_MACHINE_FORM_INTEGER = 1,
+    MIR_MACHINE_FORM_POINTER = 2
+};
+
+/* Shared plan-descriptor types used by the exact-schedule
+ * helpers above; moved here verbatim from dcc_mir_machine_emit.c
+ * during the family split (used by multiple sibling files). */
+
+struct MirStateMember {
+    struct Sym *root;
+    int root_offset;
+    int member_offset;
+};
+
+struct MirMachineForm {
+    int kind;
+    long value;
+    int storage;
+    int offset;
+    int pointer_terms;
+    char name[64];
+};
 
 void mir_emit_hl_and_const(MirStream *out, unsigned int mask)
 {
@@ -41,7 +79,8 @@ void mir_emit_bitfield_extract(MirStream *out, const struct MirInsn *insn)
     value_mask = insn->bit_width >= 16
         ? 0xffffU : (1U << insn->bit_width) - 1U;
     mir_emit_hl_and_const(out, value_mask);
-    if ((insn->type & TYPE_UNSIGNED) == 0 && insn->bit_width > 0 &&
+    if ((insn->type & TYPE_UNSIGNED) == 0 && !type_is_bool(insn->type) &&
+        insn->bit_width > 0 &&
         insn->bit_width < 16) {
         sign_label = new_label();
         if (insn->bit_width <= 8)
@@ -548,6 +587,78 @@ void mir_emit_scalar_shift(MirStream *out, int operation, int is_unsigned,
     mir_stream_printf(out, "\tdjnz L%d\nL%d:\n", loop_label, end_label);
 }
 
+static int mir_scalar_dag_type_is_emittable(int type)
+{
+    int width = type_size(type);
+
+    return width >= 1 && width <= 2 &&
+           type_ptr_depth(type) == 0 &&
+           !type_is_float(type) && !type_is_struct_object(type);
+}
+
+static int mir_scalar_parameter_is_emittable(
+    const struct MirInsn *definition)
+{
+    const struct MirObject *object;
+    long offset;
+    int width;
+
+    if (definition->object < 0 || definition->object >= mir.object_count)
+        return 0;
+    object = &mir.objects[definition->object];
+    if (object->storage != SC_PARAM ||
+        object->type != definition->type ||
+        !mir_scalar_dag_type_is_emittable(object->type))
+        return 0;
+    offset = object->offset;
+    width = type_size(object->type);
+    return offset >= -128 && offset + width - 1 <= 127;
+}
+
+static int mir_scalar_value_is_emittable(int value, int depth)
+{
+    const struct MirInsn *definition;
+
+    if (depth > 256)
+        return 0;
+    definition = mir_definition(value);
+    if (definition == NULL ||
+        !mir_scalar_dag_type_is_emittable(definition->type))
+        return 0;
+    switch (definition->opcode) {
+    case MIR_PARAM:
+        return mir_scalar_parameter_is_emittable(definition);
+    case MIR_CONST:
+        return 1;
+    case MIR_UNARY:
+        if (definition->immediate != 0 && definition->immediate != '+' &&
+            definition->immediate != '-' && definition->immediate != '~' &&
+            definition->immediate != '!')
+            return 0;
+        return mir_scalar_value_is_emittable(
+            definition->src1, depth + 1);
+    case MIR_BINARY:
+        switch ((int)definition->immediate) {
+        case '+': case '-': case '&': case '|': case '^': case '*':
+        case '/': case '%':
+        case TOK_EQ: case TOK_NE: case '<': case '>': case TOK_LE: case TOK_GE:
+        case TOK_SHL: case TOK_SHR:
+            break;
+        default:
+            return 0;
+        }
+        if (!mir_scalar_dag_type_is_emittable(
+                definition->secondary_offset))
+            return 0;
+        return mir_scalar_value_is_emittable(
+                   definition->src1, depth + 1) &&
+               mir_scalar_value_is_emittable(
+                   definition->src2, depth + 1);
+    default:
+        return 0;
+    }
+}
+
 static int mir_emit_scalar_value(MirStream *out, int value, int depth)
 {
     const struct MirInsn *definition;
@@ -562,11 +673,9 @@ static int mir_emit_scalar_value(MirStream *out, int value, int depth)
         return 0;
     switch (definition->opcode) {
     case MIR_PARAM:
-        if (definition->object < 0 || definition->object >= mir.object_count)
+        if (!mir_scalar_parameter_is_emittable(definition))
             return 0;
         object = &mir.objects[definition->object];
-        if (object->storage != SC_PARAM || type_size(object->type) > 2)
-            return 0;
         if (type_size(object->type) == 1) {
             mir_stream_printf(out, "\tld l,(ix%+d)\n", object->offset);
             if (type_is_bool(object->type)) {
@@ -589,7 +698,14 @@ static int mir_emit_scalar_value(MirStream *out, int value, int depth)
     case MIR_UNARY:
         if (!mir_emit_scalar_value(out, definition->src1, depth + 1))
             return 0;
-        if (definition->immediate == 0 || definition->immediate == '+')
+        if (definition->immediate == 0) {
+            const struct MirInsn *source =
+                mir_definition(definition->src1);
+
+            return source != NULL &&
+                   mir_emit_cast(out, source->type, definition->type);
+        }
+        if (definition->immediate == '+')
             return 1;
         if (definition->immediate == '-') {
             mir_stream_puts("\txor a\n\tsub l\n\tld l,a\n\tsbc a,a\n\tsub h\n\tld h,a\n", out);
@@ -708,24 +824,15 @@ static int mir_emit_scalar_value(MirStream *out, int value, int depth)
                 out, (definition->type & TYPE_UNSIGNED) != 0 ? "__modu" : "__mods");
             return 1;
         case TOK_EQ: case TOK_NE: case '<': case '>': case TOK_LE: case TOK_GE:
-            {
-                const struct MirInsn *left = mir_definition(definition->src1);
-                const struct MirInsn *right = mir_definition(definition->src2);
-                int is_unsigned =
-                    (left != NULL &&
-                     mir_type_uses_unsigned_comparison(left->type)) ||
-                    (right != NULL &&
-                     mir_type_uses_unsigned_comparison(right->type));
-                mir_emit_scalar_compare(out, (int)definition->immediate,
-                                        is_unsigned);
-            }
+            mir_emit_scalar_compare(out, (int)definition->immediate,
+                                    (definition->secondary_offset &
+                                     TYPE_UNSIGNED) != 0);
             return 1;
         case TOK_SHL: case TOK_SHR:
             {
-                const struct MirInsn *left = mir_definition(definition->src1);
                 mir_emit_scalar_shift(out, (int)definition->immediate,
-                                      left != NULL &&
-                                      (left->type & TYPE_UNSIGNED) != 0,
+                                      (definition->secondary_offset &
+                                       TYPE_UNSIGNED) != 0,
                                       definition->src2);
             }
             return 1;
@@ -742,7 +849,8 @@ int mir_try_emit_scalar_dag(MirStream *out)
     const struct MirInsn *return_insn = NULL;
     int i;
 
-    if ((mir.return_type & 15) != TYPE_INT || type_size(mir.return_type) > 2)
+    if ((mir.return_type & 15) != TYPE_INT ||
+        !mir_scalar_dag_type_is_emittable(mir.return_type))
         return 0;
     for (i = 0; i < mir.count; ++i) {
         const struct MirInsn *insn = &mir.insns[i];
@@ -758,6 +866,9 @@ int mir_try_emit_scalar_dag(MirStream *out)
         }
     }
     if (return_insn == NULL || return_insn->src1 < 0)
+        return 0;
+    /* Reject the whole DAG before prologue text or labels become observable. */
+    if (!mir_scalar_value_is_emittable(return_insn->src1, 0))
         return 0;
     mir_emit_prologue(out);
     if (!mir_emit_scalar_value(out, return_insn->src1, 0))
@@ -815,6 +926,17 @@ static int mir_home_spill_width(int value)
     const struct MirInsn *definition = mir_definition(value);
 
     return definition != NULL && type_size(definition->type) == 4 ? 4 : 2;
+}
+
+static int mir_home_is_byte_object(int value)
+{
+    const struct MirInsn *definition = mir_definition(value);
+
+    /* Pooled scalar spill slots stay word-sized. Only a regional named
+     * object home may use its value's true byte width. */
+    return definition != NULL &&
+           type_size(definition->type) == 1 &&
+           mir_regional_object_home_offset(value, NULL);
 }
 
 static int mir_home_spill_slot_width(int spill)
@@ -1028,8 +1150,12 @@ int mir_emit_home_to_hl(MirStream *out, int value)
     default:
         if (!mir_home_spill_offset(value, &offset))
             return 0;
-        mir_stream_printf(out, "\tld l,(ix%+d)\n\tld h,(ix%+d)\n",
-                offset, offset + 1);
+        mir_stream_printf(out, "\tld l,(ix%+d)\n", offset);
+        if (mir_home_is_byte_object(value))
+            mir_emit_byte_extension(
+                out, MIR_COLOR_HL, mir_definition(value)->type);
+        else
+            mir_stream_printf(out, "\tld h,(ix%+d)\n", offset + 1);
         return 1;
     }
 }
@@ -1059,10 +1185,16 @@ static int mir_emit_home_to_de(MirStream *out, int value)
     default:
         if (!mir_home_spill_offset(value, &offset))
             return 0;
-        mir_stream_puts("\tpush hl\n", out);
-        mir_stream_printf(out, "\tld l,(ix%+d)\n\tld h,(ix%+d)\n",
-                offset, offset + 1);
-        mir_stream_puts("\tex de,hl\n\tpop hl\n", out);
+        if (mir_home_is_byte_object(value)) {
+            mir_stream_printf(out, "\tld e,(ix%+d)\n", offset);
+            mir_emit_byte_extension(
+                out, MIR_COLOR_DE, mir_definition(value)->type);
+        } else {
+            mir_stream_puts("\tpush hl\n", out);
+            mir_stream_printf(out, "\tld l,(ix%+d)\n\tld h,(ix%+d)\n",
+                    offset, offset + 1);
+            mir_stream_puts("\tex de,hl\n\tpop hl\n", out);
+        }
         return 1;
     }
 }
@@ -1079,8 +1211,9 @@ int mir_emit_hl_to_home(MirStream *out, int value)
     default:
         if (!mir_home_spill_offset(value, &offset))
             return 0;
-        mir_stream_printf(out, "\tld (ix%+d),l\n\tld (ix%+d),h\n",
-                offset, offset + 1);
+        mir_stream_printf(out, "\tld (ix%+d),l\n", offset);
+        if (!mir_home_is_byte_object(value))
+            mir_stream_printf(out, "\tld (ix%+d),h\n", offset + 1);
         return 1;
     }
 }
@@ -1201,8 +1334,12 @@ int mir_emit_home_push(MirStream *out, int value)
         if (!mir_home_spill_offset(value, &offset))
             return 0;
         mir_stream_puts("\tpush hl\n", out);
-        mir_stream_printf(out, "\tld l,(ix%+d)\n\tld h,(ix%+d)\n",
-                offset, offset + 1);
+        mir_stream_printf(out, "\tld l,(ix%+d)\n", offset);
+        if (mir_home_is_byte_object(value))
+            mir_emit_byte_extension(
+                out, MIR_COLOR_HL, mir_definition(value)->type);
+        else
+            mir_stream_printf(out, "\tld h,(ix%+d)\n", offset + 1);
         mir_stream_puts("\tex (sp),hl\n", out);
         return 1;
     }
@@ -1357,8 +1494,10 @@ int mir_emit_constant_to_home(MirStream *out, int value, long immediate)
             return 0;
         mir_stream_puts("\tpush hl\n", out);
         mir_stream_printf(out,
-                "\tld hl,%ld\n\tld (ix%+d),l\n\tld (ix%+d),h\n",
-                immediate & 0xffffL, offset, offset + 1);
+                "\tld hl,%ld\n\tld (ix%+d),l\n",
+                immediate & 0xffffL, offset);
+        if (!mir_home_is_byte_object(value))
+            mir_stream_printf(out, "\tld (ix%+d),h\n", offset + 1);
         mir_stream_puts("\tpop hl\n", out);
         return 1;
     }
@@ -1453,6 +1592,23 @@ int mir_emit_cast(MirStream *out, int source_type, int target_type)
                 mir_stream_puts("\tld a,l\n\trlca\n\tsbc a,a\n\tld h,a\n", out);
         }
         return 1;
+    }
+    if (type_size(source_type) == 1 && type_size(target_type) == 4) {
+        /* Extend directly from the byte in L.  Going through the generic
+         * byte-to-word path first made signed conversions compute the same
+         * sign byte twice (once for H, then again from H for DE). */
+        if ((source_type & TYPE_UNSIGNED) != 0 || type_is_bool(source_type))
+            mir_stream_puts("\tld h,0\n\tld de,0\n", out);
+        else
+            mir_stream_puts("\tld a,l\n\trlca\n\tsbc a,a\n"
+                            "\tld h,a\n\tld d,a\n\tld e,a\n", out);
+        return 1;
+    }
+    if (type_size(source_type) == 1 && type_size(target_type) >= 2) {
+        if ((source_type & TYPE_UNSIGNED) != 0 || type_is_bool(source_type))
+            mir_stream_puts("\tld h,0\n", out);
+        else
+            mir_stream_puts("\tld a,l\n\trlca\n\tsbc a,a\n\tld h,a\n", out);
     }
     if (type_size(target_type) == 4 && type_size(source_type) <= 2) {
         if ((source_type & TYPE_UNSIGNED) != 0 ||
@@ -1569,8 +1725,10 @@ int mir_emit_byte_param_to_home(MirStream *out, int value, int offset, int type)
         mir_stream_puts("\tpush hl\n", out);
         mir_stream_printf(out, "\tld l,(ix%+d)\n", offset);
         mir_emit_byte_extension(out, MIR_COLOR_HL, type);
-        mir_stream_printf(out, "\tld (ix%+d),l\n\tld (ix%+d),h\n",
-                spill_offset, spill_offset + 1);
+        mir_stream_printf(out, "\tld (ix%+d),l\n", spill_offset);
+        if (!mir_home_is_byte_object(value))
+            mir_stream_printf(out, "\tld (ix%+d),h\n",
+                    spill_offset + 1);
         mir_stream_puts("\tpop hl\n", out);
         return 1;
     }
@@ -1616,8 +1774,13 @@ static int mir_emit_push_home(MirStream *out, int value)
         if (!mir_home_spill_offset(value, &offset))
             return 0;
         mir_stream_puts("\texx\n", out);
-        mir_stream_printf(out, "\tld l,(ix%+d)\n\tld h,(ix%+d)\n\tpush hl\n",
-                offset, offset + 1);
+        mir_stream_printf(out, "\tld l,(ix%+d)\n", offset);
+        if (mir_home_is_byte_object(value))
+            mir_emit_byte_extension(
+                out, MIR_COLOR_HL, mir_definition(value)->type);
+        else
+            mir_stream_printf(out, "\tld h,(ix%+d)\n", offset + 1);
+        mir_stream_puts("\tpush hl\n", out);
         mir_stream_puts("\texx\n", out);
         return 1;
     }
@@ -1657,8 +1820,9 @@ static int mir_emit_pop_home(MirStream *out, int value)
         if (!mir_home_spill_offset(value, &offset))
             return 0;
         mir_stream_puts("\texx\n", out);
-        mir_stream_printf(out, "\tpop hl\n\tld (ix%+d),l\n\tld (ix%+d),h\n",
-                offset, offset + 1);
+        mir_stream_printf(out, "\tpop hl\n\tld (ix%+d),l\n", offset);
+        if (!mir_home_is_byte_object(value))
+            mir_stream_printf(out, "\tld (ix%+d),h\n", offset + 1);
         mir_stream_puts("\texx\n", out);
         return 1;
     }
@@ -1672,8 +1836,8 @@ static int mir_homed_values_share_home(int left, int right)
     if (mir_regional_object_home_offset(left, &left_offset) &&
         mir_regional_object_home_offset(right, &right_offset) &&
         left_offset == right_offset &&
-        mir_home_spill_width(left) ==
-            mir_home_spill_width(right))
+        type_size(mir_definition(left)->type) ==
+            type_size(mir_definition(right)->type))
         return 1;
     if (mir.allocation_colors[left] >= 0 ||
         mir.allocation_colors[right] >= 0)
@@ -1686,25 +1850,35 @@ static int mir_homed_values_share_home(int left, int right)
                mir_home_spill_width(right);
 }
 
-int mir_phi_source_for_edge(const struct MirInsn *phi,
-                                   int predecessor_label, int edge_label,
-                                   int successor, int phi_instruction)
+int mir_phi_slot_for_edge(const struct MirInsn *phi,
+                          int predecessor_label, int edge_label,
+                          int successor, int phi_instruction)
 {
     int instruction;
     if (predecessor_label == phi->phi_pred1 || edge_label == phi->phi_pred1)
-        return phi->src1;
+        return 0;
     if (predecessor_label == phi->phi_pred2 || edge_label == phi->phi_pred2)
-        return phi->src2;
+        return 1;
     for (instruction = successor;
          instruction >= 0 && instruction < phi_instruction;
          ++instruction)
         if (mir.insns[instruction].opcode == MIR_LABEL) {
             if (mir.insns[instruction].label == phi->phi_pred1)
-                return phi->src1;
+                return 0;
             if (mir.insns[instruction].label == phi->phi_pred2)
-                return phi->src2;
+                return 1;
         }
     return -1;
+}
+
+int mir_phi_source_for_edge(const struct MirInsn *phi,
+                            int predecessor_label, int edge_label,
+                            int successor, int phi_instruction)
+{
+    int slot = mir_phi_slot_for_edge(
+        phi, predecessor_label, edge_label, successor, phi_instruction);
+
+    return slot == 0 ? phi->src1 : slot == 1 ? phi->src2 : -1;
 }
 
 int mir_emit_homed_phi_copies(MirStream *out, int predecessor,
@@ -2050,7 +2224,7 @@ void mir_emit_home_epilogue(MirStream *out, int uses_iy)
     mir_stream_puts("\tret\n", out);
 }
 
-static int mir_value_is_normalized_byte(int value, int type, int depth)
+int mir_value_is_normalized_byte(int value, int type, int depth)
 {
     const struct MirInsn *definition;
     unsigned long bits;
@@ -2067,6 +2241,24 @@ static int mir_value_is_normalized_byte(int value, int type, int depth)
         return (bits & 0xff80UL) == 0 ||
                (bits & 0xff80UL) == 0xff80UL;
     }
+    /* Byte loads and explicit narrowing casts already establish the C value
+     * in HL.  Byte arithmetic is deliberately excluded: its high byte can
+     * retain carry/sign debris and must be normalized before promotion. */
+    if ((definition->opcode == MIR_LOAD ||
+         definition->opcode == MIR_LOAD_INDIRECT ||
+         definition->opcode == MIR_PARAM ||
+         definition->opcode == MIR_CALL) &&
+        type_size(definition->type) == 1 &&
+        (((definition->type & TYPE_UNSIGNED) != 0 ||
+          type_is_bool(definition->type)) ==
+         (((type & TYPE_UNSIGNED) != 0) || type_is_bool(type))))
+        return 1;
+    if (definition->opcode == MIR_UNARY && definition->immediate == 0 &&
+        type_size(definition->type) == 1 &&
+        (((definition->type & TYPE_UNSIGNED) != 0 ||
+          type_is_bool(definition->type)) ==
+         (((type & TYPE_UNSIGNED) != 0) || type_is_bool(type))))
+        return 1;
     if (definition->opcode == MIR_PHI)
         return mir_value_is_normalized_byte(
                    definition->src1, type, depth + 1) &&
@@ -2145,7 +2337,25 @@ int mir_emit_homed_unary_instruction(MirStream *out,
         if (mir_float_identity_unary(insn)) {
             /* The value already has the target representation. */
         } else if (insn->immediate == 0) {
-            if (!mir_emit_cast(out, source_type, insn->type))
+            int cast_source_type = source_type;
+
+            /* A normalized byte already has its correct H byte.  For a
+             * wide destination only extend that word into DE; repeating the
+             * byte normalization costs an instruction and can duplicate a
+             * signed extension sequence. */
+            if (type_size(source_type) == 1 &&
+                type_size(insn->type) >= 2 &&
+                mir_value_is_normalized_byte(
+                    insn->src1, source_type, 0)) {
+                if (type_size(insn->type) == 2)
+                    cast_source_type = insn->type;
+                else
+                    cast_source_type =
+                        ((source_type & TYPE_UNSIGNED) != 0 ||
+                         type_is_bool(source_type))
+                            ? (TYPE_INT | TYPE_UNSIGNED) : TYPE_INT;
+            }
+            if (!mir_emit_cast(out, cast_source_type, insn->type))
                 return 0;
         } else if (insn->immediate == '+') {
             if (!source_wide || !target_wide)
@@ -2246,7 +2456,6 @@ int mir_emit_homed_binary_instruction(MirStream *out,
     int preserve_hl_de;
     int preserve_hl;
     int preserve_de;
-    const struct MirInsn *left_definition;
     const struct MirInsn *right_definition;
     int comparison_unsigned;
     int biased_right_constant;
@@ -2271,13 +2480,9 @@ int mir_emit_homed_binary_instruction(MirStream *out,
             mir.allocation_colors[insn->dst] != MIR_COLOR_DE &&
             !(mir.allocation_colors[right] == MIR_COLOR_DE &&
               !mir_value_has_use_after(right, instruction));
-        left_definition = mir_definition(left);
         right_definition = mir_definition(right);
-        comparison_unsigned =
-            (left_definition != NULL &&
-             mir_type_uses_unsigned_comparison(left_definition->type)) ||
-            (right_definition != NULL &&
-             mir_type_uses_unsigned_comparison(right_definition->type));
+        comparison_unsigned = mir_type_uses_unsigned_comparison(
+            insn->secondary_offset);
         biased_right_constant = allow_comparison && !comparison_unsigned &&
                                 (insn->immediate == '<' ||
                                  insn->immediate == TOK_GE) &&
@@ -2416,6 +2621,318 @@ static int mir_compare_is_general_form(int compare_index)
     return 1;
 }
 
+static int mir_homed_scalar_dag_home_is_emittable(int value)
+{
+    return value >= 0 && value < mir.next_value &&
+           mir.allocation_colors[value] >= MIR_COLOR_HL &&
+           mir.allocation_colors[value] <= MIR_COLOR_IY;
+}
+
+static int mir_homed_scalar_dag_promoted_type(int type)
+{
+    if (type_size(type) == 1)
+        return TYPE_INT;
+    return TYPE_INT | (type & TYPE_UNSIGNED);
+}
+
+static int mir_homed_scalar_dag_identity_conversion(int source_type,
+                                                    int target_type)
+{
+    if (!mir_scalar_dag_type_is_emittable(source_type) ||
+        !mir_scalar_dag_type_is_emittable(target_type))
+        return 0;
+    if (type_is_bool(target_type))
+        return type_is_bool(source_type);
+    if (type_size(target_type) == 2)
+        return 1;
+    return source_type == target_type;
+}
+
+static int mir_homed_scalar_dag_constant_is_normalized(
+    int type, long value)
+{
+    unsigned long mask = type_size(type) == 1 ? 0xffUL : 0xffffUL;
+    unsigned long bits = (unsigned long)value & mask;
+
+    if (type_is_bool(type))
+        return value == 0 || value == 1;
+    if ((type & TYPE_UNSIGNED) == 0 &&
+        (bits & (type_size(type) == 1 ? 0x80UL : 0x8000UL)) != 0)
+        bits |= ~mask;
+    return (long)bits == value;
+}
+
+static int mir_homed_scalar_dag_name_is_terminated(const char name[64])
+{
+    return memchr(name, 0, 64) != NULL;
+}
+
+static int mir_homed_scalar_dag_parameter_is_volatile(
+    const struct MirObject *object)
+{
+    int declared;
+
+    for (declared = 0; declared < mir.declared_count; ++declared)
+        if (mir_homed_scalar_dag_name_is_terminated(
+                mir.declared_names[declared]) &&
+            !strcmp(mir.declared_names[declared], object->name) &&
+            mir.declared_is_volatile[declared])
+            return 1;
+    return 0;
+}
+
+static int mir_homed_scalar_dag_preflight(int *uses_iy_out,
+                                          int *frameless_out)
+{
+    /* The only production caller caps general-rollout graphs at 64 MIR
+     * instructions before reaching this dedicated emitter. */
+    enum { MIR_HOMED_SCALAR_DAG_MAX_VALUES = 64 };
+    int definitions[MIR_HOMED_SCALAR_DAG_MAX_VALUES];
+    int last_uses[MIR_HOMED_SCALAR_DAG_MAX_VALUES];
+    int owners[4] = {-1, -1, -1, -1};
+    int parameter_count = 0;
+    int operation_count = 0;
+    int label_count = 0;
+    int return_value = -1;
+    int terminated = 0;
+    int saw_body = 0;
+    int effective_local_bytes;
+    int uses_iy = 0;
+    int frameless;
+    int i;
+
+    if (mir.insns == NULL || mir.count <= 0 ||
+        mir.count > mir.capacity ||
+        mir.count > MIR_HOMED_SCALAR_DAG_MAX_VALUES ||
+        mir.next_value <= 0 || mir.next_value > mir.count ||
+        mir.next_value > mir.allocation_capacity ||
+        mir.next_value > MIR_HOMED_SCALAR_DAG_MAX_VALUES ||
+        mir.next_label != 1 ||
+        mir.object_count < 0 ||
+        mir.object_count > (int)(sizeof(mir.objects) / sizeof(mir.objects[0])) ||
+        mir.declared_count < 0 || mir.declared_count > MAX_LOCALS ||
+        mir.allocation_spill_count != 0 ||
+        mir.allocation_colors == NULL ||
+        mir.aggregate_temp_bytes != 0)
+        return 0;
+    if ((long)mir.local_bytes - (long)mir.dead_local_suffix_bytes < 0 ||
+        (long)mir.local_bytes - (long)mir.dead_local_suffix_bytes > 30000 ||
+        (mir.return_type & 15) != TYPE_INT ||
+        type_ptr_depth(mir.return_type) != 0 ||
+        !mir_scalar_dag_type_is_emittable(mir.return_type))
+        return 0;
+    effective_local_bytes = mir.local_bytes - mir.dead_local_suffix_bytes;
+    for (i = 0; i < mir.declared_count; ++i)
+        if (!mir_homed_scalar_dag_name_is_terminated(
+                mir.declared_names[i]))
+            return 0;
+    for (i = 0; i < mir.next_value; ++i) {
+        definitions[i] = -1;
+        last_uses[i] = -1;
+    }
+    for (i = 0; i < mir.count; ++i) {
+        const struct MirInsn *insn = &mir.insns[i];
+        const struct MirInsn *source;
+        const struct MirObject *object;
+        int common_type;
+        int declared;
+
+        if ((insn->opcode == MIR_RETURN
+                 ? insn->successor_count != 0
+                 : (insn->successor_count != 1 ||
+                    insn->successors[0] != i + 1)) ||
+            (terminated && insn->opcode != MIR_NOP))
+            return 0;
+        if (insn->dst >= 0 &&
+            (insn->dst >= mir.next_value ||
+             definitions[insn->dst] >= 0 ||
+             type_ptr_depth(insn->type) != 0 ||
+             !mir_scalar_dag_type_is_emittable(insn->type)))
+            return 0;
+        switch (insn->opcode) {
+        case MIR_NOP:
+            if (insn->dst >= 0)
+                return 0;
+            break;
+        case MIR_LABEL:
+            if (insn->dst >= 0 || label_count != 0 || insn->label != 0 ||
+                saw_body)
+                return 0;
+            ++label_count;
+            break;
+        case MIR_PARAM:
+            if (insn->dst < 0 ||
+                insn->object < 0 || insn->object >= mir.object_count)
+                return 0;
+            object = &mir.objects[insn->object];
+            if (object->storage != SC_PARAM ||
+                object->type != insn->type ||
+                object->entry_value != insn->dst ||
+                object->name[0] == 0 ||
+                !mir_homed_scalar_dag_name_is_terminated(object->name) ||
+                !mir_homed_scalar_dag_name_is_terminated(insn->name) ||
+                strcmp(object->name, insn->name) != 0 ||
+                type_ptr_depth(object->type) != 0 ||
+                !mir_scalar_dag_type_is_emittable(object->type) ||
+                object->offset < 2 || object->offset > 32767 ||
+                mir_homed_scalar_dag_parameter_is_volatile(object))
+                return 0;
+            for (declared = 0; declared < mir.declared_count; ++declared)
+                if (!strcmp(mir.declared_names[declared], object->name) &&
+                    (mir.declared_storage[declared] != SC_PARAM ||
+                     mir.declared_types[declared] != object->type))
+                    return 0;
+            ++parameter_count;
+            saw_body = 1;
+            break;
+        case MIR_CONST:
+            if (insn->dst < 0 ||
+                !mir_homed_scalar_dag_constant_is_normalized(
+                    insn->type, insn->immediate))
+                return 0;
+            saw_body = 1;
+            break;
+        case MIR_UNARY:
+            if (insn->dst < 0 || insn->src1 < 0 ||
+                insn->src1 >= mir.next_value ||
+                definitions[insn->src1] < 0)
+                return 0;
+            source = &mir.insns[definitions[insn->src1]];
+            if (insn->immediate == 0) {
+                if (!mir_homed_scalar_dag_identity_conversion(
+                        source->type, insn->type))
+                    return 0;
+            } else if (insn->immediate == '+' ||
+                       insn->immediate == '-' ||
+                       insn->immediate == '~') {
+                if (insn->type !=
+                    mir_homed_scalar_dag_promoted_type(source->type))
+                    return 0;
+            } else if (insn->immediate == '!') {
+                if (insn->type != TYPE_INT)
+                    return 0;
+            } else {
+                return 0;
+            }
+            last_uses[insn->src1] = i;
+            ++operation_count;
+            saw_body = 1;
+            break;
+        case MIR_BINARY:
+            if (insn->dst < 0 ||
+                insn->src1 < 0 || insn->src1 >= mir.next_value ||
+                insn->src2 < 0 || insn->src2 >= mir.next_value ||
+                definitions[insn->src1] < 0 ||
+                definitions[insn->src2] < 0)
+                return 0;
+            if (insn->immediate != '+' && insn->immediate != '-' &&
+                insn->immediate != '&' && insn->immediate != '|' &&
+                insn->immediate != '^')
+                return 0;
+            common_type =
+                mir_homed_scalar_dag_promoted_type(
+                    mir.insns[definitions[insn->src1]].type);
+            if ((mir_homed_scalar_dag_promoted_type(
+                    mir.insns[definitions[insn->src2]].type) &
+                 TYPE_UNSIGNED) != 0)
+                common_type |= TYPE_UNSIGNED;
+            if (insn->secondary_offset != common_type ||
+                insn->type != common_type ||
+                mir.allocation_colors[insn->src2] == MIR_COLOR_HL)
+                return 0;
+            last_uses[insn->src1] = i;
+            last_uses[insn->src2] = i;
+            ++operation_count;
+            saw_body = 1;
+            break;
+        case MIR_RETURN:
+            if (insn->dst >= 0 || return_value >= 0 ||
+                insn->src1 < 0 || insn->src1 >= mir.next_value ||
+                definitions[insn->src1] < 0 ||
+                !mir_homed_scalar_dag_identity_conversion(
+                    mir.insns[definitions[insn->src1]].type,
+                    mir.return_type))
+                return 0;
+            return_value = insn->src1;
+            last_uses[insn->src1] = i;
+            terminated = 1;
+            saw_body = 1;
+            break;
+        default:
+            return 0;
+        }
+        if (insn->dst >= 0) {
+            if (!mir_homed_scalar_dag_home_is_emittable(insn->dst))
+                return 0;
+            definitions[insn->dst] = i;
+            if (last_uses[insn->dst] < i)
+                last_uses[insn->dst] = i;
+            if (mir.allocation_colors[insn->dst] == MIR_COLOR_IY)
+                uses_iy = 1;
+        }
+    }
+    if (label_count != 1 || return_value < 0 ||
+        (parameter_count == 0 && operation_count == 0))
+        return 0;
+
+    for (i = 0; i < mir.count; ++i) {
+        const struct MirInsn *insn = &mir.insns[i];
+        int color;
+
+        for (color = 0; color < 4; ++color)
+            if (owners[color] >= 0 &&
+                last_uses[owners[color]] < i)
+                owners[color] = -1;
+        /* DE-to-HL is a push/pop copy, and binary emission separately saves
+         * DE before loading a distinct right operand. Only a live HL source
+         * is destructively consumed by these direct operations. */
+        if ((insn->opcode == MIR_UNARY ||
+             insn->opcode == MIR_BINARY) &&
+            last_uses[insn->src1] > i &&
+            mir.allocation_colors[insn->src1] == MIR_COLOR_HL)
+            return 0;
+        if (insn->dst >= 0) {
+            color = mir.allocation_colors[insn->dst] - MIR_COLOR_HL;
+            if (owners[color] >= 0 &&
+                last_uses[owners[color]] > i)
+                return 0;
+        }
+        for (color = 0; color < 4; ++color)
+            if (owners[color] >= 0 &&
+                last_uses[owners[color]] <= i)
+                owners[color] = -1;
+        if (insn->dst >= 0 && last_uses[insn->dst] > i) {
+            color = mir.allocation_colors[insn->dst] - MIR_COLOR_HL;
+            owners[color] = insn->dst;
+        }
+    }
+
+    frameless = !uses_iy && effective_local_bytes == 0;
+    if (frameless) {
+        for (i = 0; i < mir.count; ++i)
+            if (mir.insns[i].opcode == MIR_PARAM &&
+                type_size(mir.objects[mir.insns[i].object].type) != 2)
+                frameless = 0;
+    }
+    if (!frameless) {
+        for (i = 0; i < mir.count; ++i)
+            if (mir.insns[i].opcode == MIR_PARAM) {
+                const struct MirObject *object =
+                    &mir.objects[mir.insns[i].object];
+                long parameter_offset =
+                    (long)object->offset + (uses_iy ? 2L : 0L);
+                int width = type_size(object->type);
+
+                if (parameter_offset < -128 ||
+                    parameter_offset + width - 1 > 127)
+                    return 0;
+            }
+    }
+    *uses_iy_out = uses_iy;
+    *frameless_out = frameless;
+    return 1;
+}
+
 int mir_has_phi_instruction(void)
 {
     int instruction;
@@ -2461,7 +2978,6 @@ int mir_emit_homed_compare_false(MirStream *out,
 {    int left = compare->src1;    int right = compare->src2;
     int instruction = (int)(compare - mir.insns);
     int operation = (int)compare->immediate;
-    const struct MirInsn *left_definition;
     const struct MirInsn *right_definition;
     int preserve_hl_de;
     int preserve_hl;
@@ -2470,13 +2986,11 @@ int mir_emit_homed_compare_false(MirStream *out,
     int biased_right_constant;
 
     right_definition = mir_definition(right);
-    left_definition = mir_definition(left);
     if (right_definition != NULL && right_definition->opcode == MIR_CONST &&
         right_definition->immediate == 0 &&
         mir.allocation_colors[left] == MIR_COLOR_HL) {
-        is_unsigned =
-            left_definition != NULL &&
-            mir_type_uses_unsigned_comparison(left_definition->type);
+        is_unsigned = mir_type_uses_unsigned_comparison(
+            compare->secondary_offset);
         if (operation == '>') {
             if (is_unsigned) {
                 mir_stream_puts("\tld a,h\n\tor l\n", out);
@@ -2520,13 +3034,13 @@ int mir_emit_homed_compare_false(MirStream *out,
         right = temporary;
         operation = operation == '>' ? '<' : TOK_GE;
     }
-    left_definition = mir_definition(left);
     right_definition = mir_definition(right);
-    is_unsigned =
-        (left_definition != NULL &&
-         mir_type_uses_unsigned_comparison(left_definition->type)) ||
-        (right_definition != NULL &&
-         mir_type_uses_unsigned_comparison(right_definition->type));
+    /* Use the common operand type recorded after integer promotions and
+     * usual arithmetic conversions.  Same-width casts do not create a new
+     * machine value, so the source definitions can retain the opposite
+     * signedness from the comparison required by C. */
+    is_unsigned = mir_type_uses_unsigned_comparison(
+        compare->secondary_offset);
     biased_right_constant =
         !is_unsigned &&
         (operation == '<' || operation == TOK_GE) &&
@@ -2585,69 +3099,12 @@ int mir_try_emit_homed_scalar_dag(MirStream *out)
 {
     int uses_iy;
     int frameless;
-    int return_value = -1;
-    int parameter_count = 0;
-    int operation_count = 0;
     int i;
 
-    if ((mir.return_type & 15) != TYPE_INT || type_size(mir.return_type) > 2 ||
-        mir.allocation_spill_count != 0)
+    /* Prove every later helper call before stack-check text, extern state, or
+     * generated labels become observable to a declined direct attempt. */
+    if (!mir_homed_scalar_dag_preflight(&uses_iy, &frameless))
         return 0;
-    for (i = 0; i < mir.count; ++i) {
-        const struct MirInsn *insn = &mir.insns[i];
-        if ((insn->dst >= 0 && type_size(insn->type) > 2) ||
-            (insn->opcode == MIR_BINARY &&
-             type_size(insn->secondary_offset) > 2))
-            return 0;
-        if (insn->dst >= 0 && mir.allocation_colors[insn->dst] < 0)
-            return 0;
-        if (insn->opcode == MIR_STORE && insn->object < 0)
-            return 0;
-        switch (insn->opcode) {
-        case MIR_NOP: case MIR_LABEL: case MIR_CONST:
-            break;
-        case MIR_PARAM:
-            ++parameter_count;
-            break;
-        case MIR_UNARY:
-            ++operation_count;
-            if (insn->immediate != 0 && insn->immediate != '+' &&
-                insn->immediate != '-' && insn->immediate != '~' &&
-                insn->immediate != '!')
-                return 0;
-            break;
-        case MIR_BINARY:
-            ++operation_count;
-            if (insn->immediate != '+' && insn->immediate != '-' &&
-                insn->immediate != '&' && insn->immediate != '|' &&
-                insn->immediate != '^')
-                return 0;
-            if (mir.allocation_colors[insn->src2] == MIR_COLOR_HL)
-                return 0;
-            break;
-        case MIR_RETURN:
-            if (return_value >= 0)
-                return 0;
-            return_value = insn->src1;
-            break;
-        default:
-            return 0;
-        }
-    }
-    if (return_value < 0)
-        return 0;
-    if (parameter_count == 0 && operation_count == 0)
-        return 0;
-
-    uses_iy = mir_home_uses_iy();
-    frameless = !uses_iy && mir_effective_local_bytes() == 0;
-    if (frameless) {
-        for (i = 0; i < mir.count; ++i)
-            if (mir.insns[i].opcode == MIR_PARAM &&
-                mir.insns[i].object >= 0 &&
-                type_size(mir.objects[mir.insns[i].object].type) != 2)
-                frameless = 0;
-    }
     if (frameless) {
         if (opt_stack_check)
             mir_emit_runtime_call(out, "__stchk");
@@ -2770,4 +3227,674 @@ int mir_try_emit_homed_scalar_dag(MirStream *out)
         }
     }
     return 1;
+}
+
+int mir_machine_convert_integer(
+    long value, int type, long *result)
+{
+    int width = type_size(type);
+    unsigned long bits;
+    unsigned long mask;
+    unsigned long sign;
+
+    if (type_ptr_depth(type) != 0 || type_is_float(type) ||
+        (type & 15) == TYPE_BOOL ||
+        (width != 1 && width != 2 && width != 4))
+        return 0;
+    mask = width == 1 ? 0xffUL :
+           width == 2 ? 0xffffUL : 0xffffffffUL;
+    sign = width == 1 ? 0x80UL :
+           width == 2 ? 0x8000UL : 0x80000000UL;
+    bits = (unsigned long)value & mask;
+    if ((type & TYPE_UNSIGNED) == 0 && (bits & sign) != 0)
+        bits |= ~mask;
+    *result = (long)bits;
+    return 1;
+}
+
+
+const struct MirInsn *mir_machine_resolve_local_alias(int value)
+{
+    const struct MirInsn *definition = mir_definition(value);
+    int definition_index;
+    int instruction;
+    const struct MirInsn *stored = NULL;
+
+    if (definition == NULL || definition->opcode != MIR_LOAD)
+        return definition;
+    definition_index = (int)(definition - mir.insns);
+    for (instruction = 0; instruction < definition_index; ++instruction) {
+        const struct MirInsn *candidate = &mir.insns[instruction];
+
+        if (candidate->opcode == MIR_ADDRESS &&
+            !strcmp(candidate->name, definition->name))
+            return NULL;
+        if (candidate->opcode == MIR_STORE &&
+            mir_machine_same_location(candidate, definition))
+            stored = candidate;
+    }
+    return stored != NULL ? mir_definition(stored->src1) : NULL;
+}
+
+/* Private copy of mir_machine_fold_integer_binary (small helper
+ * duplicated per family file rather than shared, matching
+ * existing convention; needed here too for mir_machine_pointer_form). */
+static int mir_machine_fold_integer_binary(
+    int operation, long left, long right, int type, long *result)
+{
+    int width = type_size(type);
+    int is_unsigned = (type & TYPE_UNSIGNED) != 0;
+    unsigned long long mask;
+    unsigned long long sign;
+    unsigned long long modulus;
+    unsigned long long lhs;
+    unsigned long long rhs;
+    unsigned long long bits;
+
+    if (width != 1 && width != 2 && width != 4)
+        return 0;
+    mask = width == 1 ? 0xffULL :
+           width == 2 ? 0xffffULL : 0xffffffffULL;
+    sign = width == 1 ? 0x80ULL :
+           width == 2 ? 0x8000ULL : 0x80000000ULL;
+    modulus = mask + 1ULL;
+    lhs = (unsigned long long)(unsigned long)left & mask;
+    rhs = (unsigned long long)(unsigned long)right & mask;
+    if (operation == '&') {
+        bits = lhs & rhs;
+        goto convert_result;
+    }
+    if (operation == '|') {
+        bits = lhs | rhs;
+        goto convert_result;
+    }
+    if (operation == '^') {
+        bits = lhs ^ rhs;
+        goto convert_result;
+    }
+    if (is_unsigned) {
+        switch (operation) {
+        case '+': bits = lhs + rhs; break;
+        case '-': bits = lhs - rhs; break;
+        case '*': bits = lhs * rhs; break;
+        case '/':
+            if (rhs == 0)
+                return 0;
+            bits = lhs / rhs;
+            break;
+        case '%':
+            if (rhs == 0)
+                return 0;
+            bits = lhs % rhs;
+            break;
+        default:
+            return 0;
+        }
+    } else {
+        long long signed_lhs = (lhs & sign) != 0
+            ? (long long)(lhs - modulus) : (long long)lhs;
+        long long signed_rhs = (rhs & sign) != 0
+            ? (long long)(rhs - modulus) : (long long)rhs;
+        long long signed_value;
+
+        switch (operation) {
+        case '+': signed_value = signed_lhs + signed_rhs; break;
+        case '-': signed_value = signed_lhs - signed_rhs; break;
+        case '*': signed_value = signed_lhs * signed_rhs; break;
+        case '/':
+            if (signed_rhs == 0)
+                return 0;
+            if (signed_lhs == -(long long)sign && signed_rhs == -1)
+                return 0;
+            signed_value = signed_lhs / signed_rhs;
+            break;
+        case '%':
+            if (signed_rhs == 0)
+                return 0;
+            if (signed_lhs == -(long long)sign && signed_rhs == -1)
+                return 0;
+            signed_value = signed_lhs % signed_rhs;
+            break;
+        default:
+            return 0;
+        }
+        bits = (unsigned long long)signed_value;
+    }
+convert_result:
+    bits &= mask;
+    if (is_unsigned)
+        *result = (long)(unsigned long)bits;
+    else if ((bits & sign) != 0)
+        *result = (long)((long long)bits - (long long)modulus);
+    else
+        *result = (long)bits;
+    return 1;
+}
+
+int mir_machine_pointer_form(
+    int value, int before, struct MirMachineForm *form, int depth)
+{
+    const struct MirInsn *definition;
+    int definition_index;
+
+    if (depth > 32)
+        return 0;
+    definition = mir_definition(value);
+    if (definition == NULL)
+        return 0;
+    definition_index = (int)(definition - mir.insns);
+    if (definition_index >= before)
+        return 0;
+    if (definition->opcode == MIR_CONST) {
+        long converted;
+
+        if (!mir_machine_convert_integer(
+                definition->immediate, definition->type,
+                &converted))
+            return 0;
+        form->kind = MIR_MACHINE_FORM_INTEGER;
+        form->value = converted;
+        form->storage = 0;
+        form->offset = 0;
+        form->pointer_terms = 0;
+        form->name[0] = 0;
+        return 1;
+    }
+    if (definition->opcode == MIR_ADDRESS) {
+        int memory_type;
+        int memory_storage;
+        int memory_offset;
+
+        if (!mir_scalar_memory_location(
+                definition, &memory_type, &memory_storage,
+                &memory_offset) ||
+            (memory_storage != SC_LOCAL &&
+             memory_storage != SC_GLOBAL) ||
+            mir_declared_is_vla_object(definition->name))
+            return 0;
+        form->kind = MIR_MACHINE_FORM_POINTER;
+        form->value = 0;
+        form->storage = memory_storage;
+        form->offset = memory_offset;
+        form->pointer_terms = 1;
+        snprintf(form->name, sizeof(form->name), "%s",
+                 definition->name);
+        return 1;
+    }
+    if (definition->opcode == MIR_LOAD) {
+        const struct MirInsn *stored =
+            mir_machine_resolve_local_alias(value);
+
+        if (stored == NULL &&
+            getenv("DCC_MIR_POINTER_REPORT") != NULL)
+            fprintf(stderr,
+                    "; MIR pointer function=%s value=%d reject=alias\n",
+                    mir.name, value);
+        return stored != NULL &&
+               mir_machine_pointer_form(
+                   stored->dst, definition_index,
+                   form, depth + 1);
+    }
+    if (definition->opcode == MIR_UNARY &&
+        definition->immediate == 0) {
+        struct MirMachineForm source;
+        const struct MirInsn *source_definition =
+            mir_definition(definition->src1);
+
+        if (!mir_machine_pointer_form(
+                definition->src1, definition_index,
+                &source, depth + 1))
+            return 0;
+        if (source.kind == MIR_MACHINE_FORM_POINTER) {
+            if (source_definition == NULL ||
+                type_ptr_depth(source_definition->type) == 0 ||
+                type_ptr_depth(definition->type) !=
+                    type_ptr_depth(source_definition->type) ||
+                type_size(definition->type) != 2 ||
+                type_size(source_definition->type) != 2)
+                return 0;
+            *form = source;
+            return 1;
+        }
+        *form = source;
+        return mir_machine_convert_integer(
+            source.value, definition->type, &form->value);
+    }
+    if (definition->opcode == MIR_INDEX_ADDRESS) {
+        struct MirMachineForm base;
+        struct MirMachineForm index;
+        long scaled;
+
+        if (definition->immediate <= 0 ||
+            !mir_machine_pointer_form(
+                definition->src1, definition_index,
+                &base, depth + 1) ||
+            !mir_machine_pointer_form(
+                definition->src2, definition_index,
+                &index, depth + 1) ||
+            base.kind != MIR_MACHINE_FORM_POINTER ||
+            index.kind != MIR_MACHINE_FORM_INTEGER ||
+            !mir_machine_fold_integer_binary(
+                '*', index.value, definition->immediate,
+                TYPE_INT, &scaled))
+            return 0;
+        *form = base;
+        form->value += scaled;
+        form->pointer_terms += index.pointer_terms;
+        return 1;
+    }
+    if (definition->opcode == MIR_BINARY &&
+        (definition->immediate == '+' ||
+         definition->immediate == '-' ||
+         definition->immediate == '*' ||
+         definition->immediate == '/')) {
+        struct MirMachineForm left;
+        struct MirMachineForm right;
+
+        if (!mir_machine_pointer_form(
+                definition->src1, definition_index,
+                &left, depth + 1) ||
+            !mir_machine_pointer_form(
+                definition->src2, definition_index,
+                &right, depth + 1)) {
+            if (getenv("DCC_MIR_POINTER_REPORT") != NULL)
+                fprintf(stderr,
+                        "; MIR pointer function=%s value=%d "
+                        "op=%ld reject=operand\n",
+                        mir.name, value, definition->immediate);
+            return 0;
+        }
+        if (left.kind == MIR_MACHINE_FORM_INTEGER &&
+            right.kind == MIR_MACHINE_FORM_INTEGER) {
+            long result;
+
+            if (!mir_machine_fold_integer_binary(
+                    (int)definition->immediate,
+                    left.value, right.value,
+                    definition->type, &result))
+                return 0;
+            form->kind = MIR_MACHINE_FORM_INTEGER;
+            form->value = result;
+            form->storage = 0;
+            form->offset = 0;
+            form->pointer_terms =
+                left.pointer_terms + right.pointer_terms;
+            form->name[0] = 0;
+            return 1;
+        }
+        if (definition->immediate == '+' &&
+            left.kind == MIR_MACHINE_FORM_INTEGER &&
+            right.kind == MIR_MACHINE_FORM_POINTER) {
+            *form = right;
+            form->value += left.value;
+            form->pointer_terms += left.pointer_terms;
+            return 1;
+        }
+        if ((definition->immediate == '+' ||
+             definition->immediate == '-') &&
+            left.kind == MIR_MACHINE_FORM_POINTER &&
+            right.kind == MIR_MACHINE_FORM_INTEGER) {
+            *form = left;
+            form->value += definition->immediate == '+'
+                ? right.value : -right.value;
+            form->pointer_terms += right.pointer_terms;
+            return 1;
+        }
+        if (definition->immediate == '-' &&
+            left.kind == MIR_MACHINE_FORM_POINTER &&
+            right.kind == MIR_MACHINE_FORM_POINTER &&
+            left.storage == right.storage &&
+            left.offset == right.offset &&
+            !strcmp(left.name, right.name)) {
+            form->kind = MIR_MACHINE_FORM_INTEGER;
+            form->value = left.value - right.value;
+            form->storage = 0;
+            form->offset = 0;
+            form->pointer_terms =
+                left.pointer_terms + right.pointer_terms;
+            form->name[0] = 0;
+            return 1;
+        }
+    }
+    if (getenv("DCC_MIR_POINTER_REPORT") != NULL)
+        fprintf(stderr,
+                "; MIR pointer function=%s value=%d opcode=%d "
+                "reject=form\n",
+                mir.name, value, definition->opcode);
+    return 0;
+}
+
+int mir_machine_parameter_offset(
+    int value, int *stack_offset)
+{
+    const struct MirInsn *parameter = mir_definition(value);
+    int memory_type;
+    int memory_storage;
+    int memory_offset;
+
+    if (parameter == NULL || parameter->opcode != MIR_PARAM ||
+        !mir_scalar_memory_location(
+            parameter, &memory_type, &memory_storage,
+            &memory_offset) ||
+        memory_storage != SC_PARAM || type_size(memory_type) != 2)
+        return 0;
+    *stack_offset = memory_offset - 2;
+    return *stack_offset >= 0;
+}
+
+int mir_machine_parameter_address(
+    int value, int *stack_offset, long *offset, int depth)
+{
+    const struct MirInsn *definition;
+
+    if (depth > 32)
+        return 0;
+    definition = mir_definition(value);
+    if (definition == NULL)
+        return 0;
+    if (definition->opcode == MIR_LOAD) {
+        int memory_type, memory_storage, memory_offset;
+
+        if (!mir_scalar_memory_location(
+                definition, &memory_type, &memory_storage,
+                &memory_offset))
+            return 0;
+        if (memory_storage == SC_PARAM &&
+            type_ptr_depth(memory_type) > 0 &&
+            type_size(memory_type) == 2) {
+            *stack_offset = memory_offset - 2;
+            *offset = 0;
+            return *stack_offset >= 0;
+        }
+        definition = mir_machine_resolve_local_alias(value);
+        if (definition == NULL)
+            return 0;
+        value = definition->dst;
+    }
+    if (definition->opcode == MIR_PARAM) {
+        if (!mir_machine_parameter_offset(value, stack_offset))
+            return 0;
+        *offset = 0;
+        return 1;
+    }
+    if (definition->opcode == MIR_UNARY &&
+        definition->immediate == 0)
+        return mir_machine_parameter_address(
+            definition->src1, stack_offset, offset, depth + 1);
+    if (definition->opcode == MIR_INDEX_ADDRESS) {
+        const struct MirInsn *constant = mir_definition(definition->src2);
+        long base_offset;
+
+        if (constant == NULL || constant->opcode != MIR_CONST ||
+            definition->immediate <= 0 ||
+            !mir_machine_parameter_address(
+                definition->src1, stack_offset,
+                &base_offset, depth + 1))
+            return 0;
+        *offset = base_offset +
+            constant->immediate * definition->immediate;
+        return *offset >= -32768 && *offset <= 32767;
+    }
+    if (definition->opcode == MIR_MEMBER_ADDRESS) {
+        long base_offset;
+
+        if (!mir_machine_parameter_address(
+                definition->src1, stack_offset,
+                &base_offset, depth + 1))
+            return 0;
+        *offset = base_offset + definition->immediate;
+        return *offset >= -32768 && *offset <= 32767;
+    }
+    return 0;
+}
+
+
+
+
+int mir_machine_four_call_arguments(
+    const struct MirInsn *call, int arguments[4])
+{
+    int count = 0;
+    int instruction;
+    int argument;
+
+    for (argument = 0; argument < 4; ++argument)
+        arguments[argument] = -1;
+    for (instruction = 0; instruction < mir.count; ++instruction) {
+        const struct MirInsn *arg = &mir.insns[instruction];
+        int index;
+
+        if (arg->opcode != MIR_ARG ||
+            arg->secondary_offset != call->secondary_offset)
+            continue;
+        index = (int)arg->immediate;
+        if (index < 0 || index >= 4 || arguments[index] >= 0)
+            return 0;
+        arguments[index] = arg->src1;
+        ++count;
+    }
+    return count == 4;
+}
+
+int mir_machine_five_call_arguments(
+    const struct MirInsn *call, int arguments[5])
+{
+    int count = 0;
+    int instruction;
+    int argument;
+
+    for (argument = 0; argument < 5; ++argument)
+        arguments[argument] = -1;
+    for (instruction = 0; instruction < mir.count; ++instruction) {
+        const struct MirInsn *arg = &mir.insns[instruction];
+        int index;
+
+        if (arg->opcode != MIR_ARG ||
+            arg->secondary_offset != call->secondary_offset)
+            continue;
+        index = (int)arg->immediate;
+        if (index < 0 || index >= 5 || arguments[index] >= 0)
+            return 0;
+        arguments[index] = arg->src1;
+        ++count;
+    }
+    return count == 5;
+}
+
+int mir_machine_six_call_arguments(
+    const struct MirInsn *call, int arguments[6])
+{
+    int count = 0;
+    int instruction;
+    int argument;
+
+    for (argument = 0; argument < 6; ++argument)
+        arguments[argument] = -1;
+    for (instruction = 0; instruction < mir.count; ++instruction) {
+        const struct MirInsn *arg = &mir.insns[instruction];
+        int index;
+
+        if (arg->opcode != MIR_ARG ||
+            arg->secondary_offset != call->secondary_offset)
+            continue;
+        index = (int)arg->immediate;
+        if (index < 0 || index >= 6 || arguments[index] >= 0)
+            return 0;
+        arguments[index] = arg->src1;
+        ++count;
+    }
+    return count == 6;
+}
+
+int mir_machine_ten_call_arguments(
+    const struct MirInsn *call, int arguments[10])
+{
+    int count = 0;
+    int instruction;
+    int argument;
+
+    for (argument = 0; argument < 10; ++argument)
+        arguments[argument] = -1;
+    for (instruction = 0; instruction < mir.count; ++instruction) {
+        const struct MirInsn *arg = &mir.insns[instruction];
+        int index;
+
+        if (arg->opcode != MIR_ARG ||
+            arg->secondary_offset != call->secondary_offset)
+            continue;
+        index = (int)arg->immediate;
+        if (index < 0 || index >= 10 || arguments[index] >= 0)
+            return 0;
+        arguments[index] = arg->src1;
+        ++count;
+    }
+    return count == 10;
+}
+
+
+int mir_machine_phi_merge(
+    int phi_index, int true_value_index, int false_value_index,
+    int true_label_index, int false_label_index)
+{
+    const struct MirInsn *phi = &mir.insns[phi_index];
+
+    return phi->opcode == MIR_PHI &&
+           phi->src1 == mir.insns[true_value_index].dst &&
+           phi->src2 == mir.insns[false_value_index].dst &&
+           phi->phi_pred1 == mir.insns[true_label_index].label &&
+           phi->phi_pred2 == mir.insns[false_label_index].label;
+}
+
+int mir_machine_boolean_merge(
+    int phi_index, int true_value_index, int false_value_index,
+    int true_label_index, int false_label_index)
+{
+    return mir_machine_phi_merge(
+               phi_index, true_value_index, false_value_index,
+               true_label_index, false_label_index) &&
+           mir_machine_constant_equals(
+               mir.insns[true_value_index].dst, 1) &&
+           mir_machine_constant_equals(
+               mir.insns[false_value_index].dst, 0);
+}
+
+int mir_machine_transparent_pointer_unary(
+    const struct MirInsn *unary)
+{
+    const struct MirInsn *source;
+
+    if (unary == NULL || unary->opcode != MIR_UNARY ||
+        unary->immediate != 0 ||
+        type_ptr_depth(unary->type) == 0 ||
+        type_size(unary->type) != 2)
+        return 0;
+    source = mir_definition(unary->src1);
+    return source != NULL &&
+           type_ptr_depth(source->type) ==
+               type_ptr_depth(unary->type) &&
+           type_size(source->type) == 2;
+}
+
+
+
+int mir_machine_name_nonvolatile(const char *name)
+{
+    int declared;
+    struct Sym *global;
+
+    if (name == NULL || name[0] == '\0')
+        return 0;
+    for (declared = 0; declared < mir.declared_count; ++declared)
+        if (!strcmp(mir.declared_names[declared], name))
+            return !mir.declared_is_volatile[declared];
+    global = find_global(name);
+    return global != NULL && !global->is_volatile;
+}
+
+int mir_machine_wide_parameter_offset(
+    int value, int *stack_offset)
+{
+    const struct MirInsn *parameter = mir_definition(value);
+    int memory_type;
+    int memory_storage;
+    int memory_offset;
+
+    if (parameter == NULL || parameter->opcode != MIR_PARAM ||
+        type_size(parameter->type) != 4 ||
+        type_is_float(parameter->type) ||
+        !mir_scalar_memory_location(
+            parameter, &memory_type, &memory_storage,
+            &memory_offset) ||
+        memory_storage != SC_PARAM ||
+        type_size(memory_type) != 4 ||
+        type_is_float(memory_type))
+        return 0;
+    *stack_offset = memory_offset - 2;
+    return *stack_offset >= 0;
+}
+
+
+void mir_machine_emit_global_byte_a(
+    MirStream *out, struct Sym *symbol, int offset, int is_store)
+{
+    const char *name = asm_name_for(sym_asm_name(symbol));
+
+    if ((symbol->storage == SC_EXTERN || symbol->needs_extrn) &&
+        mir_extrn_should_emit(symbol))
+        mir_stream_printf(out, "\textrn %s\n", name);
+    if (offset == 0)
+        mir_stream_printf(out, is_store ? "\tld (%s),a\n" : "\tld a,(%s)\n",
+                name);
+    else
+        mir_stream_printf(out, is_store
+                    ? "\tld (%s%+d),a\n"
+                    : "\tld a,(%s%+d)\n",
+                name, offset);
+}
+
+void mir_emit_wide_parameter(
+    MirStream *out, int stack_offset)
+{
+    mir_stream_printf(out,
+            "\tld hl,%d\n\tadd hl,sp\n"
+            "\tld c,(hl)\n\tinc hl\n\tld b,(hl)\n"
+            "\tinc hl\n\tld e,(hl)\n\tinc hl\n\tld d,(hl)\n"
+            "\tld l,c\n\tld h,b\n",
+            stack_offset);
+}
+
+void mir_emit_byte_parameter_word(
+    MirStream *out, int stack_offset, int is_unsigned)
+{
+    mir_stream_printf(out,
+            "\tld hl,%d\n\tadd hl,sp\n\tld a,(hl)\n\tld l,a\n",
+            stack_offset);
+    if (is_unsigned)
+        mir_stream_puts("\tld h,0\n", out);
+    else
+        mir_stream_puts("\trlca\n\tsbc a,a\n\tld h,a\n", out);
+}
+
+void mir_emit_fixed_point_constant(
+    MirStream *out, unsigned long value)
+{
+    mir_stream_printf(out,
+            "\tld hl,%lu\n\tpush hl\n"
+            "\tld hl,%lu\n\tpush hl\n",
+            (value >> 16) & 0xffffUL,
+            value & 0xffffUL);
+}
+
+void mir_emit_local_address(MirStream *out, int offset)
+{
+    mir_stream_puts("\tpush ix\n\tpop hl\n", out);
+    mir_machine_emit_hl_offset(out, offset, 0);
+}
+
+void mir_emit_local_wide_argument(MirStream *out, int offset)
+{
+    mir_stream_printf(out,
+            "\tld l,(ix%+d)\n\tld h,(ix%+d)\n\tpush hl\n"
+            "\tld l,(ix%+d)\n\tld h,(ix%+d)\n\tpush hl\n",
+            offset + 2, offset + 3, offset, offset + 1);
 }

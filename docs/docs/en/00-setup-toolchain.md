@@ -1,7 +1,13 @@
 # The toolchain
 
-To compile, assemble, link, and run CP/M apps with the DCC C Compiler toolchain, you need two things: the DCC C Compiler tools
-([`dcc`](appendix/03-utilities.md#toolchain-commands), [`dccmake`](appendix/03-utilities.md#build-pipeline-helper-dccmake), [`dccpeep`](appendix/03-utilities.md#toolchain-commands), [`dccrtlstrip`](appendix/03-utilities.md#toolchain-commands), plus [`DCCRTL.MAC`](appendix/03-utilities.md#toolchain-commands), [`m80.com`](appendix/03-utilities.md#toolchain-commands), and [`l80.com`](appendix/03-utilities.md#toolchain-commands)) and the [`ntvcm`](appendix/03-utilities.md#toolchain-commands) CP/M 2.2 emulator to run CP/M binaries, including `m80.com`, `l80.com`, and the resulting programs.
+To build CP/M apps, you need the native DCC tools (`dcc`, `dccmake`,
+`dccpeep`, `dccrtlstrip`, `m80c`, and `l80c`), the bundled headers, and
+`DCCRTL.MAC`. Normal builds run entirely on the host. Use
+[`ntvcm`](appendix/03-utilities.md#toolchain-commands) to run the resulting
+programs, or transfer them to another CP/M emulator or real hardware.
+The original `m80.com` and `l80.com` are needed only for the optional emulated
+assembler/linker path. Source debugging uses the separate
+[`dcc-debug-host`](00-debug-host.md).
 
 You build these tools once. After that, use them from any CP/M app project.
 
@@ -9,7 +15,9 @@ Setup flow:
 
 - Install the host prerequisites for Windows, macOS, or Linux.
 - Clone the DCC C Compiler (`dcc`) and `ntvcm` repositories.
-- Build the DCC C Compiler host tools with `pwsh ./scripts/build-dcc.ps1`.
+- Build the DCC C Compiler host tools with `pwsh ./scripts/build-dcc.ps1`
+  (or `sh m-posix.sh` on Linux platforms without a PowerShell package, e.g.
+  RISC-V64 boards or Raspberry Pi OS).
 - Build the ntvcm emulator.
 - Add the DCC C Compiler and ntvcm directories to your `PATH`.
 - Verify the setup with a sample CP/M program.
@@ -18,6 +26,11 @@ Setup flow:
 
 Install the native compiler tools for your host platform before cloning and
 building DCC C Compiler or ntvcm.
+
+The full PowerShell build also requires CMake and a C++17 compiler for
+`dcc-debug-host` and its example adapter. Install CMake with
+`winget install Kitware.CMake` on Windows, `brew install cmake` on macOS, or
+`sudo apt install cmake` on Ubuntu. Verify it with `cmake --version`.
 
 === "Windows"
 
@@ -125,6 +138,25 @@ building DCC C Compiler or ntvcm.
 
         The `file` output should report `ARM aarch64`.
 
+=== "Linux without PowerShell (RISC-V64, etc.)"
+
+    Some platforms this project targets - RISC-V64 boards, for example - have
+    no PowerShell package and no official release tarball at all, unlike
+    ARM64 above. On any such Linux platform, skip installing PowerShell
+    entirely:
+
+    1. Install gcc, g++, make, and the usual build tools:
+
+        ```bash
+        sudo apt install build-essential
+        ```
+
+    2. Use `m-posix.sh` in place of `pwsh ./scripts/build-dcc.ps1` throughout
+       this guide - see [Build DCC C Compiler](#build-dcc-c-compiler) below.
+       It needs nothing beyond `/bin/sh` (tested under `dash`, what Raspberry
+       Pi OS/Debian actually use) and a C compiler, and builds the same
+       `dcc`, `dccpeep`, `dccrtlstrip`, `dccmake`, `m80c`, and `l80c` tools.
+
 === "Windows ARM64"
 
     1. Install Visual Studio Build Tools with the C++ workload and native ARM64
@@ -168,19 +200,29 @@ building DCC C Compiler or ntvcm.
 ## Build DCC C Compiler
 
 The cross-platform PowerShell build script is in the `scripts` directory. It
-builds `dcc`, `dccpeep`, and `dccrtlstrip`, using MSVC on Windows, clang on
-macOS, and gcc on Linux by default:
+builds `dcc`, `dccpeep`, `dccrtlstrip`, `dccmake`, `m80c`, `l80c`,
+`dcc-debug-host`, and its example I/O adapter, using MSVC on Windows, clang on
+macOS, and gcc on Linux by default. Run it from the cloned `dcc` directory:
 
+    cd dcc
     pwsh ./scripts/build-dcc.ps1
+
 
 ## Build ntvcm
 
-ntvcm is a C++ project. Build it from its own directory.
+ntvcm is a C++ project. Build it from its own directory. The commands below
+start from the parent directory containing both checkouts; from `dcc`, first
+return to that parent with `cd ..`.
+
+Use the `m.bat` / `mmac.sh` / `m.sh` scripts below, not `m.bat` / `mmac.sh`
+/ `m.sh`. The `r` versions build release configurations of the emulator with
+asserts compiled out, so the resulting `ntvcm` runs faster.
 
 === "Windows"
 
     Open a Developer PowerShell or Developer Command Prompt so the Microsoft
-    C/C++ compiler (`cl`) is on your `PATH`, then run the Windows build script:
+    C/C++ compiler (`cl`) is on your `PATH`, then run the Windows release build
+    script:
 
     ```powershell
     cd ntvcm
@@ -192,7 +234,7 @@ ntvcm is a C++ project. Build it from its own directory.
 === "macOS"
 
     Open a terminal where the Xcode Command Line Tools are available, then run
-    the macOS build script:
+    the macOS release build script:
 
     ```bash
     cd ntvcm
@@ -204,7 +246,8 @@ ntvcm is a C++ project. Build it from its own directory.
 
 === "Ubuntu"
 
-    Open a terminal where `g++` is available, then run the Linux build script:
+    Open a terminal where `g++` is available, then run the Linux release build
+    script:
 
     ```bash
     cd ntvcm
@@ -216,7 +259,8 @@ ntvcm is a C++ project. Build it from its own directory.
 
 === "Ubuntu ARM64"
 
-    Open a terminal where `g++` is available, then run the Linux build script:
+    Open a terminal where `g++` is available, then run the Linux release build
+    script:
 
     ```bash
     cd ntvcm
@@ -230,7 +274,7 @@ ntvcm is a C++ project. Build it from its own directory.
 
     Open a Developer PowerShell or Developer Command Prompt for ARM64 so the
     Microsoft C/C++ compiler (`cl`) is on your `PATH`, then run the Windows
-    build script:
+    release build script:
 
     ```powershell
     cd ntvcm
@@ -241,9 +285,9 @@ ntvcm is a C++ project. Build it from its own directory.
 
 ## Set up your environment
 
-Build scripts live in the `scripts` directory:
+Use `dccmake` to build application projects with the source-built tools.
+Optional build and test helpers live in the `scripts` directory:
 
-- `dcc-ma` — installed package command for building one app on Windows, macOS, and Linux
 - `scripts/ma.sh` — source-checkout implementation for Linux/macOS without PowerShell
 - `scripts/ma.ps1` — source-checkout implementation for Windows PowerShell 5.1 or PowerShell 7+
 - `scripts/runall.ps1` — builds and verifies the test suite
@@ -259,15 +303,18 @@ one, otherwise they look for the tool on your `PATH`. The relevant tools are:
 - [`dcc`](appendix/03-utilities.md#toolchain-commands) — compiler
 - [`dccmake`](appendix/03-utilities.md#build-pipeline-helper-dccmake) — build pipeline helper
 - [`dccpeep`](appendix/03-utilities.md#toolchain-commands) — peephole optimizer
-- [`dccrtlstrip`](appendix/03-utilities.md#toolchain-commands) — runtime stripper
+- [`dccrtlstrip`](appendix/03-utilities.md#toolchain-commands) — application/runtime stripper
 - [`ntvcm`](appendix/03-utilities.md#toolchain-commands) — CP/M emulator
-- [`m80`](appendix/03-utilities.md#toolchain-commands) / [`l80`](appendix/03-utilities.md#toolchain-commands) — assembler and linker
+- [`m80c`](appendix/03-utilities.md#native-assembler-m80c) / [`l80c`](appendix/03-utilities.md#native-linker-l80c) — native assembler and linker
 
 Recommended setup, especially when building apps in a project *outside* the DCC C Compiler
 repo, is to add the directories containing the built `dcc` and `ntvcm`
 binaries to your `PATH`. The DCC C Compiler directory also provides `dccpeep`,
-`dccrtlstrip`, `m80.com`, `l80.com`, and `DCCRTL.MAC`, so no per-tool variables
-are needed.
+`dccmake`, `dccrtlstrip`, `m80c`, `l80c`, the standard headers, and
+`DCCRTL.MAC`. For a `dccmake` build outside that directory, configure
+`dcc-runtime` and `dcc-include-directory` as shown in
+[Building and linking](02-build-and-link.md#build-with-dccmake); putting a
+directory on `PATH` alone does not configure header lookup.
 
 === "Windows"
 
@@ -434,15 +481,13 @@ are needed.
 
 ## Verify the setup
 
-With the tools on your `PATH`, build and run one of the DCC C Compiler repo's sample tests
-to confirm everything is wired up. From your operating-system terminal or the VS
-Code terminal, change to the DCC C Compiler checkout, start PowerShell, build
-`tests/tstr.c`, then run the generated `.COM` file under ntvcm:
+With the tools on your `PATH`, build and run one of the repository's sample
+tests. From your operating-system terminal or the VS Code terminal, change to
+the DCC checkout and use the native build driver:
 
     cd /path/to/dcc
-    pwsh
-    ./scripts/ma.ps1 tstr -Mode fast       # compiles tests/tstr.c -> TSTR.COM
-    ntvcm TSTR.COM                         # runs it under the emulator
+    dccmake tests/tstr.c dcc-output=TSTR
+    ntvcm build/TSTR.COM
 
 The DCC C Compiler repo's `tests/` programs are suitable samples for scratch projects, but
 day-to-day work does not need to happen inside the DCC C Compiler repo. The tools build

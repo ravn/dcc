@@ -37,6 +37,7 @@ Use `dcc-project` for build, test, runtime, and baseline conventions.
 | Surface | Location |
 | --- | --- |
 | Lowering, metadata repair, verifier, CFG/liveness | `src/dcc/dcc_mir.c` |
+| Independent reachable CFG dominance verification | `dcc_mir_verify.c` |
 | Public/internal MIR contracts | `dcc_mir.h`, `dcc_mir_internal.h` |
 | Candidate selection and `mir-v1` policy | `dcc_mir_select.c` |
 | Shared emission and homes | `dcc_mir_emit_common.c`, `dcc_mir_homed_cfg.c` |
@@ -44,6 +45,12 @@ Use `dcc-project` for build, test, runtime, and baseline conventions.
 | Z80 costs/constraints/scheduling | `dcc_mir_target.c`, `dcc_mir_schedule.c` |
 | Exact schedule dispatch | `dcc_mir_machine_emit.c` |
 | Exact schedule families | `dcc_mir_machine_*.c` |
+
+All maintained C/header modules under `src/` follow the Doxygen file-header
+convention defined in the `dcc-project` skill: `@file`, `@brief`, explicit
+role, and useful entry-point/boundary notes. For MIR changes, keep the module
+map in `dcc_mir_internal.h` current whenever files move or responsibilities
+change. Never document `dcc_ast_gen*` as a production body-codegen fallback.
 
 Place new schedules in the closest family module. Keep plan/matcher state
 automatic and expose only that module's dispatch function:

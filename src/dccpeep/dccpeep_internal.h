@@ -1,7 +1,31 @@
-/* dccpeep_internal.h - private line-program contract for dccpeep modules.
+/**
+ * @file dccpeep_internal.h
+ * @brief Defines the private line-program and pass contract for dccpeep.
  *
- * Passes may mutate only through this API: user-assembly entries are opaque,
- * and the scheduler in dccpeep.c remains the sole owner of pass ordering.
+ * @par Role
+ * Declares shared options, statistics, line/effect/CFG representations,
+ * mutation transactions, parsing and analysis helpers, and pass entry points.
+ *
+ * @par Module map
+ * - dccpeep.c: CLI, pass scheduling, core rewrites, and register claims.
+ * - peep_lines.c: line ownership, opaque user assembly, mutation, and I/O.
+ * - peep_parse.c: exact Z80/M80 text parsers and formatters.
+ * - peep_analyze.c: lightweight register and function safety queries.
+ * - peep_control_flow.c: label, jump, function, and loop-bound queries.
+ * - peep_effects.c: cached line classification and machine effects.
+ * - peep_dataflow.c: versioned CFG, basic blocks, and liveness.
+ * - peep_frame_alloc.c: analysis-only frame-slot promotion census.
+ * - peep_pass_once.c: ordered single-scan local rewrites.
+ * - peep_pass_control_flow.c: label and branch rewrite passes.
+ * - peep_pass_inline_temp.c: tagged inline-temporary spill rewrites.
+ * - peep_pass_loops.c: loop-scoped register promotion.
+ * - peep_pass_minmax.c: exact board-game and minimax rewrites.
+ * - peep_pass_stubs.c: size-mode shared-helper factoring.
+ * - peep_pass_final.c: terminal relaxation and dead-state cleanup.
+ *
+ * @par Boundary
+ * This header is private to dccpeep. Passes mutate only through the line API,
+ * user-assembly entries remain opaque, and dccpeep.c alone orders passes.
  */
 #ifndef DCCPEEP_INTERNAL_H
 #define DCCPEEP_INTERNAL_H
@@ -17,7 +41,6 @@
 
 typedef struct PeepOptions {
     int optimize_size;
-    int allow_undocumented_z80;
     int stats_enabled;
 } PeepOptions;
 
@@ -126,7 +149,9 @@ typedef struct PeepLineInfo {
 } PeepLineInfo;
 
 typedef struct PeepFlowLine {
-    int successors[2];
+    /* Conditional branches need two successors; a compiler-generated dense
+     * switch can have one successor for every byte value. */
+    int successors[256];
     int successor_count;
     int block;
     unsigned live_in;
@@ -141,6 +166,36 @@ typedef struct PeepBasicBlock {
     int function_start;
     int function_end;
 } PeepBasicBlock;
+
+/* Reverse jump-target index: for a given label name, every line that jumps
+ * to it (jp or jr form). Two-level, mirroring a classic chained hash table:
+ * PeepJumpLabelGroup is one entry per distinct label name actually jumped
+ * to (chained on hash collision via next_group); PeepJumpRefEntry is one
+ * entry per jump line targeting that label (chained per-group via
+ * next_ref). Built alongside labels[] in ensure_control_flow_indexes,
+ * gated by the same version check - see find_last_loop_back and
+ * label_targeted_only_within in peep_control_flow.c for the O(nlines)
+ * linear scans this replaces with O(references to this one label). */
+typedef struct PeepJumpRefEntry {
+    int line;
+    int is_jp;      /* 1 = "jp " form, 0 = "jr " form (jump_target_any's
+                       * "any" callers want both; jump_target-only callers
+                       * want just the is_jp entries). */
+    int next_ref;
+} PeepJumpRefEntry;
+
+typedef struct PeepJumpLabelGroup {
+    char name[128];         /* owned copy - a jump target's extracted text
+                              * isn't a stable pointer into lines[] the way
+                              * a label definition's own line is, so this
+                              * mirrors the fixed-size buffers jump_target/
+                              * jump_target_any already use for the same
+                              * text rather than pooling/owning a strdup */
+    int first_ref;
+    int next_group;
+} PeepJumpLabelGroup;
+
+#define PEEP_JUMPREF_HASH_SIZE 16411
 
 typedef struct PeepIndexes {
     PeepLabelIndexEntry *labels;
@@ -161,6 +216,13 @@ typedef struct PeepIndexes {
     unsigned long version;
     unsigned long line_info_version;
     unsigned long flow_version;
+    int jumpref_buckets[PEEP_JUMPREF_HASH_SIZE];
+    PeepJumpLabelGroup *jumpref_groups;
+    int jumpref_group_count;
+    int jumpref_group_capacity;
+    PeepJumpRefEntry *jumpref_entries;
+    int jumpref_entry_count;
+    int jumpref_entry_capacity;
 } PeepIndexes;
 
 typedef struct PeepContext {
@@ -176,6 +238,8 @@ typedef struct PeepContext {
 typedef struct PeepEditTransaction {
     char **lines;
     char **user_asm_original;
+    char **debug_metadata;
+    char *trailing_debug_metadata;
     int line_count;
     unsigned long version;
     PeepRunStats stats;
@@ -190,6 +254,7 @@ void peep_edit_rollback(PeepEditTransaction *transaction);
 
 extern char *lines[MAX_LINES];
 extern char *user_asm_original[MAX_LINES];
+extern char *debug_metadata[MAX_LINES];
 extern int nlines;
 extern int input_is_dcc_generated;
 
@@ -238,6 +303,9 @@ int peep_parse_ld_e_ix(const char *s, char *off);
 int peep_parse_ld_d_ix(const char *s, char *off);
 int peep_parse_ld_ix_pair(const char *s1, const char *s2, int *off);
 int peep_parse_st_ix_pair(const char *s1, const char *s2, int *off);
+int peep_parse_ld_l_iy(const char *s, char *off);
+int peep_parse_ld_h_iy(const char *s, char *off);
+int peep_parse_ld_iy_pair(const char *s1, const char *s2, int *off);
 int peep_parse_jp_same_z_c(int iz, int ic, char *lab);
 int peep_parse_dec_ix_byte(const char *s, int *off);
 int peep_parse_ld_ix_byte_imm(const char *s, int *off, int *val);
@@ -269,6 +337,7 @@ const PeepBasicBlock *peep_basic_block(int block);
 int peep_basic_block_count(void);
 int peep_registers_dead_after(int line, unsigned registers);
 int peep_flags_dead_after(int line, unsigned flags);
+int peep_local_jump_table_dispatch(int line, int func_start, int func_end);
 
 /* Analysis-only frame-slot register-allocation census. Runs after structural
  * convergence under -fstats; changes no program text. */
@@ -318,6 +387,9 @@ int peep_register_claimed_from(unsigned mask, int at);
 int peep_register_claimed_in_file(unsigned mask);
 int peep_register_available_in_range(
     unsigned mask, int begin, int end, const char *own_tag);
+int dcc_iy_claimed_in_file(void);
+int iy_loop_borrow_safe(int loop_start, int loop_end,
+                        const char *header, const char *exit_target);
 /* Interval forms of the same question. dcc publishes its own BC claims as
  * paired "@dcc.reg claim=bc" / "@dcc.reg free=bc" directives, so ownership
  * is a set of intervals rather than a single "claimed from here onward"
@@ -344,34 +416,19 @@ int is_label_referenced(const char *label);
 /* Application-specific board/game passes (peep_pass_minmax.c). */
 int peep_in_function_range(const char *func, int *startp, int *endp);
 int peep_range_has_debug_annotations(int start, int end);
-int pass_posfunc_b_cache(void);
-int pass_minmax_winner_result_no_temp(void);
-int pass_minmax_score_b_cache(void);
-int pass_minmax_loop_ctr_b(void);
-int pass_minmax_value_c(void);
-int pass_minmax_board_ptr_loop(void);
-int pass_minmax_byte_returns(void);
 int pass_minmax_pack_frame(void);
 int pass_minmax_pack_call(void);
-int pass_minmax_save_board_addr(void);
-int pass_reuse_board_addr_for_zero_store(void);
+int pass_minmax_return_score_in_a(void);
+int pass_minmax_reuse_dead_move_slot(void);
 int pass_minmax_elim_label_reload(void);
 int pass_winner_check_dec_a(void);
-int pass_global_board_const_offsets(void);
 
 /* Loop-scoped registerization passes (peep_pass_loops.c). */
-int pass_byte_loop_counter_to_reg_c(void);
+int pass_regional_word_loop_var_to_reg_bc(void);
 int pass_word_loop_var_to_reg_bc(void);
 int pass_narrow_bc_loop_bound_to_reg_c(void);
 int pass_byte_loop_var_to_reg_c(void);
 int pass_byte_for_counter_to_reg_c(void);
-int pass_byte_for_counter_to_reg_e(void);
-int pass_byte_loop_counter_to_reg_iyl(void);
-int pass_byte_incr_loop_counter_to_reg_iyl(void);
-
-/* Compiler-tagged temporary spill passes (peep_pass_inline_temp.c). */
-int pass_inline_temp_spill_to_stack(void);
-int pass_remove_inline_temp_markers(void);
 
 /* Label and branch rewrite passes (peep_pass_control_flow.c). */
 int pass_labels(void);
@@ -379,5 +436,7 @@ int pass_branch_over_jump(void);
 int pass_jump_thread(void);
 int pass_cond_skip_shortcut(void);
 int pass_jp_to_plain_ret(void);
+int pass_cond_jp_to_cond_ret(void);
+int pass_call_to_tail_jp(void);
 
 #endif

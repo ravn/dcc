@@ -1,15 +1,22 @@
-/*
- * dcc.c - compiler driver and entry point (the program's main translation unit).
+/**
+ * @file dcc.c
+ * @brief Drives one source translation from command line to M80 assembly.
  *
- * Ties the pipeline together: reads the input file, resolves #include
- * directives and splices line directives, runs the active-source filtering
- * pass, parses command-line options (-o/-c/-f/-I/-D/-U/...), and contains
- * main(). The include search path (include_dirs/num_include_dirs, capped by
- * MAX_INCLUDE_DIRS) is kept module-local (static) here.
+ * @par Role
+ * Parses compiler options, reads and splices source files, expands recursive
+ * includes, filters inactive preprocessing branches, initializes compilation
+ * state, and sequences translation-unit parsing, MIR finalization, data
+ * emission, and deferred extern emission.
  *
- * MODULE: its own translation unit, using dcc.h plus the focused preprocessor
- * and AST contracts.
- * Source provenance: monolith src/ddc.c lines 17975-18841.
+ * @par Key entry points
+ * main(), preprocess_includes_file(), filter_active_preprocessor_source(), and
+ * splice_backslash_newlines().
+ *
+ * @par Boundary
+ * dcc_preproc.c owns token-level preprocessing and lexing; frontend modules
+ * own parsing; selected MIR candidates are the only source of production
+ * function bodies. This file orchestrates those stages rather than lowering
+ * function bodies itself.
  */
 
 /*
@@ -1568,6 +1575,7 @@ void print_help(void)
     printf("  -fno-octio       -fno-floatio, but for %%o\n");
     printf("  -s, -stack <bytes>   reserve <bytes> for the C stack (default 512)\n");
     printf("  -g               emit source-level debug annotations\n");
+    printf("  -gline           emit optimized debug annotations and variable locations\n");
     printf("  -fstack-check    abort gracefully if the stack overflows its reserve\n");
     printf("  -fno-narrow      disable every int-array/scalar/for-counter byte-narrowing pass\n");
     printf("  -I<dir>          add <dir> to the include search path\n");
@@ -1589,9 +1597,26 @@ int main(int argc, char **argv)
     opt_stack_check = 0;
     opt_no_narrow = 0;
     opt_debug = 0;
+    opt_debug_lines = 0;
+    g_main_has_args = 0;
     max_function_local_bytes = 0;
 
     add_define("_DCC_", "1");
+    /* Common implementation macro used by GCC/SDCC-compatible sources.
+     * This target always has eight-bit bytes (the same value exposed as
+     * CHAR_BIT by limits.h), including during preprocessing before headers
+     * have been included. */
+    add_define("__CHAR_BIT__", "8");
+    /* Underlying type used by the target's size_t typedef.  Exposing the
+     * conventional implementation macro lets freestanding GCC/SDCC-derived
+     * sources declare library interfaces without including stddef.h. */
+    add_define("__SIZE_TYPE__", "unsigned int");
+    add_define("__PTRDIFF_TYPE__", "int");
+    add_define("__builtin_offsetof", "__offsetof");
+    /* GCC's __extension__ only suppresses pedantic diagnostics for the next
+     * construct.  dcc has no pedantic mode, so its compatible meaning is an
+     * empty token sequence. */
+    add_define("__extension__", "");
     ast_build_init();
 
     for (i = 1; i < argc; ++i) {
@@ -1617,6 +1642,10 @@ int main(int argc, char **argv)
             opt_no_narrow = 1;
         } else if (!strcmp(argv[i], "-g")) {
             opt_debug = 1;
+            opt_debug_lines = 0;
+        } else if (!strcmp(argv[i], "-gline")) {
+            opt_debug = 0;
+            opt_debug_lines = 1;
         } else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
             print_version();
             return 0;

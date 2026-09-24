@@ -2,18 +2,24 @@
 
 This appendix describes the DCC C Compiler toolchain: the compiler `dcc`, the peephole
 optimizer `dccpeep`, the runtime size reducer `dccrtlstrip`, and the assembler
-and linker - either the host-native `m80c`/`l80c`, or the Microsoft `M80`/`L80`
-originals running under `ntvcm`.
+and linker - either the host-native
+[`m80c`](03-utilities.md#native-assembler-m80c)/[`l80c`](03-utilities.md#native-linker-l80c),
+or the Microsoft `M80`/`L80` originals running under `ntvcm`.
 
 !!! note "Host-resident tools"
-  `dcc`, `dccpeep`, `dccrtlstrip`, `m80c`, and `l80c` run on Windows, macOS,
-  and Linux. They never run on a Z80. They emit Z80 assembly text and CP/M
+  `dcc`, `dccpeep`, `dccrtlstrip`,
+  [`m80c`](03-utilities.md#native-assembler-m80c), and
+  [`l80c`](03-utilities.md#native-linker-l80c) run on Windows, macOS, and
+  Linux. They never run on a Z80. They emit Z80 assembly text and CP/M
   `.COM` files that run under CP/M-80, for example via the `ntvcm` emulator.
-  `m80c`/`l80c` are clean-room, LINK-80-object-format-compatible
+  [`m80c`](03-utilities.md#native-assembler-m80c)/
+  [`l80c`](03-utilities.md#native-linker-l80c) are clean-room,
+  LINK-80-object-format-compatible
   reimplementations of `M80`/`L80` with unbounded host memory instead of
   CP/M's own 64K tables - large `nopeep` builds can exhaust real `L80`'s own
   in-emulator linking workspace well before the target program itself would
-  not fit; `l80c` has no such ceiling. They are the default; pass
+  not fit; [`l80c`](03-utilities.md#native-linker-l80c) has no such ceiling.
+  They are the default; pass
   `dcc-use-emulated-m80=true`/`dcc-use-emulated-l80=true` to `dccmake` (or
   `--emulated-m80`/`--emulated-l80` to `ma.sh`/`ma.ps1`) to use the real
   `M80.COM`/`L80.COM` under `ntvcm` instead, e.g. to cross-check output.
@@ -28,35 +34,36 @@ A single `.c` file becomes a CP/M `.COM` executable through a short pipeline.
 Each stage has one job and hands a text or object file to the next:
 
 ```mermaid
-flowchart LR
-    SRC([".c source"]) --> DCC["dcc<br/>C front end<br/>AST -> MIR -> Z80 asm"]
-    DCC --> MAC([".MAC assembly"])
-    MAC --> PEEP["dccpeep<br/>peephole optimizer"]
-    PEEP --> MAC2([".MAC optimized"])
-    MAC2 --> M80A["m80c / M80<br/>assemble"]
-    RTL([" DCCRTL.MAC<br/>full runtime"]) --> STRIP["dccrtlstrip<br/>dead-block removal"]
-    MAC2 -. references .-> STRIP
-    STRIP --> RTLMIN([" RTLMIN.MAC<br/>used routines only"])
-    RTLMIN --> M80B["m80c / M80<br/>assemble"]
-    M80A --> REL([" app.REL"])
-    M80B --> RRTL([" RTLMIN.REL"])
-    REL --> L80["l80c / L80<br/>link"]
-    RRTL --> L80
-    L80 --> COM([".COM executable"])
+flowchart TB
+  SRC["C source"] --> DCC["dcc<br/>AST → MIR → Z80 assembly"]
+  DCC --> PEEP["dccpeep<br/>optional assembly optimization"]
+  PEEP --> APPSTRIP["dccrtlstrip<br/>remove unreachable app blocks"]
+  APPSTRIP --> APPASM["m80c<br/>assemble application"]
+  APPASM --> APPREL["app.REL"]
+
+  RTL["DCCRTL.MAC<br/>full runtime"] --> STRIP["dccrtlstrip<br/>keep referenced routines"]
+  APPSTRIP -. runtime references .-> STRIP
+  STRIP --> RTLASM["m80c<br/>assemble reduced runtime"]
+  RTLASM --> RTLREL["RTLMIN.REL"]
+
+  APPREL --> LINK["l80c<br/>link application + runtime"]
+  RTLREL --> LINK
+  LINK --> COM["CP/M .COM executable"]
 ```
 
 | Stage | Tool | Input | Output | Role |
 | --- | --- | --- | --- | --- |
 | Compile | `dcc` | `.c` | `.MAC` | Parse typed AST, lower and verify MIR, then select Z80/M80 assembly |
 | Optimize | `dccpeep` | `.MAC` | `.MAC` | Local peephole rewriting of the asm |
+| Reduce application | `dccrtlstrip` | All app `.MAC` files | Rewritten app `.MAC` files | Remove functions, initialized objects, and module BSS objects unreachable from the final program entry |
 | Reduce runtime | `dccrtlstrip` | `DCCRTL.MAC` + app `.MAC` | `RTLMIN.MAC` | Keep only the runtime routines the app references |
-| Assemble | `m80c` or `M80` | `.MAC` | `.REL` | Object code (relocatable); `dccmake` uses native `m80c` by default |
-| Link | `l80c` or `L80` | `.REL` files | `.COM` | Resolve symbols into a CP/M executable; `dccmake` uses native `l80c` by default |
+| Assemble | [`m80c`](03-utilities.md#native-assembler-m80c) | `.MAC` | `.REL` | Object code (relocatable); `dccmake` uses native `m80c` by default |
+| Link | [`l80c`](03-utilities.md#native-linker-l80c) | `.REL` files | `.COM` | Resolve symbols into a CP/M executable; `dccmake` uses native `l80c` by default |
 
 The `dccpeep` stage is optional (`./scripts/ma.ps1 name -Mode nopeep` skips it
-when run from PowerShell in the DCC C Compiler checkout). `dccrtlstrip` runs against the
-*final* application assembly so it
-sees the real set of runtime symbols the program calls.
+when run from PowerShell in the DCC C Compiler checkout). `dccrtlstrip` first
+computes whole-program reachability across all final application assembly
+modules, then uses the reduced application to select runtime blocks.
 
 ## Compiler shape: front end, AST, and MIR
 
@@ -69,17 +76,20 @@ Top-level declarations, global initializers, strings, and data/BSS placement
 remain table-driven because they are not function-body instructions.
 
 ```mermaid
-flowchart LR
-    SRC([".c source"]) --> PP["preprocessor + lexer"]
-    PPX["dcc_pp_expr.c<br/>#if / #elif"] -. evaluates .-> PP
-    PP --> PARSE["recursive-descent parser"]
-    PARSE --> AST["typed statement AST<br/>(transient arena)"]
-    AST --> LOWER["MIR lowering +<br/>metadata recording"]
-    LOWER --> REPAIR["deferred metadata repair<br/>and canonicalization"]
-    REPAIR --> VERIFY["CFG + verifier<br/>liveness + object promotion"]
-    VERIFY --> ALLOC["register homes + spills<br/>Z80 constraints"]
-    ALLOC --> SELECT["generated candidate<br/>selection + mir-v1 cost"]
-    SELECT --> ASM(["selected .MAC body"])
+flowchart TB
+  SRC["C source"] --> FRONT["Front end<br/>preprocess, parse, build typed AST"]
+  FRONT --> MIR["Persistent MIR<br/>lower statements and record metadata"]
+  MIR --> ANALYZE["Prepare MIR<br/>repair metadata, check structure,<br/>build CFG, promote objects, transform values"]
+  ANALYZE --> VERIFY["Verify dominance<br/>independent reachable CFG + PHI-edge checks"]
+  VERIFY --> ALLOCATE["Plan baseline allocation<br/>solve liveness, assign homes and spills"]
+  ALLOCATE --> SELECT["Select generated Z80 candidate<br/>try exact structural schedules first"]
+
+  SELECT -- exact match --> ASM["Selected .MAC function body"]
+  SELECT -- exact declines --> GENERAL["Build generated alternatives<br/>rollout, homed, regional, spilled"]
+  GENERAL --> COST["Choose alternative<br/>candidate-specific allocation + mir-v1"]
+  COST --> ASM
+
+  ALLOCATE -. optional reports .-> SHADOW["Diagnostic shadow models<br/>target constraints + sparse schedule"]
 ```
 
 | Classic phase | DCC C Compiler implementation |
@@ -87,9 +97,9 @@ flowchart LR
 | Preprocessing / lexical analysis | Integrated macro engine and `next_token` lexer in `dcc_preproc.c`; `dcc_pp_expr.c` evaluates conditional directives |
 | Parsing | Recursive descent builds typed AST nodes against live symbol/type tables |
 | Intermediate representation | Persistent per-function MIR with virtual values, typed memory, calls, labels, branches, PHIs, VLA operations, and aggregate copies |
-| MIR analysis | Deferred metadata repair, CFG construction, verification, object promotion, liveness, target constraints, register homes, and spill-slot planning |
-| Instruction selection | Exact machine schedules plus general homed, hybrid/regional, and spilled CFG candidates |
-| Profitability | `mir-v1` compares generated candidates using machine instructions/bytes, helper/frame/spill costs, moves, branches, and loop weighting |
+| MIR analysis | Deferred metadata repair, structural checks, CFG construction, object promotion, independent dominance verification, liveness, baseline register homes, and spill-slot planning |
+| Instruction selection | Priority exact machine schedules, followed by general rollout, homed, hybrid/regional, and spilled CFG candidates |
+| Profitability | After exact scheduling declines, `mir-v1` compares generated alternatives using machine instructions/bytes, helper/frame/spill costs, moves, branches, and loop weighting |
 | Machine-dependent cleanup | Standalone `dccpeep` fixpoint optimization over the selected assembly |
 
 ### Transient AST, persistent MIR
@@ -124,14 +134,33 @@ This separation is load-bearing:
 
 ### Verification, promotion, and allocation
 
-The verifier resolves labels, constructs instruction successors, rejects
-undefined or multiply defined virtual values, and solves backwards liveness.
-PHI operands are uses on their incoming CFG edges; call arguments remain live
-through the matching call-site ID.
+Structural verification checks operand/object bounds, labels, definitions,
+PHI references, call identities, and known argument ABI types. After object
+promotion and semantic transformations, `dcc_mir_verify.c` independently
+reconstructs the instruction CFG and computes an immediate-dominator tree in
+reverse postorder, using storage linear in the MIR size.
 
-Conservative object promotion removes local/parameter loads only when every
-reachable predecessor agrees on the value. Unknown aliases, volatile accesses,
-opaque user assembly, calls, or ambiguous joins stop the proof.
+Every ordinary value use on a reachable path must be dominated by its
+definition: execution cannot reach the use without first passing the
+definition. PHIs define their results at the logical block entry, even when
+they appear later in the instruction array; each input must dominate its
+corresponding incoming edge. Argument records and their values must dominate
+the matching call. Unreachable paths impose no dominance requirement, but
+their IDs and references still undergo structural checks. This non-mutating
+check runs before allocation and candidate emission and cannot be disabled
+through an environment setting.
+
+Object promotion reuses agreeing reaching definitions or constructs a valid
+two-predecessor PHI. It distinguishes an **undefined entry value** from an
+**unreached dataflow state**: a definition discovered only on a loop backedge
+cannot supply the function-entry path. Undefined values and unresolved joins
+remain memory operations. This does not make reading an uninitialized C local
+defined behavior; it prevents that read from being represented by an invalid
+SSA value. Exact schedules account for the corrected NOP positions where
+unnecessary loop merges no longer produce PHIs.
+
+After verification, backwards liveness treats PHI operands as incoming-edge
+uses and keeps call arguments live through the matching call-site ID.
 
 Allocation assigns lifetime homes in HL, DE, BC, or callee-saved IY, with
 deterministic spill slots when pressure or ABI constraints require them.
@@ -139,16 +168,27 @@ Call-crossing ordinary values may use only IY. Fixed Z80 operand/result
 registers are boundary constraints, so the emitter inserts moves rather than
 precoloring a value for its whole lifetime.
 
+The MIR analysis pipeline computes a baseline allocation and retains its liveness matrices
+for selection. Candidate construction may then derive and measure a different
+allocation plan: lazy-parameter and regional candidates, for example, save the
+baseline homes and spills, recompute them for that candidate, and restore the
+baseline before the next attempt.
+
 ### Generated-only candidate selection
 
 Every candidate writes to its own temporary stream. A declining selector cannot
-leave partial text in the next candidate. Production then chooses among:
+leave partial text in the next candidate. Production first tries:
 
 - exact `scheduled-machine-cfg` kernels with complete structural proofs;
+- the compact `general-rollout` scalar DAG for eligible straight-line functions;
 - `homed-scalar-cfg`, including hybrid and regional-home variants;
 - the general `spilled-scalar-cfg` emitter.
 
-The `mir-v1` policy compares only generated MIR candidates.
+An accepted exact schedule has priority. When exact scheduling declines, the
+selector establishes a complete generated incumbent from the rollout or general
+CFG candidates, then `mir-v1` may compare that incumbent with homed,
+lazy-parameter, hybrid, regional, and spilled variants. The policy compares
+only generated MIR candidates.
 `DCC_MIR_REQUIRE_COMPLETE=1` and `DCC_MIR_REQUIRE_EMIT=1` are the strict
 semantic and generated-output boundaries.
 
@@ -187,7 +227,7 @@ lock these messages and carets against exact baselines.
 | Array and pointer constraints | `DCC-E0601`-`DCC-E0605` | unsupported variable inner dimensions, invalid bounds/object sizes, scalar subscripting |
 | Statement control flow | `DCC-E0701`-`DCC-E0706` | `break`/`continue` outside valid contexts, stray `case`/`default`, duplicate or undefined labels |
 | Functions and declarations | `DCC-E0801`-`DCC-E0806` | parameter declaration errors, redefinitions, too few or too many function-call arguments |
-| Initializers and assignment compatibility | `DCC-E0901`-`DCC-E0920` | invalid address initializers, non-constant initializers, string/array/struct initializer errors, integer-to-pointer assignment |
+| Initializers and assignment compatibility | `DCC-E0901`-`DCC-E0921` | invalid initializers, integer-to-pointer assignment, taking the address of a register-qualified object |
 | Unsupported or malformed constructs | `DCC-E1001`-`DCC-E1005` | unsupported AST forms, malformed syntax, oversized string literals, unsupported `sizeof` expressions |
 | General syntax and top-level parsing | `DCC-E1101`-`DCC-E1107` | expected tokens such as `;`, `)`, `]`, `=`, or an external declaration |
 | CP/M/Z80 target-model limits | `DCC-E1201`-`DCC-E1203` | unsupported `double`, `long long`, and 64-bit integer typedef names |
@@ -216,6 +256,10 @@ knowledge:
   dead-block elimination over `DCCRTL.MAC`: it roots symbols referenced by the
   app, follows runtime-to-runtime references to a fixpoint, and writes
   `RTLMIN.MAC` containing only reachable runtime blocks.
+- **Dead application blocks.** Before runtime selection, `dccrtlstrip` follows
+  reachability across the final application's marked assembly modules and
+  removes unreferenced functions and eligible objects. This is link-time
+  reachability, not a whole-program C statement analysis.
 
 This split keeps the compiler simple while still attacking the biggest sources
 of wasted code: unused expression values, local assembly redundancies, unused
@@ -244,13 +288,15 @@ graph TB
     end
 
     subgraph MIR["Persistent function MIR"]
-      CORE["dcc_mir.c<br/>lowering + repair + verifier"]
-      COMMON["dcc_mir_emit_common.c<br/>shared value emission"]
-      TARGET["dcc_mir_target.c / dcc_mir_schedule.c<br/>Z80 constraints + scheduling"]
+      CORE["dcc_mir.c<br/>lowering + repair + promotion"]
+      VERIFY["dcc_mir_verify.c<br/>independent dominance verification"]
+      ALLOCATE["dcc_mir.c<br/>liveness + baseline allocation"]
+      SHADOW["dcc_mir_target.c / dcc_mir_schedule.c<br/>diagnostic shadow models"]
     end
 
     subgraph BACK["Generated back ends"]
-      SELECT["dcc_mir_select.c<br/>candidate transaction + mir-v1"]
+      SELECT["dcc_mir_select.c<br/>priority, rollout + mir-v1"]
+      COMMON["dcc_mir_emit_common.c<br/>scalar DAG + shared emission"]
       HOMED["dcc_mir_homed_cfg.c<br/>homed / hybrid / regional"]
       SPILLED["dcc_mir_spilled_cfg.c<br/>general spilled CFG"]
       MACHINE["dcc_mir_machine_*.c<br/>exact structural schedules"]
@@ -266,12 +312,15 @@ graph TB
     SEM --> BUILD
     NODES -.storage and typed nodes.-> BUILD
     META -.declarations / scopes / VLA events.-> CORE
-    CORE --> TARGET --> SELECT
-    COMMON --> HOMED
-    COMMON --> SPILLED
+    CORE --> VERIFY --> ALLOCATE --> SELECT
+    ALLOCATE -. diagnostic reports .-> SHADOW
+    SELECT --> COMMON
     SELECT --> HOMED
     SELECT --> SPILLED
     SELECT --> MACHINE
+    HOMED -. shared operations .-> COMMON
+    SPILLED -. shared operations .-> COMMON
+    COMMON --> ASM
     HOMED --> ASM
     SPILLED --> ASM
     MACHINE --> ASM
@@ -281,13 +330,15 @@ graph TB
 | Group | Modules | Responsibility |
 | --- | --- | --- |
 | Shared | `dcc.h`, `dcc_state.c`, subsystem `*_internal.h` files | Target model, shared contracts, and lifecycle-owned compiler state |
-| Front end | `dcc.c`, `dcc_preproc.c`, `dcc_pp_expr.c`, `dcc_func.c`, `dcc_stmt.c`, `dcc_diag_emit.c` | Driver, preprocessing/lexing, declarations/statements, frame scan, and diagnostics |
-| Types / symbols | `dcc_types.c`, `dcc_symbols.c`, `dcc_constexpr.c`, `dcc_fold.c` | Type system, symbol tables, constant-expression evaluation, constant folding |
-| Typed AST / metadata | `dcc_ast.c`, `dcc_ast_build.c`, `dcc_ast_gen*.c`, `dcc_ast_metadata.c`, `dcc_ast_stmt_meta.c` | Transient typed trees, semantic classifiers, and non-emitting declaration/scope replay |
+| Front end | `dcc.c`, `dcc_preproc.c`, `dcc_pp_expr.c`, `dcc_func.c`, `dcc_stmt.c`, `dcc_diag_emit.c`, `dcc_global_scan.c` | Driver, preprocessing/lexing, declarations/statements, conservative global-use prepass, frame scan, and diagnostics |
+| Types / symbols | `dcc_types.c`, `dcc_symbols.c`, `dcc_constexpr.c`, `dcc_fold.c`, `dcc_asmname.c` | Type system, symbol tables, constant evaluation/folding, and M80-safe assembly-name mapping |
+| Typed AST / metadata | `dcc_ast.c`, `dcc_ast_build.c`, `dcc_ast_gen*.c`, `dcc_ast_metadata.c`, `dcc_ast_stmt_meta.c`, `dcc_licm.c` | Transient typed trees, semantic classifiers, and non-emitting LICM/CSE planning and declaration/scope replay |
 | Compatibility helpers | `dcc_expr.c`, `dcc_ops.c`, `dcc_cmp.c`, `dcc_assign.c`, `dcc_decl.c`, `dcc_stmt_fast.c`, `dcc_array_narrow.c` | Shared initializer/type behavior and conservative source proofs; not a production body emitter |
-| MIR core | `dcc_mir.c`, `dcc_mir_emit_common.c`, `dcc_mir_target.c`, `dcc_mir_schedule.c` | Persistent IR, metadata repair, CFG/verifier, liveness, target constraints, common emission |
-| MIR selection | `dcc_mir_select.c`, `dcc_mir_homed_cfg.c`, `dcc_mir_spilled_cfg.c` | Transactional generated candidates, homes/spills, and `mir-v1` selection |
-| Machine schedules | `dcc_mir_machine_emit.c`, `dcc_mir_machine_*.c` | Exact structural matchers and specialized Z80 streams |
+| MIR core | `dcc_mir.c`, `dcc_mir_stream.c` | Persistent IR, metadata repair, CFG/verifier, liveness, baseline allocation, and isolated candidate streams |
+| MIR dominance verification | `dcc_mir_verify.c` | Independent reachable CFG, immediate dominators, ordinary-value and PHI-edge checks, and call-argument dominance; no IR rewriting or allocation |
+| MIR emission / selection | `dcc_mir_select.c`, `dcc_mir_emit_common.c`, `dcc_mir_homed_cfg.c`, `dcc_mir_spilled_cfg.c` | Exact-schedule priority, scalar DAG rollout, transactional generated candidates, candidate-specific homes/spills, shared emission, and `mir-v1` selection |
+| Diagnostic shadow models | `dcc_mir_target.c`, `dcc_mir_schedule.c` | Optional Z80 constraint and sparse-schedule reports; these modules do not select production candidates or emit Z80 |
+| Machine schedules | `dcc_mir_machine_emit.c` (coordinator), `dcc_mir_machine_*.c` (families) | Exact structural matchers and specialized Z80 streams |
 | Top level / output | `dcc_func.c`, `dcc_global_init.c`, `dcc_data.c` | Function/frame parsing, one production metadata/MIR body walk, global initializer recording, deferred static-body placement, and data-section emission |
 
 ### Exact machine-schedule families
@@ -298,14 +349,20 @@ dispatch. Cohesive schedules live in separately compiled families:
 | Family module | Responsibility |
 | --- | --- |
 | `dcc_mir_machine_attention.c` | Matrix, attention, and fixed-point kernels |
+| `dcc_mir_machine_byte_scans.c` | Byte/row scans, fills, copies, hashes, records, and file-line kernels |
+| `dcc_mir_machine_constant_folding.c` | Constant/result flows, result switches, and indexed-member schedules |
+| `dcc_mir_machine_containers.c` | Array, container, stack, comparison, and reduction schedules |
+| `dcc_mir_machine_float_recursion.c` | Floating-point, recursive, tree, and byte-status kernels |
 | `dcc_mir_machine_numeric.c` | Integer, long, fixed-point, and math kernels |
 | `dcc_mir_machine_float_reports.c` | Float reports and checks |
 | `dcc_mir_machine_scanners.c` | Scan, parse, and traversal loops |
 | `dcc_mir_machine_aggregate_checks.c` | Aggregate, array, and struct checks |
+| `dcc_mir_machine_structural_checks.c` | Literal, bitset, sieve, string, structure, and bitfield validations |
 | `dcc_mir_machine_runtime_runners.c` | Runtime, file, and system orchestration |
 | `dcc_mir_machine_interpreter_runners.c` | Interpreter and parser runners |
 | `dcc_mir_machine_call_runners.c` | Call/control orchestration |
 | `dcc_mir_machine_validation_runners.c` | Scope, wide-value, and validation runners |
+| `dcc_mir_machine_wide_records.c` | Wide arithmetic, aggregate updates, and record-oriented schedules |
 | `dcc_mir_machine_endgame.c` | Large final exact schedule families |
 
 Machine families follow a zero-shared-state rule:
@@ -394,19 +451,20 @@ Key design points:
 
 ## The runtime: a block-structured library sized for stripping
 
-The runtime `DCCRTL.MAC` is a single ~19,000-line assembly source, but its
+The runtime `DCCRTL.MAC` is a single assembly source, but its
 *architecture* is what makes the toolchain's "pay only for what you use"
 property possible. Rather than one monolithic blob, the runtime is written as
-**~280 parsed blocks** around `public` entry points and shared preludes. A
+hundreds of parsed blocks around `public` entry points and shared preludes. A
 program never links the whole library — `dccrtlstrip` keeps only the blocks the
 application actually references (the mark-and-sweep details are in the companion
 appendix [*Runtime optimization*](01-dccrtlstrip.md)). The architectural
-consequence is that **every routine has a well-defined, measurable size cost**.
+consequence is that routine dependencies can be inspected and their linked
+cost measured for a particular application.
 
 ```mermaid
 flowchart TB
-    subgraph RT["DCCRTL.MAC (~19,000 lines, ~280 parsed blocks)"]
-      BASE["always-present baseline<br/>~297 lines, 7 blocks<br/>(start, argv/console, heap, exit)"]
+    subgraph RT["DCCRTL.MAC (block-structured runtime)"]
+      BASE["always-present baseline<br/>(start, argv/console, heap, exit)"]
         IO["stdio blocks<br/>printf, file I/O core"]
         MEM["memory blocks<br/>malloc/free/realloc"]
         LONG["32-bit long blocks"]
@@ -428,20 +486,20 @@ the build-time size hook (`docs/docs/hooks/runtime_sizes.py`) measures directly:
 
 - **self** — the source lines in the routine's own block.
 - **marginal** — self *plus* every additional block it transitively links
-  beyond the always-present baseline. This is the real incremental cost of
-  using a routine in a program that otherwise wouldn't need it.
+  beyond the always-present baseline. This estimates source volume, not
+  assembled bytes or execution cycles.
 
 The gap between the two is the whole story of the runtime's size architecture: a
 small `self` with a large `marginal` means the routine sits on top of a big
 shared substrate (the file-I/O core, or the float arithmetic core).
 
-### The always-present baseline (~297 lines)
+### The always-present baseline
 
-Seven blocks are always linked because they are reachable from the forced
-`start` root: program entry and heap/BSS setup, the command-tail `argv` builder
-(which also contains the console writer `__conout`), the heap-state words, and
-`exit`. Console output therefore costs essentially nothing extra — `putchar`
-and `puts` call into code that is already present.
+The forced `start` root retains entry, heap/BSS setup, heap-state words, exit,
+and their dependencies. Command-tail construction and console output have
+separate public blocks; the application main shim can retain additional
+support. Use the generated table for the current baseline rather than a fixed
+block count. `putchar` and `puts` are small wrappers, not zero-cost operations.
 
 ### What the feature groups cost
 
@@ -485,16 +543,20 @@ the runtime and rebuilding the docs is all that is needed to refresh them.
 - MIR owns CFG, PHIs, virtual values, object promotion, liveness, register
   homes, spills, target constraints, and generated candidate selection.
 - Production function assembly comes only from MIR.
-- Exact machine families and general homed/spilled CFG emitters compete under
-  the generated-only `mir-v1` cost policy.
+- Structurally proven exact machine schedules have priority. When they decline,
+  general rollout and homed/spilled CFG candidates are selected from generated
+  streams, with `mir-v1` arbitrating eligible alternatives.
 - Machine-dependent optimization is split out into **`dccpeep`**, a
   fixpoint peephole optimizer over the assembly text, with separate time (`-Ot`)
   and size (`-Os`) strategies.
-- The runtime `DCCRTL.MAC` is **block-structured** (~280 parsed blocks over a
-  ~297-line baseline), so every routine has a measurable
+- The runtime `DCCRTL.MAC` is **block-structured** into hundreds of public
+  blocks, so every routine has a measurable
   `self`/`marginal` size cost and `dccrtlstrip` can link only the blocks a
-  program references.
-- The back half of the pipeline uses native **`m80c`**/**`l80c`** (or
+  program references. The exact current totals are generated on the
+  [runtime size page](02-runtime-sizes.md).
+- The back half of the pipeline uses native
+  **[`m80c`](03-utilities.md#native-assembler-m80c)**/
+  **[`l80c`](03-utilities.md#native-linker-l80c)** (or
   Microsoft **`M80`**/**`L80`** under `ntvcm`) for assembly and linking - a
   shared LINK-80-compatible `.REL` object format that DCC C Compiler consumes
   as a fixed target rather than needing to invent its own.

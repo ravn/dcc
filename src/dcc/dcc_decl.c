@@ -1,17 +1,144 @@
-/*
- * dcc_decl.c - local declaration and initializer code generation.
+/**
+ * @file dcc_decl.c
+ * @brief Parses function-local declarations and their initialization plans.
  *
- * Emits storage and initialisation for function-local declarations: scalars,
- * arrays, structs/unions and bitfields, brace-enclosed initializer lists, and
- * const-scalar folding of local initializers into immediates.
+ * @par Role
+ * Allocates automatic objects, folds eligible constant locals, handles scalar,
+ * array, aggregate, bitfield, string, and VLA initialization, and keeps local
+ * declaration replay consistent with frame sizing and MIR capture.
  *
- * MODULE: compiled as its own translation unit.
- * Source provenance: monolith src/ddc.c lines 13128-13991.
+ * @par Key entry points
+ * gen_local_decl_after_type(), try_const_fold_local(),
+ * emit_init_auto_struct_from_list(), emit_init_auto_array_from_list(), and
+ * emit_zero_local_bytes().
+ *
+ * @par Boundary
+ * File-scope initializers are recorded by dcc_global_init.c. Expression trees
+ * and metadata come from the AST modules, while selected MIR candidates alone
+ * provide production function bodies.
  */
 
 #include "dcc.h"
 #include "dcc_mir.h"
 #include "dcc_ast.h"
+
+/* One term of a constant float initializer expression: an optional numeric
+ * cast applied to a single literal, e.g. `(float)0x100000` or plain `16`.
+ * Used only by parse_float_const_expr_value below; declines (returns 0,
+ * lexer untouched) on anything else. */
+static int parse_float_const_term(double *out)
+{
+    LexState _ls;
+    int cast_type;
+    int cast_size;
+    double value;
+
+    if (g_lex.tok.kind == '(') {
+        _ls = lex_save();
+        next_token();
+        if (starts_type()) {
+            parse_type_name_decl(&cast_type, &cast_size);
+            if (g_lex.tok.kind == ')') {
+                next_token();
+                if (g_lex.tok.kind == TOK_FLOATLIT) {
+                    union { float f; unsigned long b; } u;
+                    u.b = parse_float_literal_bits(g_lex.tok.text);
+                    value = (double)u.f;
+                    next_token();
+                } else if (g_lex.tok.kind == TOK_NUM || g_lex.tok.kind == TOK_CHARLIT) {
+                    value = (double)g_lex.tok.val;
+                    next_token();
+                } else {
+                    lex_restore(&_ls);
+                    return 0;
+                }
+                if (type_is_float(cast_type))
+                    value = (double)(float)value;
+                else if (cast_type & TYPE_UNSIGNED)
+                    value = (double)(unsigned long)(long)value;
+                else
+                    value = (double)(long)value;
+                *out = value;
+                return 1;
+            }
+        }
+        lex_restore(&_ls);
+        return 0;
+    }
+
+    if (g_lex.tok.kind == TOK_FLOATLIT) {
+        union { float f; unsigned long b; } u;
+        u.b = parse_float_literal_bits(g_lex.tok.text);
+        *out = (double)u.f;
+        next_token();
+        return 1;
+    }
+    if (g_lex.tok.kind == TOK_NUM || g_lex.tok.kind == TOK_CHARLIT) {
+        *out = (double)g_lex.tok.val;
+        next_token();
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * A small, deliberately narrow constant-float-expression evaluator: a chain
+ * of terms (see parse_float_const_term above, each optionally negated)
+ * combined by '*' or '/' - e.g. `(float)0x100000 * 0x10`.  '*'/'/' share one
+ * precedence level so left-to-right evaluation is exactly C's associativity,
+ * unlike mixing in '+'/'-' would be.  This is not a general constant-
+ * expression folder (dcc_fold.c's ConstVal evaluator already covers that,
+ * but only for integers - it truncates any float operand straight to a
+ * long); it exists solely so parse_float_init_literal's compact-initializer
+ * fast path recognizes an obviously-constant float initializer that isn't a
+ * single literal token, instead of rejecting it with "float initializer
+ * must be constant". */
+static int parse_float_const_expr_value(double *out)
+{
+    double value;
+    double rhs;
+    int sign;
+    int op;
+
+    sign = 1;
+    if (g_lex.tok.kind == '-') {
+        sign = -1;
+        next_token();
+    } else if (g_lex.tok.kind == '+') {
+        next_token();
+    }
+    if (!parse_float_const_term(&value))
+        return 0;
+    if (sign < 0)
+        value = -value;
+
+    while (g_lex.tok.kind == '*' || g_lex.tok.kind == '/') {
+        op = g_lex.tok.kind;
+        next_token();
+        sign = 1;
+        if (g_lex.tok.kind == '-') {
+            sign = -1;
+            next_token();
+        } else if (g_lex.tok.kind == '+') {
+            next_token();
+        }
+        if (!parse_float_const_term(&rhs))
+            return 0;
+        if (sign < 0)
+            rhs = -rhs;
+        if (op == '*') {
+            value *= rhs;
+        } else {
+            if (rhs == 0.0)
+                return 0;
+            value /= rhs;
+        }
+    }
+
+    *out = value;
+    return 1;
+}
+
 int parse_float_init_literal(unsigned long *bits)
 {
     int sign;
@@ -71,6 +198,30 @@ int parse_float_init_literal(unsigned long *bits)
 
         lex_restore(&_ls);
         return 0;
+    }
+
+    /*
+     * Neither bare form matched: a single literal isn't the only shape a
+     * human (and C89 6.6) would call constant - `(float)0x100000 * 0x10` is
+     * just as knowable at compile time.  Try the narrow constant-expression
+     * evaluator above before giving up; it declines (leaving the lexer
+     * untouched) on anything that isn't its specific cast/multiply/divide
+     * shape, so a genuine runtime expression like `16.0 * f` still falls
+     * through to gen_expr() exactly as before.
+     */
+    lex_restore(&_ls);
+    {
+        double value;
+        if (parse_float_const_expr_value(&value) &&
+            (g_lex.tok.kind == ';' || g_lex.tok.kind == ',' || g_lex.tok.kind == '}')) {
+            union { float f; unsigned char b[4]; } u;
+            u.f = (float)value;
+            bits[0] = ((unsigned long)u.b[0]) |
+                      ((unsigned long)u.b[1] << 8) |
+                      ((unsigned long)u.b[2] << 16) |
+                      ((unsigned long)u.b[3] << 24);
+            return 1;
+        }
     }
 
     lex_restore(&_ls);
@@ -676,6 +827,7 @@ void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int 
     int n;
     int maxn;
     int total_bytes;
+    int had_brace;
 
     if (elem_size <= 0) elem_size = type_size(elem_type);
     if (elem_size <= 0) elem_size = 2;
@@ -694,8 +846,11 @@ void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int 
         return;
     }
 
-    if (g_lex.tok.kind == '{')
+    had_brace = 0;
+    if (g_lex.tok.kind == '{') {
         next_token();
+        had_brace = 1;
+    }
 
     n = 0;
     maxn = 0;
@@ -719,10 +874,16 @@ void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int 
 
         n++;
         if (n > maxn) maxn = n;
+        /* With braces elided, exactly one array subobject belongs to this
+         * call.  Leave its following comma for the enclosing struct, whose
+         * next member must receive the next initializer. */
+        if (!had_brace && count > 0 && n >= count)
+            break;
         if (!accept(',')) break;
         if (g_lex.tok.kind == '}') break;
     }
-    expect('}');
+    if (had_brace)
+        expect('}');
 
     if (maxn > n) n = maxn;
     if (count > 0 && n < count) {
@@ -732,6 +893,15 @@ void emit_init_auto_struct_array(struct Sym *s, int baseoff, int elem_type, int 
 }
 
 
+/* Set by parse_struct_init_const_value whenever a bit-field element isn't a
+ * compile-time constant, in addition to (and regardless of) whether
+ * error_here actually reports it - emit_init_auto_struct_type uses this
+ * under asm_suppress_depth to silently probe whether an automatic struct's
+ * bit-field unit is fully constant (worth the packed single-store fast
+ * path) without leaving a diagnostic from a probe that gets re-parsed for
+ * real right after. */
+static int g_bitfield_const_trial_failed;
+
 long parse_struct_init_const_value(void)
 {
     long v;
@@ -740,6 +910,7 @@ long parse_struct_init_const_value(void)
 
     k = parse_global_init_atom(&v, label, sizeof(label));
     if (k != 1) {
+        g_bitfield_const_trial_failed = 1;
         error_here("bitfield initializer must be constant integer");
         if (g_lex.tok.kind != ',' && g_lex.tok.kind != '}')
             next_token();
@@ -900,11 +1071,6 @@ unsigned int pack_struct_bitfield_unit(int sid, int i, struct FieldDef *fd,
     return unit;
 }
 
-void emit_store_const_bitfield_unit_to_local(struct Sym *s, int off, unsigned int unit)
-{
-    emit_store_const_to_local_offset(s, off, TYPE_UNSIGNED | TYPE_INT, (long)(unit & 0xffffU));
-}
-
 void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
 {
     int sid;
@@ -914,16 +1080,26 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
     int is_union;
     int had_brace;
     int end_used;
-    /* Bit-field storage units already stored at this struct level.  Out-of-
-     * order designators can revisit a unit after leaving it (e.g.
-     * `{ .a=1, .x=2, .b=3 }` with a and b sharing a unit); each unit store
-     * overwrites the whole 16-bit word, so a revisit must merge with the
-     * previously stored value (C99 last-designator-wins per field). */
+    /* Bit-field storage units already zero-filled at this struct level, for
+     * the runtime read-modify-write path below.  Sibling bit-fields share a
+     * 16-bit unit; the first one reached (in source or designator order)
+     * zero-fills the whole unit so an omitted sibling defaults to 0, and
+     * this array remembers which unit offsets already got that treatment
+     * so an out-of-order designator revisiting the unit (e.g.
+     * `{ .a=1, .x=2, .b=3 }` with a and b sharing a unit) doesn't zero away
+     * a field already stored this pass. */
     int bf_unit_offs[32];
-    unsigned int bf_unit_vals[32];
     int bf_nunits;
+    /* Separate revisit-merge tracking for the all-constant fast path
+     * (pack_struct_bitfield_unit's own out-of-order-designator merge, see
+     * its comment) - kept apart from bf_unit_offs above since the two
+     * paths track different things (zeroed-or-not vs. accumulated value). */
+    int bf_const_unit_offs[32];
+    unsigned int bf_const_unit_vals[32];
+    int bf_const_nunits;
 
     bf_nunits = 0;
+    bf_const_nunits = 0;
 
     sid = type_struct_id(type);
     total = type_size(type);
@@ -1059,26 +1235,89 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
         }
 
         if (fd->bit_width > 0) {
-            int unit_off;
-            int k;
-            int stop;
-            unsigned int unit;
+            int j;
+            int seen;
+            struct AstNode *rhs;
+            LexState trial_ls;
+            int trial_offs[32];
+            unsigned int trial_vals[32];
+            int trial_n;
+            int trial_unit_off, trial_k, trial_stop;
 
-            unit = pack_struct_bitfield_unit(sid, i, fd, 1,
-                bf_unit_offs, bf_unit_vals, &bf_nunits,
-                (int)(sizeof(bf_unit_offs) / sizeof(bf_unit_offs[0])),
-                &unit_off, &k, &stop);
-            emit_store_const_bitfield_unit_to_local(s, baseoff + unit_off, unit);
-            end_used = unit_off + 2;
+            /*
+             * Bit-fields sharing a unit are usually all-constant (the common
+             * case tbitfld.c exercises), which the packed single-store path
+             * just below handles in one instruction sequence; silently probe
+             * for that first (asm_suppress_depth swallows the diagnostic
+             * parse_struct_init_const_value would otherwise raise) and only
+             * fall back to the slower but more general per-field runtime
+             * read-modify-write path when some field genuinely isn't
+             * constant - C89 6.5.7's constant-only rule is for static-
+             * storage objects, so an automatic struct's bit-field may be
+             * initialized from any expression.
+             */
+            trial_ls = lex_save();
+            trial_n = 0;
+            g_bitfield_const_trial_failed = 0;
+            asm_suppress_depth++;
+            (void)pack_struct_bitfield_unit(sid, i, fd, 1,
+                trial_offs, trial_vals, &trial_n,
+                (int)(sizeof(trial_offs) / sizeof(trial_offs[0])),
+                &trial_unit_off, &trial_k, &trial_stop);
+            asm_suppress_depth--;
+            lex_restore(&trial_ls);
+
+            if (!g_bitfield_const_trial_failed) {
+                int unit_off, k, stop;
+                unsigned int unit;
+
+                unit = pack_struct_bitfield_unit(sid, i, fd, 1,
+                    bf_const_unit_offs, bf_const_unit_vals, &bf_const_nunits,
+                    (int)(sizeof(bf_const_unit_offs) / sizeof(bf_const_unit_offs[0])),
+                    &unit_off, &k, &stop);
+                emit_store_const_to_local_offset(s, baseoff + unit_off,
+                    TYPE_UNSIGNED | TYPE_INT, (long)(unit & 0xffffU));
+                end_used = unit_off + 2;
+                if (end_used > used) used = end_used;
+                if (k > i)
+                    i = k - 1;
+                if (stop)
+                    break;
+                if (g_lex.tok.kind == '.')
+                    i = -1;
+                continue;
+            }
+
+            /*
+             * Some field in this unit isn't constant: fall back to a
+             * per-field runtime read-modify-write store, zero-filling this
+             * field's storage unit the first time it's reached (see
+             * bf_unit_offs above) so an omitted sibling still defaults to 0
+             * - exactly the codegen an ordinary `s.field = expr;` assignment
+             * statement already gets, reused here via
+             * mir_capture_bitfield_init_expr instead of a bespoke
+             * implementation.
+             */
+            seen = 0;
+            for (j = 0; j < bf_nunits; ++j)
+                if (bf_unit_offs[j] == fd->offset) { seen = 1; break; }
+            if (!seen) {
+                if (bf_nunits < (int)(sizeof(bf_unit_offs) / sizeof(bf_unit_offs[0])))
+                    bf_unit_offs[bf_nunits++] = fd->offset;
+                emit_zero_local_bytes(s, baseoff + fd->offset, 2);
+            }
+
+            rhs = ast_build_assign_expr(&g_ast_init_arena);
+            ast_validate_expr_symbols(rhs);
+            mir_capture_bitfield_init_expr(s, baseoff + fd->offset, fd, rhs);
+            ast_arena_reset(&g_ast_init_arena);
+
+            end_used = fd->offset + fd->size;
             if (end_used > used) used = end_used;
-            if (k > i)
-                i = k - 1;
-            if (stop)
+            if (!accept(','))
                 break;
-            /* A designator for a different unit (or a non-bit-field) stopped
-             * the packing loop; restart the field scan so the outer loop's
-             * designator handling processes it even when this unit's owner
-             * was the last declared field. */
+            if (g_lex.tok.kind == '}')
+                break;
             if (g_lex.tok.kind == '.')
                 i = -1;
             continue;
@@ -1093,6 +1332,10 @@ void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type)
 
         end_used = fd->offset + fd->size;
         if (end_used > used) used = end_used;
+        /* A braceless struct element nested in an array must leave the comma
+         * after its final field for the enclosing array's element loop. */
+        if (!had_brace && next_parent_field_index(sid, i + 1) < 0)
+            break;
         if (!accept(',')) break;
         if (g_lex.tok.kind == '}') break;
         if (g_lex.tok.kind == '.') i = -1;
@@ -1332,8 +1575,12 @@ void gen_local_decl_after_type(int base)
     int type, bytes, arrlen;
     int base_is_volatile;
     int base_pointee_is_volatile;
+    unsigned int base_volatile_mask;
     int total_elems;
     int direct_funcptr;
+    int parenthesized_array;
+    int parenthesized_total;
+    int parenthesized_stride;
     char name[64];
     char source_name[64];
     struct Sym *s;
@@ -1342,20 +1589,28 @@ void gen_local_decl_after_type(int base)
 
     base_is_volatile = g_decl.is_volatile;
     base_pointee_is_volatile = g_decl.pointee_is_volatile;
+    base_volatile_mask = g_decl.pointee_volatile_mask;
 
     for (;;) {
         type = base;
         g_decl.is_volatile = base_is_volatile;
         g_decl.pointee_is_volatile = base_pointee_is_volatile;
+        g_decl.pointee_volatile_mask = base_volatile_mask;
         direct_funcptr = 0;
+        parenthesized_array = 0;
+        parenthesized_total = 0;
+        parenthesized_stride = 0;
 
         while (accept('*')) {
-            g_decl.pointee_is_volatile = g_decl.is_volatile;
-            g_decl.is_volatile = skip_type_qualifiers_volatile();
+            advance_pointer_qualifiers();
             type = type_add_ptr(type);
         }
 
-        if (parse_funcptr_declarator(&type, name, sizeof(name))) {
+        if (parse_parenthesized_array_declarator(type, name, sizeof(name),
+                                                 &parenthesized_total,
+                                                 &parenthesized_stride)) {
+            parenthesized_array = 1;
+        } else if (parse_funcptr_declarator(&type, name, sizeof(name))) {
             direct_funcptr = 1;
         } else {
             if (g_lex.tok.kind != TOK_ID) {
@@ -1393,13 +1648,16 @@ void gen_local_decl_after_type(int base)
             name[sizeof(name) - 1] = 0;
         }
 
-        arrlen = g_funcptr_decl_array_len;
+        arrlen = parenthesized_array ? parenthesized_total
+                                     : g_funcptr_decl_array_len;
         g_funcptr_decl_array_len = 0;
         total_elems = arrlen;
         {
             int first_stride_bytes;
             first_stride_bytes = 0;
-            if (arrlen == 0)
+            if (parenthesized_array)
+                first_stride_bytes = parenthesized_stride;
+            else if (arrlen == 0)
                 parse_array_declarator_dims(type, &total_elems, &first_stride_bytes, 1);
             else
                 total_elems = arrlen;
@@ -1461,6 +1719,32 @@ void gen_local_decl_after_type(int base)
         if (arrlen == 0 && g_typedef_array_len > 0) {
             arrlen = g_typedef_array_len;
             total_elems = g_typedef_array_len;
+        } else if (g_last_array_dim_count > 0 && g_typedef_array_len > 0 &&
+                   g_last_array_dim_count < MAX_ARRAY_DIMS) {
+            /* `ARR2 table[2]` composes the typedef's own array length as an
+             * extra trailing dimension - see the identical composition in
+             * scan_local_decl_after_type (dcc_func.c), which this codegen
+             * pass must reach the same conclusion as. */
+            g_last_array_dims[g_last_array_dim_count++] = g_typedef_array_len;
+            if (target_size_multiply(arrlen, g_typedef_array_len, &arrlen))
+                total_elems = arrlen;
+            else
+                error_here("object size exceeds 16-bit address space");
+            /* current_field_array_elem_size (-> Sym.elem_size) reflected only
+             * this declarator's own dims; redo it as the stride across every
+             * dim past the first now that the typedef's dimension is appended
+             * - see the identical fixup in scan_local_decl_after_type
+             * (dcc_func.c), which this codegen pass must match. */
+            {
+                int inner_stride = 1;
+                int elem_bytes = type_size(type);
+                int di;
+                if (elem_bytes <= 0) elem_bytes = 2;
+                for (di = 1; di < g_last_array_dim_count; ++di)
+                    if (g_last_array_dims[di] > 0)
+                        inner_stride *= g_last_array_dims[di];
+                current_field_array_elem_size = inner_stride * elem_bytes;
+            }
         }
 
         /* Must reach the identical conclusion scan_local_decl_after_type
@@ -1468,8 +1752,8 @@ void gen_local_decl_after_type(int base)
          * frame-sizing pass - both independently re-run the same
          * speculative parse over the same source text, so they agree. */
         narrowed_as_counter = 0;
-        if (!g_decl.is_volatile &&
-            try_narrow_local_int_array(name, type, arrlen, total_elems)) {
+        if (!g_decl.is_extern && !g_decl.is_volatile &&
+            try_narrow_local_int_array(source_name, type, arrlen, total_elems)) {
             type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
             /* See the identical comment in scan_local_decl_after_type
              * (dcc_func.c): first_stride_bytes was computed from the
@@ -1477,10 +1761,10 @@ void gen_local_decl_after_type(int base)
              * here too or Sym.elem_size below keeps the stale, too-wide
              * stride even though Sym.type is now correctly narrowed. */
             current_field_array_elem_size = 0;
-        } else if (!g_decl.is_volatile &&
+        } else if (!g_decl.is_extern && !g_decl.is_volatile &&
                    try_narrow_register_scalar(name, type, g_decl.is_register, arrlen, total_elems)) {
             type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
-        } else if (!g_decl.is_volatile &&
+        } else if (!g_decl.is_extern && !g_decl.is_volatile &&
                    try_narrow_for_counter(name, type, arrlen, total_elems)) {
             type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
             narrowed_as_counter = 1;
@@ -1498,10 +1782,13 @@ void gen_local_decl_after_type(int base)
             else if (total_elems > 0)
                 bytes = object_array_size(type, total_elems);
 
-            s = add_local_alloc(name, type, bytes);
+            s = g_decl.is_extern
+                ? add_block_extern_alias(name, source_name, type, bytes)
+                : add_local_alloc(name, type, bytes);
             copy_funcptr_prototype_to_sym(s, direct_funcptr);
             s->is_volatile = g_decl.is_volatile;
             s->pointee_is_volatile = g_decl.pointee_is_volatile;
+            s->pointee_volatile_mask = g_decl.pointee_volatile_mask;
             s->is_register = g_decl.is_register;
             freshly_allocated = 1;
             if (arrlen > 0 || g_last_array_dim_count > 0) {
@@ -1549,7 +1836,7 @@ void gen_local_decl_after_type(int base)
                     s->dims[pi] = (pi < g_ptr_array_dim_count) ? g_ptr_array_dims[pi] : 0;
             }
         }
-        if (freshly_allocated) {
+        if (freshly_allocated || (opt_debug_lines && s && s->is_const_value)) {
             mir_note_declared_symbol(s);
             mir_note_declared_alias(source_name, s);
             emit_debug_variable(s);

@@ -15,7 +15,8 @@ process control, and pseudo-random numbers.
 ## Runtime model
 
 The standard functions in this header are runtime-backed. DCC C Compiler also declares a
-small set of CP/M and Z80 extensions here (`bdos`, `inp`, and `outp`); those are
+small set of CP/M and Z80 extensions here (BDOS/BIOS wrappers, port I/O, and
+program replacement); those are
 documented with the CP/M services rather than treated as portable C APIs.
 
 ## Dynamic memory
@@ -30,25 +31,48 @@ this space is bounded by the program's TPA: code, data, runtime support, heap,
 and stack all share the same transient program area.
 
 ```c
-char *p = malloc(256);
-if (!p) { fputs("out of memory\n", stderr); exit(EXIT_FAILURE); }
-p = realloc(p, 512);        /* old contents preserved */
-free(p);
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void)
+{
+    char *buffer = malloc(256);
+    char *resized;
+
+    if (!buffer)
+        return EXIT_FAILURE;
+    resized = realloc(buffer, 512);
+    if (!resized) {
+        free(buffer);
+        return EXIT_FAILURE;
+    }
+    buffer = resized;
+    free(buffer);
+    return EXIT_SUCCESS;
+}
 ```
 
 `realloc` follows the standard rules: `realloc(NULL, n)` behaves like
 `malloc(n)`, and `realloc(p, 0)` frees `p` and returns `NULL`.
 
+Allocation failure returns `NULL`; a failed nonzero `realloc` leaves the
+original block valid. Do not overwrite your only pointer before checking the
+result. `free(NULL)` does nothing. Zero-byte `malloc` requests use the minimum
+allocation size and can still fail. `calloc` rejects a product that exceeds
+16-bit `size_t`; check multiplication before calling `malloc(count * size)`,
+where the expression itself can already have wrapped. Allocation failure does
+not guarantee that `errno` is set.
+
 !!! note "Size cost"
-    `malloc`/`calloc` link integer multiply/divide/modulo helpers for size
-    arithmetic, and `strdup` inherits the whole `malloc` chain. See the
+    `calloc` uses checked size multiplication and zero-filling in addition to
+    allocation. `strdup` also requires the allocator. See the
     [appendix](../appendix/01-dccrtlstrip.md).
 
 ## Conversion
 
-`atoi`/`atol` skip leading spaces/tabs, accept an optional `+`/`-` sign, then
-consume decimal digits; conversion stops at the first non-digit. Overflow wraps
-modulo the type width.
+`atoi`/`atol` skip the full C whitespace set (space and bytes `\t` through
+`\r`), accept an optional `+`/`-` sign, then consume decimal digits; conversion
+stops at the first non-digit. Overflow wraps modulo the type width.
 
 ```c
 int  n = atoi("  -123xyz");   /* -123  */
@@ -60,7 +84,9 @@ accept an optional sign, honour a `0x`/`0X` prefix for base 16 and a leading `0`
 for base 8 when `base` is 0, and accept digits/letters up to `base`-1 for any
 base from 2 to 36. The unused tail is reported through `*end` when `end` is
 non-`NULL`. On overflow they clamp to `LONG_MAX`/`LONG_MIN` (or `ULONG_MAX`) and
-set `errno` to `ERANGE`.
+set `errno` to `ERANGE`. A `0x` prefix is recognized only when a hexadecimal
+digit follows it; for `"0x"` or `"0xG"` the leading zero is converted and
+`end` points at the `x`, without changing `errno`.
 
 ```c
 char *end;
@@ -72,6 +98,25 @@ unsigned long u = strtoul("4294967295", NULL, 10); /* ULONG_MAX */
 and returns IEEE 754 single precision. C89 `atof` normally returns `double`, which DCC C Compiler
 does not have. It accepts ordinary decimal text with an optional exponent, plus the case-insensitive
 spellings `nan`, `inf`, and `infinity`. Overflow returns signed infinity; underflow returns signed zero.
+`strtod` uses the same parser and reports the first unconsumed byte through
+`endptr`. Numeric overflow and underflow set `errno` to `ERANGE`; explicit
+infinity/NaN spellings and an exact zero with a large exponent are not range
+errors.
+
+For checked input, prefer `strtol`/`strtoul`/`strtod` to `atoi`/`atol`/`atof`.
+Set `errno = 0` before conversion, check whether `endptr` advanced, inspect any
+unconsumed suffix, and check `ERANGE`. A zero result alone cannot distinguish
+valid zero from failed conversion.
+
+## Multibyte and wide characters
+
+DCC uses a fixed single-byte execution encoding (`MB_CUR_MAX == 1`).
+Byte values `0x00` through `0xFF` map to equal-valued 16-bit `wchar_t` values.
+A wider value is unrepresentable: `wctomb` returns `-1` without writing a
+truncated byte, and `wcstombs` returns `(size_t)-1` at the offending element.
+`wcstombs` may already have stored a representable prefix, as permitted by C,
+but never stores the truncated offending value. With `n == 0`, it examines and
+writes no elements and returns zero.
 
 ## Integer arithmetic helpers
 
@@ -94,9 +139,52 @@ complete programs.
 
 ## Process control
 
+`exit(status)` and returning from `main` run registered `atexit` functions in
+reverse registration order, clean up temporary files, and flush console output.
+`atexit` returns zero on success and nonzero when its 32-entry table is full.
+Close ordinary files explicitly before exiting. `abort` flushes console output
+and warm-boots without running handlers or temporary-file cleanup; it does not
+set an exit status.
+
+CP/M has no environment-variable service: `getenv` always returns `NULL`.
+There is no supported returning shell-command service: `system(NULL)` returns
+zero and `system(command)` returns `-1`. Use the DCC-specific `exec` functions
+below only when replacing the current program is intended.
+
 The exit code is surfaced through CP/M 3.0 BDOS call 108, which emulators such
 as ntvcm reflect in their own process exit code. Returning a value from `main`
 has the same effect.
+
+`exec()` and `execv()` replace the current program through the CP/M command-tail
+area. DCC accepts the full 127-byte payload in `0x81..0xFF`; the length byte is
+authoritative, so the conventional trailing CR is omitted only at that exact
+maximum. A 128th byte returns `-1` with `errno == E2BIG`. `exec()` validates
+and copies its caller-owned source into private staging before opening the
+image, abandoning the caller stack, clearing FCBs, or writing the destination
+tail, so stack-local and overlapping low-memory sources are safe.
+
+The executable path must be an unambiguous CP/M 8.3 name: an optional
+`A:` through `P:` drive, one to eight filename bytes, and an optional one to
+three byte filetype. DCC appends `.COM` when the filetype is absent. Invalid
+syntax returns `EINVAL`, a failed open returns `ENOENT`, and an executable whose
+128-byte-record-rounded image cannot fit below the loader's reserved high-memory
+stack/FCB/trampoline ranges returns `EFBIG`.
+
+The BDOS function 35 record count is also the loader's exact read contract. The
+high-memory trampoline performs exactly that many successful sequential reads,
+never reads a newly grown extra record, and warm-boots rather than jumping to a
+partial image if any approved read returns a nonzero status.
+
+The startup parser intentionally keeps direct CP/M behavior: bytes through
+ASCII space delimit arguments, while quote and backslash are literal bytes and
+have no escaping role. Therefore `execv()` can round-trip only nonempty
+arguments containing bytes above ASCII space. It returns `-1` with
+`errno == EINVAL` for empty arguments or arguments containing spaces, tabs, or
+other delimiter bytes rather than silently changing `argv`.
+
+The first two command-tail words seed CP/M's default FCB1 and FCB2. Their
+delimiter rule is identical to startup argument parsing: every byte through
+ASCII space, including tab and control whitespace, is a delimiter.
 
 ## Pseudo-random numbers
 

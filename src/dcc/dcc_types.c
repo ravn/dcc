@@ -1,14 +1,20 @@
-/*
- * dcc_types.c - type system and aggregate/typedef parsing.
+/**
+ * @file dcc_types.c
+ * @brief Implements the target type model and aggregate/type-name parsing.
  *
- * Base-type and declarator parsing (parse_base_type/parse_type), struct/union
- * and typedef tables, bitfield layout, type sizing/promotion/arithmetic
- * helpers, and enum-constant lookup. find_enum_const() is relocated here from
- * the monolith's declaration block (its only caller is the global-init parser).
+ * @par Role
+ * Encodes size and pointer-depth operations, array dimensions and strides,
+ * target-size checks, struct/union and bitfield layout, typedef and enum
+ * lookup, qualifiers, base types, declarators, and abstract type names.
  *
- * MODULE: compiled as its own translation unit; shared declarations are in dcc.h.
- * Source provenance: monolith src/ddc.c line 467-474 (find_enum_const) then
- * lines 2872-3559.
+ * @par Key entry points
+ * type_size(), type_ptr_depth(), parse_base_type(), parse_type(),
+ * parse_type_name_decl(), parse_struct_definition(), and find_field_def().
+ *
+ * @par Boundary
+ * Function declarators are completed by dcc_expr.c and dcc_func.c; typed
+ * constant evaluation lives in dcc_fold.c and dcc_constexpr.c. This module
+ * defines types and emits no function-body code.
  */
 
 #include "dcc.h"
@@ -417,6 +423,7 @@ void parse_struct_definition(int struct_id)
     int decl_type;
     int field_base_is_volatile;
     int field_base_pointee_is_volatile;
+    unsigned int field_base_volatile_mask;
 
     sd = &struct_defs[struct_id - 1];
 
@@ -435,9 +442,14 @@ void parse_struct_definition(int struct_id)
             parse_static_assert_decl();
             continue;
         }
-        decl_type = parse_type();
+        /* Parse declaration specifiers only.  Pointer stars belong to each
+         * individual member declarator: in `int *p, n, *q, a[2]`, applying
+         * the first `*` to the shared declaration type incorrectly turns n
+         * and a into pointer-valued fields. */
+        decl_type = parse_base_type();
         field_base_is_volatile = g_decl.is_volatile;
         field_base_pointee_is_volatile = g_decl.pointee_is_volatile;
+        field_base_volatile_mask = g_decl.pointee_volatile_mask;
 
         for (;;) {
             int is_funcptr_field;
@@ -447,9 +459,9 @@ void parse_struct_definition(int struct_id)
             ftype = decl_type;
             g_decl.is_volatile = field_base_is_volatile;
             g_decl.pointee_is_volatile = field_base_pointee_is_volatile;
+            g_decl.pointee_volatile_mask = field_base_volatile_mask;
             while (accept('*')) {
-                g_decl.pointee_is_volatile = g_decl.is_volatile;
-                g_decl.is_volatile = skip_type_qualifiers_volatile();
+                advance_pointer_qualifiers();
                 ftype = type_add_ptr(ftype);
             }
 
@@ -522,10 +534,17 @@ void parse_struct_definition(int struct_id)
 
                 memset(&field_defs[nfield_defs], 0, sizeof(field_defs[nfield_defs]));
                 dcc_copy_str(field_defs[nfield_defs].name, sizeof(field_defs[nfield_defs].name), fname);
-                if ((ftype & 15) != TYPE_INT || type_ptr_depth(ftype) != 0)
+                if (((ftype & 15) != TYPE_INT && (ftype & 15) != TYPE_BOOL) ||
+                    type_ptr_depth(ftype) != 0)
                     error_here("bitfield type must be int or unsigned int");
-                field_defs[nfield_defs].type = ((ftype & TYPE_UNSIGNED) || g_parse_type_was_enum) ?
-                    (TYPE_UNSIGNED | TYPE_INT) : TYPE_INT;
+                if ((ftype & 15) == TYPE_BOOL && bw > 1)
+                    error_here("_Bool bitfield width exceeds one bit");
+                if ((ftype & 15) == TYPE_BOOL)
+                    field_defs[nfield_defs].type = TYPE_BOOL;
+                else
+                    field_defs[nfield_defs].type =
+                        ((ftype & TYPE_UNSIGNED) || g_parse_type_was_enum) ?
+                        (TYPE_UNSIGNED | TYPE_INT) : TYPE_INT;
                 field_defs[nfield_defs].is_volatile = g_decl.is_volatile;
                 field_defs[nfield_defs].parent_struct_id = struct_id;
                 field_defs[nfield_defs].offset = bit_unit_offset;
@@ -552,7 +571,11 @@ void parse_struct_definition(int struct_id)
             memset(&field_defs[nfield_defs], 0, sizeof(field_defs[nfield_defs]));
             dcc_copy_str(field_defs[nfield_defs].name, sizeof(field_defs[nfield_defs].name), fname);
             field_defs[nfield_defs].type = ftype;
+            field_defs[nfield_defs].funcptr_prototype = capture_funcptr_prototype(ftype, is_funcptr_field);
             field_defs[nfield_defs].is_volatile = g_decl.is_volatile;
+            field_defs[nfield_defs].pointee_volatile_mask =
+                g_decl.pointee_volatile_mask |
+                (unsigned int)(g_decl.pointee_is_volatile != 0);
             field_defs[nfield_defs].parent_struct_id = struct_id;
             /* union: all fields at offset 0; struct: cumulative */
             field_defs[nfield_defs].offset = sd->is_union ? 0 : sd->size;
@@ -639,13 +662,24 @@ void add_typedef_name_ex(const char *name, int type, int array_len, int is_func,
     typedefs[i].type = type;
     typedefs[i].is_volatile = is_volatile;
     typedefs[i].pointee_is_volatile = pointee_is_volatile;
+    typedefs[i].pointee_volatile_mask = (unsigned int)(pointee_is_volatile != 0);
     typedefs[i].array_len = array_len;
     typedefs[i].is_func = is_func;
     typedefs[i].has_proto = g_funcptr_has_proto;
+    typedefs[i].funcptr_return_type = g_funcptr_return_type;
+    typedefs[i].funcptr_result_prototype = g_funcptr_result_prototype;
     typedefs[i].proto_nargs = g_funcptr_proto_nargs;
     typedefs[i].proto_variadic = g_funcptr_proto_variadic;
     for (pi = 0; pi < MAX_PROTO_PARAMS; ++pi)
         typedefs[i].proto_types[pi] = g_funcptr_proto_types[pi];
+    if (g_funcptr_return_type == 0 && g_typedef_funcptr_return_type != 0) {
+        typedefs[i].funcptr_return_type = g_typedef_funcptr_return_type;
+        typedefs[i].funcptr_result_prototype = g_typedef_funcptr_result_prototype;
+        typedefs[i].has_proto = g_typedef_has_proto;
+        typedefs[i].proto_nargs = g_typedef_proto_nargs;
+        typedefs[i].proto_variadic = g_typedef_proto_variadic;
+        memcpy(typedefs[i].proto_types, g_typedef_proto_types, sizeof(g_typedef_proto_types));
+    }
 }
 
 void add_typedef_name(const char *name, int type, int array_len)
@@ -680,8 +714,13 @@ int parse_base_type(void)
     saw_bool = 0;
     storage_class_seen = 0;
     g_typedef_array_len = 0;
+    g_typedef_array_dim_count = 0;
+    memset(g_typedef_array_dims, 0, sizeof(g_typedef_array_dims));
+    g_typedef_base_type = 0;
     g_typedef_is_func = 0;
     g_typedef_has_proto = 0;
+    g_typedef_funcptr_return_type = 0;
+    g_typedef_funcptr_result_prototype = NULL;
     g_typedef_proto_nargs = 0;
     g_typedef_proto_variadic = 0;
     memset(g_typedef_proto_types, 0, sizeof(g_typedef_proto_types));
@@ -689,8 +728,10 @@ int parse_base_type(void)
     g_decl.is_const = 0;
     g_decl.is_volatile = 0;
     g_decl.pointee_is_volatile = 0;
+    g_decl.pointee_volatile_mask = 0;
     g_decl.is_inline = 0;
     g_decl.is_noreturn = 0;
+    g_decl.is_fastcall = 0;
     g_parse_type_was_enum = 0;
 
     /* C89 declaration specifiers are order-independent. */
@@ -757,10 +798,12 @@ int parse_base_type(void)
             int sid;
             int struct_is_volatile;
             int struct_pointee_is_volatile;
+            unsigned int struct_volatile_mask;
             char sname[64];
             int is_union_kw;
             struct_is_volatile = g_decl.is_volatile;
             struct_pointee_is_volatile = g_decl.pointee_is_volatile;
+            struct_volatile_mask = g_decl.pointee_volatile_mask;
             is_union_kw = (g_lex.tok.kind == TOK_UNION);
             next_token();
             if (g_lex.tok.kind == TOK_ID) {
@@ -780,10 +823,15 @@ int parse_base_type(void)
                 parse_struct_definition(sid);
                 g_decl.is_volatile = struct_is_volatile;
                 g_decl.pointee_is_volatile = struct_pointee_is_volatile;
+                g_decl.pointee_volatile_mask = struct_volatile_mask;
             }
             t = make_struct_type(sid);
             saw_any = 1;
-            break;
+            /* Declaration specifiers are order-independent.  Keep scanning so
+             * standard forms such as `struct S static object` and
+             * `struct S const object` accept storage classes and qualifiers
+             * written after the aggregate type specifier. */
+            continue;
         }
 
         if (g_lex.tok.kind == TOK_ENUM) {
@@ -869,11 +917,18 @@ int parse_base_type(void)
 
         if (!saw_any && g_lex.tok.kind == TOK_ID && (td = find_typedef(g_lex.tok.text)) >= 0) {
             t = typedefs[td].type;
+            g_typedef_base_type = t;
             g_decl.is_volatile |= typedefs[td].is_volatile;
             g_decl.pointee_is_volatile = typedefs[td].pointee_is_volatile;
+            g_decl.pointee_volatile_mask = typedefs[td].pointee_volatile_mask;
             g_typedef_array_len = typedefs[td].array_len;
+            g_typedef_array_dim_count = typedefs[td].dim_count;
+            memcpy(g_typedef_array_dims, typedefs[td].dims,
+                   sizeof(g_typedef_array_dims));
             g_typedef_is_func = typedefs[td].is_func;
                  g_typedef_has_proto = typedefs[td].has_proto;
+                 g_typedef_funcptr_return_type = typedefs[td].funcptr_return_type;
+                 g_typedef_funcptr_result_prototype = typedefs[td].funcptr_result_prototype;
                  g_typedef_proto_nargs = typedefs[td].proto_nargs;
                  g_typedef_proto_variadic = typedefs[td].proto_variadic;
                  memcpy(g_typedef_proto_types, typedefs[td].proto_types,
@@ -908,13 +963,22 @@ int parse_base_type(void)
     return t;
 }
 
+void advance_pointer_qualifiers(void)
+{
+    g_decl.pointee_volatile_mask =
+        ((g_decl.pointee_volatile_mask |
+          (unsigned int)(g_decl.pointee_is_volatile != 0)) << 1) |
+        (unsigned int)(g_decl.is_volatile != 0);
+    g_decl.pointee_is_volatile = g_decl.is_volatile;
+    g_decl.is_volatile = skip_type_qualifiers_volatile();
+}
+
 int parse_type(void)
 {
     int t;
     t = parse_base_type();
     while (accept('*')) {
-        g_decl.pointee_is_volatile = g_decl.is_volatile;
-        g_decl.is_volatile = skip_type_qualifiers_volatile();
+        advance_pointer_qualifiers();
         t = type_add_ptr(t);
     }
     return t;
@@ -942,8 +1006,13 @@ int parse_type_name_decl(int *typep, int *sizep)
     int n;
     int saw_paren_ptr;
     int size_is_pointer_object;
+    int return_type;
+    struct Sym *result_prototype;
 
     t = parse_base_type();
+    g_funcptr_return_type = 0;
+    g_funcptr_result_prototype = NULL;
+    saw_paren_ptr = 0;
     size_is_pointer_object = 0;
     sz = type_size(t);
     if (g_typedef_array_len > 0)
@@ -952,17 +1021,24 @@ int parse_type_name_decl(int *typep, int *sizep)
         sz = 1;
 
     while (accept('*')) {
-        skip_type_qualifiers();
+        advance_pointer_qualifiers();
         t = type_add_ptr(t);
         sz = 2;
     }
 
+    return_type = t;
+    result_prototype = capture_funcptr_prototype(t, 0);
+    if (g_lex.tok.kind == '(' && parse_abstract_funcptr_declarator(&t)) {
+        typep[0] = t;
+        sizep[0] = 2;
+        return 1;
+    }
     if (g_lex.tok.kind == '(') {
         next_token();
         skip_type_qualifiers();
         saw_paren_ptr = 0;
         while (accept('*')) {
-            skip_type_qualifiers();
+            advance_pointer_qualifiers();
             saw_paren_ptr = 1;
         }
         if (g_lex.tok.kind == TOK_ID)
@@ -1019,7 +1095,16 @@ int parse_type_name_decl(int *typep, int *sizep)
              * Plain sizeof(function type) is invalid C; keep a small, safe
              * size so DCC can continue after the diagnostic-free parse.
              */
-            skip_type_name_param_list();
+            if (saw_paren_ptr) {
+                DeclState saved_decl = g_decl;
+                next_token();
+                parse_funcptr_prototype_suffix();
+                g_decl = saved_decl;
+                g_funcptr_return_type = return_type;
+                g_funcptr_result_prototype = result_prototype;
+            } else {
+                skip_type_name_param_list();
+            }
             if (t & (TYPE_PTR | TYPE_PTR2))
                 sz = 2;
             else if (sz <= 0)
@@ -1035,4 +1120,3 @@ int parse_type_name_decl(int *typep, int *sizep)
 }
 
 int parse_sizeof_expr_operand(void);
-

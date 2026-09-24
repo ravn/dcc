@@ -1,9 +1,20 @@
-/* peep_pass_once.c - the single-scan micro-pattern dispatcher.
+/**
+ * @file peep_pass_once.c
+ * @brief Dispatches ordered local peephole patterns in one line scan.
  *
- * pass_once() walks the line program once, trying a fixed ordered list of
- * small local rewrites (the try_*_at helpers) at each position. It is the
- * highest-volume pass in the fixpoint loop; all of its helpers are private
- * to this file and invoked only from pass_once itself.
+ * @par Role
+ * Walks the line program once and applies a fixed-priority set of private
+ * try_*_at() rewrites for boolean materialization, comparisons, stack and
+ * allocation sequences, redundant jumps, and other short local shapes.
+ *
+ * @par Key entry points
+ * pass_once() runs the scan; local_alloc_hl_result_dead() exposes the shared
+ * safety proof used by terminal local-allocation cleanup.
+ *
+ * @par Boundary
+ * The try_*_at() helpers are private and one invocation is only one scan.
+ * dccpeep.c provides fixed-point repetition and ordering against other pass
+ * families.
  */
 #include "dccpeep_internal.h"
 
@@ -1430,6 +1441,113 @@ static int try_ix_predec_inc_at(int i)
     return 0;
 }
 
+static int byte_test_auxiliary_dead(int line, unsigned registers,
+                                    unsigned flags, int *budget, int c_return)
+{
+    const PeepLineInfo *info;
+    const PeepFlowLine *flow;
+    char clean[MAX_LINE];
+    unsigned flags_read;
+    unsigned reads;
+    unsigned writes;
+    unsigned flags_written;
+    int successor;
+
+    if ((registers | flags) == 0)
+        return 1;
+    if (line < 0 || line >= nlines || --*budget < 0 || user_asm_original[line] != NULL)
+        return 0;
+    strip_peep_comment_copy(clean, lines[line]);
+    if (!strcmp(clean, "ex de,hl"))
+        return byte_test_auxiliary_dead(line + 1, registers, flags, budget, c_return);
+    if (!strcmp(clean, "bit 7,h"))
+        return byte_test_auxiliary_dead(line + 1, registers, 0, budget, c_return);
+    if (registers == 0 && (!strcmp(clean, "rlca") || !strcmp(clean, "rrca") ||
+                           !strcmp(clean, "rla") || !strcmp(clean, "rra")))
+        return byte_test_auxiliary_dead(line + 1, registers, flags, budget, c_return);
+    if (!strcmp(clean, "call __stchk"))
+        return byte_test_auxiliary_dead(line + 1, registers, 0, budget, c_return);
+    if (!strcmp(clean, "call __fpc") || !strcmp(clean, "call _pflng") ||
+        !strcmp(clean, "call _pflio") || !strcmp(clean, "call _pffio") ||
+        !strcmp(clean, "call _printf") ||
+        !strcmp(clean, "call __ssf") || !strcmp(clean, "call __scat") ||
+        !strcmp(clean, "call _atoi"))
+        return 1;
+    if (!strncmp(clean, "call ", 5) && is_local_func_label(clean + 5)) {
+        int target = find_label_line_in_range(clean + 5, 0, nlines);
+        if (target >= 0 && byte_test_auxiliary_dead(target, registers, flags, budget, 0))
+            return 1;
+    }
+    info = peep_line_info(line);
+    if (info == NULL || info->effects.unknown)
+        return 0;
+    if (!strcmp(clean, "ret") && c_return)
+        return 1;
+    flags_read = info->effects.flags_read;
+    reads = info->effects.reads;
+    writes = info->effects.writes;
+    flags_written = info->effects.flags_written;
+    if ((!strcmp(info->mnemonic, "add") || !strcmp(info->mnemonic, "inc") ||
+         !strcmp(info->mnemonic, "dec")) &&
+        info->left.kind == PEEP_OPERAND_REGISTER &&
+        (info->left.registers == PEEP_REG_HL || info->left.registers == PEEP_REG_DE ||
+         info->left.registers == PEEP_REG_BC || info->left.registers == PEEP_REG_IX ||
+         info->left.registers == PEEP_REG_IY || info->left.registers == PEEP_REG_SP))
+        flags_written &= ~PEEP_FLAG_PV;
+    if (info->opcode == PEEP_OPCODE_JP || info->opcode == PEEP_OPCODE_JR) {
+        char target[128];
+        int start;
+        int end;
+        find_function_bounds_any(line, &start, &end);
+        if (!jump_target_any(clean, target) ||
+            find_label_line_in_range(target, start, end) < 0)
+            return 0;
+    }
+    if (!strcmp(clean, "or a")) {
+        reads &= ~PEEP_REG_A;
+        writes &= ~PEEP_REG_A;
+        flags_written &= ~PEEP_FLAG_PV;
+    } else if (!strcmp(clean, "xor a") || !strcmp(clean, "sbc a,a")) {
+        reads &= ~PEEP_REG_A;
+    }
+    if (!strncmp(clean, "jp z,", 5) || !strncmp(clean, "jp nz,", 6) ||
+        !strncmp(clean, "jr z,", 5) || !strncmp(clean, "jr nz,", 6))
+        flags_read = PEEP_FLAG_Z;
+    if ((info->opcode == PEEP_OPCODE_JP || info->opcode == PEEP_OPCODE_JR) &&
+        strchr(clean, ',') == NULL)
+        flags_read = 0;
+    if ((reads & registers) != 0 || (flags_read & flags) != 0)
+        return 0;
+    registers &= ~writes;
+    flags &= ~flags_written;
+    if ((registers | flags) == 0)
+        return 1;
+    flow = peep_flow_line(line);
+    if (flow == NULL || flow->successor_count == 0)
+        return 0;
+    for (successor = 0; successor < flow->successor_count; ++successor)
+        if (!byte_test_auxiliary_dead(flow->successors[successor], registers,
+                                     flags, budget, c_return))
+            return 0;
+    return 1;
+}
+
+static int signed_byte_test_auxiliary_dead(int line)
+{
+    int start;
+    int end;
+    int scan;
+    int c_return = 0;
+    int budget = 512;
+
+    find_function_bounds_any(line, &start, &end);
+    for (scan = start; scan < end; ++scan)
+        if (strstr(lines[scan], ";@dcc.mir ") != NULL ||
+            strstr(lines[scan], ";@dcc.lto end ") != NULL)
+            c_return = 1;
+    return byte_test_auxiliary_dead(line + 1, PEEP_REG_A, PEEP_FLAG_PV, &budget, c_return);
+}
+
 static int try_byte_zero_test_at(int i)
 {
     /*
@@ -1440,7 +1558,7 @@ static int try_byte_zero_test_at(int i)
      *   or l
      * The above loads a byte from (HL) as an unsigned 16-bit value in HL,
      * then OR-reduces HL into A to test for zero.  Since H is forced to 0,
-     * A ends up equal to the byte.  Equivalent, and 11T faster:
+    * A ends up equal to the byte.  When HL is dead, equivalent and 11T faster:
      *   ld a,(hl)
      *   or a
      */
@@ -1448,7 +1566,8 @@ static int try_byte_zero_test_at(int i)
         eq(i,     "ld l,(hl)") &&
         eq(i + 1, "ld h,0") &&
         eq(i + 2, "ld a,h") &&
-        eq(i + 3, "or l")) {
+        eq(i + 3, "or l") &&
+        peep_registers_dead_after(i + 3, PEEP_REG_HL)) {
         replace1_tagged(i, "ld a,(hl)", "byte_zero_test");
         replace1(i + 1, "or a");
         delete_n(i + 2, 2);
@@ -1456,6 +1575,117 @@ static int try_byte_zero_test_at(int i)
     }
 
     return 0;
+}
+
+static int byte_table_add_de_dead_at_loop_fetch(int after_store)
+{
+    char target[128];
+    int func_start;
+    int func_end;
+    int label;
+    int j;
+
+    /* A1's tight interpreter backedge reaches its zero-argument opcode
+       fetch immediately. That helper owns/clobbers DE, but the generic
+       call model must conservatively mark all registers live across an
+       opaque call and therefore cannot prove this fact itself. */
+    if (after_store >= nlines ||
+        !peep_parse_jp_uncond_label(lines[after_store], target))
+        return 0;
+    find_function_bounds_any(after_store, &func_start, &func_end);
+    label = find_label_line_in_range(target, func_start, func_end);
+    if (label < 0)
+        return 0;
+    for (j = label + 1; j < func_end; ++j) {
+        if (is_blank_or_comment(lines[j]) || starts_label(lines[j]))
+            continue;
+        return eq(j, "call _a1opfetch");
+    }
+    return 0;
+}
+
+static int parse_ix_l_store(const char *line, int *offset)
+{
+    char clean[MAX_LINE];
+    char extra;
+
+    strip_peep_comment_copy(clean, line);
+    return sscanf(clean, "ld (ix%d),l %c", offset, &extra) == 1;
+}
+
+static int try_byte_return_switch_spill_at(int i)
+{
+    int temporary;
+    int opcode;
+    char off[32];
+    char replacement[128];
+
+    /* DCC narrows a byte-returning call through a compiler temporary before
+       assigning the named local used by the immediately following switch:
+
+         call helper
+         ld (ix-T),l    ; byte-slot return temporary
+         ld (ix-O),l    ; opcode local
+         add hl,hl      ; dense-switch table index
+
+       The switch consumes that same still-live L directly, so T is never
+       read. The MIR byte-slot marker distinguishes the compiler's narrowed
+       return temporary from the named destination local; the immediate
+       dense-switch index is the control-flow proof that no intervening use
+       of the temporary exists. */
+    if (i + 3 >= nlines ||
+        strncmp(lines[i], "call ", 5) != 0 ||
+        strstr(lines[i + 1], ";@dcc.mir byte-slot") == NULL ||
+        !parse_ix_l_store(lines[i + 1], &temporary) ||
+        !parse_ix_l_store(lines[i + 2], &opcode) ||
+        temporary == opcode ||
+        !eq(i + 3, "add hl,hl"))
+        return 0;
+
+    peep_format_ix_off(off, opcode);
+    snprintf(replacement, sizeof(replacement), "ld (ix%s),l", off);
+    replace1_tagged(i + 2, replacement, "byte_return_switch_spill");
+    delete_n(i + 1, 1);
+    return 1;
+}
+
+static int try_byte_table_add_global_at(int i)
+{
+    char load_sym[128];
+    char store_sym[128];
+    char newline[256];
+
+    /*
+     * Add an unsigned byte fetched through HL to a global word:
+     *
+     *   ld l,(hl)             ld e,(hl)
+     *   ld h,0                ld d,0
+     *   ld de,(word)    ->    ld hl,(word)
+     *   add hl,de             add hl,de
+     *   ld (word),hl          ld (word),hl
+     *
+     * Loading a global directly into HL is 4T faster and one byte smaller
+     * than loading it into DE. The final HL value and flags are identical;
+     * DE changes, so require the dataflow proof that it is dead afterward.
+     * The A1 interpreter's zero-argument fetch helper is also an explicit
+     * DE-clobber boundary; see byte_table_add_de_dead_at_loop_fetch.
+     */
+    if (i + 4 >= nlines ||
+        !eq(i, "ld l,(hl)") ||
+        !eq(i + 1, "ld h,0") ||
+        !peep_parse_ld_de_paren_sym(lines[i + 2], load_sym) ||
+        !eq(i + 3, "add hl,de") ||
+        !peep_parse_ld_paren_sym_hl(lines[i + 4], store_sym) ||
+        strcmp(load_sym, store_sym) != 0 ||
+        (!peep_registers_dead_after(i + 4, PEEP_REG_D | PEEP_REG_E) &&
+         !byte_table_add_de_dead_at_loop_fetch(i + 5)))
+        return 0;
+
+    replace1_tagged(i, "ld e,(hl)", "byte_table_add_global");
+    replace1(i + 1, "ld d,0");
+    snprintf(newline, sizeof(newline), "ld hl,(%s)", load_sym);
+    replace1(i + 2, newline);
+    return 1;
 }
 
 static int bc_dead_before_use(int start)
@@ -1513,9 +1743,9 @@ static int function_has_inline_simple_store_marker(int line)
 static int try_hl_bc_hl_roundtrip_at(int i)
 {
     if (i + 3 >= nlines ||
-        !function_has_inline_simple_store_marker(i) ||
         !eq(i, "ld c,l") || !eq(i + 1, "ld b,h") ||
-        !eq(i + 2, "ld l,c") || !eq(i + 3, "ld h,b"))
+        !eq(i + 2, "ld l,c") || !eq(i + 3, "ld h,b") ||
+        !function_has_inline_simple_store_marker(i))
         return 0;
     if (peep_registers_dead_after(
             i + 3, PEEP_REG_B | PEEP_REG_C) ||
@@ -1540,6 +1770,18 @@ int pass_once(void)
     changed = 0;
 
     for (i = 0; i < nlines; i++) {
+        if (try_byte_return_switch_spill_at(i)) {
+            changed = 1;
+            if (i > 0) i--;
+            continue;
+        }
+
+        if (try_byte_table_add_global_at(i)) {
+            changed = 1;
+            if (i > 0) i--;
+            continue;
+        }
+
         if (try_hl_bc_hl_roundtrip_at(i)) {
             changed = 1;
             if (i > 0) i--;
@@ -1837,7 +2079,8 @@ int pass_once(void)
          *
          * The sign-extension is irrelevant for a zero/nonzero branch.  Test
          * the byte directly, leaving HL untouched; only apply when the next
-         * consumer is a Z/NZ branch so no signed flags are being preserved.
+         * consumer is a Z/NZ branch and the changed HL, A, and parity results
+         * are dead.
          */
         if (i + 7 < nlines &&
             eq(i,     "ld l,(hl)") &&
@@ -1850,7 +2093,9 @@ int pass_once(void)
             (strncmp(lines[i + 7], "jp z,", 5) == 0 ||
              strncmp(lines[i + 7], "jp nz,", 6) == 0 ||
              strncmp(lines[i + 7], "jr z,", 5) == 0 ||
-             strncmp(lines[i + 7], "jr nz,", 6) == 0)) {
+             strncmp(lines[i + 7], "jr nz,", 6) == 0) &&
+            peep_registers_dead_after(i + 6, PEEP_REG_HL) &&
+            signed_byte_test_auxiliary_dead(i + 6)) {
             replace1_tagged(i, "ld a,(hl)", "byte_signed_zero_test");
             replace1(i + 1, "or a");
             delete_n(i + 2, 5);

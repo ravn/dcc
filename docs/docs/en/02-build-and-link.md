@@ -7,20 +7,42 @@ CP/M / Z80 C apps anywhere, not just inside the DCC C Compiler repo. As long as 
 are on your `PATH` (see [Setting up the toolchain](00-setup-toolchain.md)), the
 commands below work from any folder that holds your `.c` sources.
 
-## The build script
+## Build with dccmake
 
-The primary installed build command is `dcc-ma`. It compiles, optimizes,
-strips the runtime, assembles, and links in one step.
-
-With an installed package, use the common wrapper command on Windows, macOS, and
-Linux:
+`dccmake` is the native build driver. With the tools on `PATH` and the DCC
+headers and runtime configured for your project, it builds one or more sources:
 
 ```sh
-dcc-ma foo --mode fast       # builds foo.c -> FOO.COM
-dcc-ma foo --mode nopeep     # skip the dccpeep optimizer
+dccmake main.c dcc-output=MAIN
+dccmake main.c helper.c dcc-output=MAIN dcc-stack-check=true
+ntvcm build/MAIN.COM
 ```
 
-From a source checkout, run the implementation script directly:
+The first source is the application translation unit; subsequent sources are
+compiled with `-module`. Outputs go to `build/` by default. Source basenames
+and the output name must be CP/M 8.3-compatible (at most eight characters before
+the extension, and three after it). Host directory paths can be longer.
+
+For repeatable builds, put settings in `dccmake.txt` in the working directory:
+
+```ini
+dcc-input=main.c,helper.c
+dcc-output=MAIN
+dcc-stack-bytes=1024
+dcc-stack-check=true
+dcc-peep=true
+```
+
+Run `dccmake` without source arguments to use that configuration. For projects
+outside the checkout, also configure `dcc-include-directory` and
+`dcc-runtime` as described in the [dccmake reference](appendix/03-utilities.md#build-pipeline-helper-dccmake).
+That reference covers tool overrides, configuration precedence, debug modes,
+and the optional emulated assembler/linker paths.
+
+## The build script
+
+Use `dccmake` for application projects. The source checkout also provides
+optional single-app helper scripts. From the checkout on Linux/macOS, run:
 
 ```sh
 ./scripts/ma.sh foo --mode fast
@@ -35,31 +57,29 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\ma.ps1 foo -Mode nopeep  
 ```
 
 This runs the compiler, the optional `dccpeep` peephole optimizer,
-`dccrtlstrip`, then M80 and L80. Runtime trimming is part of the normal build
-path because it keeps unused library routines out of the final `.COM` file. The
-script resolves each tool from your `PATH` or from the `DCC`, `DCCPEEP`, and
-`DCCRTLSTRIP` environment variables.
+`dccrtlstrip`, [`m80c`](appendix/03-utilities.md#native-assembler-m80c), and
+[`l80c`](appendix/03-utilities.md#native-linker-l80c). Whole-program
+application stripping and runtime trimming are both part of the normal build
+path, keeping unreachable app functions/objects and unused library routines out
+of the final `.COM` file. The script resolves each tool from your `PATH` or its
+documented environment-variable override.
 
+The native linker normally uses `/P:100`, CP/M's standard `.COM` load address.
+For fixed-address, overlay, or relocating system programs,
+[`l80c`](appendix/03-utilities.md#native-linker-l80c) also supports LINK-80-style
+nonstandard origins and generates the required CP/M entry jump/bootstrap. Its
+utility reference covers the CLI options, origin layouts, and limitations.
+
+<!-- markdownlint-disable MD046 -->
 ??? note "The manual pipeline (click to expand)"
 
     For manual builds or custom build systems, the full pipeline for `foo.c` is
-    shown below. `dcc`, `dccpeep`, and `dccrtlstrip` run on the host;
-    `m80.com` and `l80.com` are CP/M programs, so run them through `ntvcm` or
-    another CP/M emulator:
+    shown below. Every build tool runs natively on the host; only the resulting
+    `FOO.COM` needs CP/M or an emulator.
 
     === "Windows"
 
-        Define a CRLF helper using PowerShell/.NET APIs.
-
-        ```powershell
-        function Convert-ToCrlf($Path) {
-            $text = [IO.File]::ReadAllText($Path) -replace "`r?`n", "`r`n"
-            [IO.File]::WriteAllText($Path, $text)
-        }
-        ```
-
-        Compile the C source to M80 assembly, then optionally run the peephole
-        optimizer.
+        Compile and optionally optimize:
 
         ```powershell
         dcc -I C:\path\to\dcc -stack 512 foo.c -o FOO.MAC
@@ -67,228 +87,55 @@ script resolves each tool from your `PATH` or from the `DCC`, `DCCPEEP`, and
         Move-Item -Force _PEEPOUT.MAC FOO.MAC
         ```
 
-        Convert the app assembly to CP/M CRLF text and assemble it with M80 under
-        `ntvcm`.
+        Strip unreachable application blocks, then assemble:
 
         ```powershell
-        Convert-ToCrlf FOO.MAC
-        ntvcm m80 "=FOO.MAC" /X /O /Z /L
+        dccrtlstrip --strip-apps FOO.MAC
+        m80c "=FOO.MAC" /X /O /Z /L
         ```
 
-        Copy and trim the runtime to only the blocks used by the app.
-
-        ```powershell
-        Copy-Item C:\path\to\dcc\DCCRTL.MAC DCCRTL.MAC
-        Convert-ToCrlf DCCRTL.MAC
-        dccrtlstrip -r DCCRTL.MAC -o RTLMIN.MAC FOO.MAC
-        ```
-
-        Convert, assemble, and link the trimmed runtime with the app.
-
-        ```powershell
-        Convert-ToCrlf RTLMIN.MAC
-        ntvcm m80 "=RTLMIN.MAC" /X /O /Z
-        ntvcm l80 "/P:100,RTLMIN,FOO,FOO/N/E"
-        ```
-
-    === "macOS"
-
-        Define a CRLF helper: prefer `unix2dos` if it is installed, otherwise
-        use Perl (available on macOS).
-
-        ```sh
-        to_crlf() {
-            if command -v unix2dos >/dev/null 2>&1; then
-                unix2dos "$1" >/dev/null 2>&1 || true
-            else
-                perl -0pi -e 's/\r?\n/\r\n/g' "$1"
-            fi
-        }
-        ```
-
-        Compile the C source to M80 assembly, then optionally run the peephole
-        optimizer.
-
-        ```sh
-        dcc -I /path/to/dcc -stack 512 foo.c -o FOO.MAC
-        dccpeep FOO.MAC _PEEPOUT.MAC
-        mv _PEEPOUT.MAC FOO.MAC
-        ```
-
-        Convert the app assembly to CP/M CRLF text and assemble it with M80 under
-        `ntvcm`.
-
-        ```sh
-        to_crlf FOO.MAC
-        ntvcm m80 "=FOO.MAC" /X /O /Z /L
-        ```
-
-        Copy and trim the runtime to only the blocks used by the app.
-
-        ```sh
-        cp /path/to/dcc/DCCRTL.MAC DCCRTL.MAC
-        to_crlf DCCRTL.MAC
-        dccrtlstrip -r DCCRTL.MAC -o RTLMIN.MAC FOO.MAC
-        ```
-
-        Convert, assemble, and link the trimmed runtime with the app.
-
-        ```sh
-        to_crlf RTLMIN.MAC
-        ntvcm m80 "=RTLMIN.MAC" /X /O /Z
-        ntvcm l80 "/P:100,RTLMIN,FOO,FOO/N/E"
-        ```
-
-    === "Ubuntu"
-
-        Define a CRLF helper: prefer `unix2dos` if it is installed, otherwise
-        use Perl (available on Ubuntu).
-
-        ```sh
-        to_crlf() {
-            if command -v unix2dos >/dev/null 2>&1; then
-                unix2dos "$1" >/dev/null 2>&1 || true
-            else
-                perl -0pi -e 's/\r?\n/\r\n/g' "$1"
-            fi
-        }
-        ```
-
-        Compile the C source to M80 assembly, then optionally run the peephole
-        optimizer.
-
-        ```sh
-        dcc -I /path/to/dcc -stack 512 foo.c -o FOO.MAC
-        dccpeep FOO.MAC _PEEPOUT.MAC
-        mv _PEEPOUT.MAC FOO.MAC
-        ```
-
-        Convert the app assembly to CP/M CRLF text and assemble it with M80 under
-        `ntvcm`.
-
-        ```sh
-        to_crlf FOO.MAC
-        ntvcm m80 "=FOO.MAC" /X /O /Z /L
-        ```
-
-        Copy and trim the runtime to only the blocks used by the app.
-
-        ```sh
-        cp /path/to/dcc/DCCRTL.MAC DCCRTL.MAC
-        to_crlf DCCRTL.MAC
-        dccrtlstrip -r DCCRTL.MAC -o RTLMIN.MAC FOO.MAC
-        ```
-
-        Convert, assemble, and link the trimmed runtime with the app.
-
-        ```sh
-        to_crlf RTLMIN.MAC
-        ntvcm m80 "=RTLMIN.MAC" /X /O /Z
-        ntvcm l80 "/P:100,RTLMIN,FOO,FOO/N/E"
-        ```
-
-    === "Ubuntu ARM64"
-
-        Define a CRLF helper: prefer `unix2dos` if it is installed, otherwise
-        use Perl (available on Ubuntu).
-
-        ```sh
-        to_crlf() {
-            if command -v unix2dos >/dev/null 2>&1; then
-                unix2dos "$1" >/dev/null 2>&1 || true
-            else
-                perl -0pi -e 's/\r?\n/\r\n/g' "$1"
-            fi
-        }
-        ```
-
-        Compile the C source to M80 assembly, then optionally run the peephole
-        optimizer.
-
-        ```sh
-        dcc -I /path/to/dcc -stack 512 foo.c -o FOO.MAC
-        dccpeep FOO.MAC _PEEPOUT.MAC
-        mv _PEEPOUT.MAC FOO.MAC
-        ```
-
-        Convert the app assembly to CP/M CRLF text and assemble it with M80 under
-        `ntvcm`.
-
-        ```sh
-        to_crlf FOO.MAC
-        ntvcm m80 "=FOO.MAC" /X /O /Z /L
-        ```
-
-        Copy and trim the runtime to only the blocks used by the app.
-
-        ```sh
-        cp /path/to/dcc/DCCRTL.MAC DCCRTL.MAC
-        to_crlf DCCRTL.MAC
-        dccrtlstrip -r DCCRTL.MAC -o RTLMIN.MAC FOO.MAC
-        ```
-
-        Convert, assemble, and link the trimmed runtime with the app.
-
-        ```sh
-        to_crlf RTLMIN.MAC
-        ntvcm m80 "=RTLMIN.MAC" /X /O /Z
-        ntvcm l80 "/P:100,RTLMIN,FOO,FOO/N/E"
-        ```
-
-    === "Windows ARM64"
-
-        Define a CRLF helper using PowerShell/.NET APIs.
-
-        ```powershell
-        function Convert-ToCrlf($Path) {
-            $text = [IO.File]::ReadAllText($Path) -replace "`r?`n", "`r`n"
-            [IO.File]::WriteAllText($Path, $text)
-        }
-        ```
-
-        Compile the C source to M80 assembly, then optionally run the peephole
-        optimizer.
-
-        ```powershell
-        dcc -I C:\path\to\dcc -stack 512 foo.c -o FOO.MAC
-        dccpeep FOO.MAC _PEEPOUT.MAC
-        Move-Item -Force _PEEPOUT.MAC FOO.MAC
-        ```
-
-        Convert the app assembly to CP/M CRLF text and assemble it with M80 under
-        `ntvcm`.
-
-        ```powershell
-        Convert-ToCrlf FOO.MAC
-        ntvcm m80 "=FOO.MAC" /X /O /Z /L
-        ```
-
-        Copy and trim the runtime to only the blocks used by the app.
+        Copy and trim the runtime, then assemble and link:
 
         ```powershell
         Copy-Item C:\path\to\dcc\DCCRTL.MAC DCCRTL.MAC
-        Convert-ToCrlf DCCRTL.MAC
         dccrtlstrip -r DCCRTL.MAC -o RTLMIN.MAC FOO.MAC
+        m80c "=RTLMIN.MAC" /X /O /Z
+        l80c "/P:100,RTLMIN,FOO,FOO/N/E/Y"
         ```
 
-        Convert, assemble, and link the trimmed runtime with the app.
+    === "macOS / Linux"
 
-        ```powershell
-        Convert-ToCrlf RTLMIN.MAC
-        ntvcm m80 "=RTLMIN.MAC" /X /O /Z
-        ntvcm l80 "/P:100,RTLMIN,FOO,FOO/N/E"
+        Compile and optionally optimize:
+
+        ```sh
+        dcc -I /path/to/dcc -stack 512 foo.c -o FOO.MAC
+        dccpeep FOO.MAC _PEEPOUT.MAC
+        mv _PEEPOUT.MAC FOO.MAC
         ```
 
-    `scripts/ma.ps1` stages `m80.com` and `l80.com` before invoking `ntvcm`.
-    For a manual build, keep those `.COM` files and `DCCRTL.MAC` in the working
-    directory where you run the pipeline, or adjust the paths to match your
-    layout. Replace `/path/to/dcc` (or `C:\path\to\dcc`) with the DCC C Compiler repo path
-    that contains the standard headers; if you run from the DCC C Compiler repo root, the
-    explicit `-I` is usually unnecessary.
+        Strip and assemble the application, trim and assemble the runtime,
+        then link:
 
-    M80 expects CP/M-style CRLF text files; LF-only files can be misread. The Unix
-    function shown above uses Perl or `unix2dos`; the Windows function uses
-    PowerShell/.NET APIs.
+        ```sh
+        dccrtlstrip --strip-apps FOO.MAC
+        m80c "=FOO.MAC" /X /O /Z /L
+        cp /path/to/dcc/DCCRTL.MAC DCCRTL.MAC
+        dccrtlstrip -r DCCRTL.MAC -o RTLMIN.MAC FOO.MAC
+        m80c "=RTLMIN.MAC" /X /O /Z
+        l80c "/P:100,RTLMIN,FOO,FOO/N/E/Y"
+        ```
+
+    Replace `/path/to/dcc` (or `C:\path\to\dcc`) with the checkout
+    directory containing the standard headers and `DCCRTL.MAC`. Native
+    [`m80c`](appendix/03-utilities.md#native-assembler-m80c) accepts normal host
+    line endings; no CP/M text conversion is needed.
+
+    To cross-check compatibility with the original Microsoft tools, use
+    `dccmake foo.c dcc-output=FOO dcc-use-emulated-m80=true dcc-use-emulated-l80=true`
+    with the project's headers, runtime, and emulated tools configured. That optional path stages
+    `M80.COM`/`L80.COM`, converts text to CP/M CRLF, and runs them under
+    `ntvcm`.
+<!-- markdownlint-enable MD046 -->
 
 ## The compiler invocation
 
@@ -300,12 +147,17 @@ Common options:
 
 | Option | Meaning |
 | --- | --- |
-| `-o file` | Write M80 assembly to `file`; default is `out.mac`, `-` is stdout. |
+| `-o file` | Write [`m80c`](appendix/03-utilities.md#native-assembler-m80c)-compatible assembly to `file`; default is `out.mac`, `-` is stdout. |
 | `-c`, `-module` | Emit a separately compilable module, not a final program translation unit. |
 | `-f`, `-ffloatio` | Force `%f` support on every `printf`-family call. |
 | `-fl`, `-flongio` | Force 32-bit `long` formats on every `printf`-family call. |
 | `-fno-floatio`, `-fno-longio` | Force the corresponding format paths off, overriding automatic detection. |
-| `-fstack-check` | Emit a lightweight stack-overflow guard in each function prologue. |
+| `-fhexio`, `-fno-hexio` | Force hexadecimal output support on or off. |
+| `-foctio`, `-fno-octio` | Force octal output support on or off. |
+| `-g` | Emit full source-debug metadata with conservative code generation. |
+| `-gline` | Emit optimized debug metadata while retaining release code generation. |
+| `-fstack-check` | Guard function prologues and VLA allocations against stack reserve overflow. |
+| `-fno-narrow` | Disable integer-array, scalar, and loop-counter byte-narrowing optimizations. |
 | `-s bytes`, `-stack bytes`, `--stack bytes` | Reserve stack bytes; default is 512. |
 | `-s=bytes`, `-stack=bytes`, `--stack=bytes` | Equivalent attached forms for the stack size. |
 | `-I dir`, `-Idir` | Add an include search directory. |
@@ -313,6 +165,11 @@ Common options:
 | `-U name`, `-Uname` | Undefine a preprocessor macro. |
 | `-v`, `--version` | Print the compiler version and exit. |
 | `-h`, `--help` | Print compiler help and exit. |
+
+There is no `-std=c89`, `-std=c99`, or `-std=c11` mode selector: the
+[documented language subset](01-c-conformance.md) is always in effect. Unknown
+compiler options are currently ignored, so an accepted command line does not
+prove that a familiar desktop-compiler flag took effect.
 
 ## Options that affect the runtime
 
@@ -356,6 +213,7 @@ forced on and sweeps the `-stack` reserve upward until it runs without tripping
 the guard, then prints the minimum and a recommended value with headroom. Run it
 against an app/test name (and pass any program arguments after `--`):
 
+<!-- markdownlint-disable MD046 -->
 === "Windows"
 
     ```bat
@@ -405,6 +263,7 @@ against an app/test name (and pass any program arguments after `--`):
     rem app that needs a data-file argument
     scripts\stacksize.bat cobint -- e.cob
     ```
+<!-- markdownlint-enable MD046 -->
 
 Both honour the same `START` / `STEP` / `MAX` / `MODE` / `EMU` environment
 variables; see [`scripts/README.md`](https://github.com/davidly/dcc/blob/main/scripts/README.md)
@@ -420,9 +279,25 @@ Include the standard headers as usual:
 #include <string.h>
 ```
 
+DCC searches the name as given (including the working directory), then the
+including file's directory, then each `-I` directory in command-line order.
+The bundled headers live beside `DCCRTL.MAC` at the root of the source checkout.
+For an external `dccmake` project, set `dcc-include-directory=/path/to/dcc`
+and `dcc-runtime=/path/to/dcc/DCCRTL.MAC`, replacing `/path/to/dcc` with that
+checkout's path. When invoking the compiler directly, use `-I /path/to/dcc`.
+
+!!! warning "Missing system headers are silently ignored"
+    An unresolved `<header.h>` include is skipped; an unresolved
+    `"header.h"` include is an error. Successful compilation therefore does
+    not prove that a system header was found. Missing prototypes can produce
+    wrong calls, especially for pointer, `long`, or `float` results. Use DCC's
+    headers, not your host compiler's standard-library headers.
+
 ## Multi-module symbol names
 
-M80 and L80 only keep the **first 6 characters** of a public (external) symbol.
+[`m80c`](appendix/03-utilities.md#native-assembler-m80c) and
+[`l80c`](appendix/03-utilities.md#native-linker-l80c) keep only the **first 6
+characters** of a public (external) symbol.
 DCC C Compiler emits each external C identifier as `_` followed by the name, so the leading
 underscore consumes one of those six characters. The practical rule for any
 program built from more than one `.c` file is:
@@ -440,6 +315,7 @@ assembler name and the 6-character rule does not apply to it.
 
 ### How a collision shows up
 
+<!-- markdownlint-disable MD046 -->
 - **Within one file**, DCC C Compiler catches it at compile time and stops with an error
   naming both symbols, for example:
 
@@ -447,10 +323,11 @@ assembler name and the 6-character rule does not apply to it.
     global names 'i_idxins' and 'i_idxbld' are not distinguishable in M80's
     6 significant character public symbols (both become '_I_IDX'); rename one
     ```
+<!-- markdownlint-enable MD046 -->
 
-- **Across different files**, DCC C Compiler cannot see the clash. L80 may report
-  `%Mult. Def. Global`, or — worse — silently bind a call to the wrong
-  definition, so the program links but misbehaves at runtime.
+- **Across different files**, DCC C Compiler cannot see the clash.
+  [`l80c`](appendix/03-utilities.md#native-linker-l80c) reports a multiply
+  defined global rather than silently binding a call to the wrong definition.
 
 ### Fixing collisions
 
@@ -480,8 +357,10 @@ Any line printed is a pair you must rename or make `static`.
 ## Memory layout
 
 CP/M loads `.COM` files in one way. BSS begins immediately after the loaded
-image, and the loader sets `SP` to the highest free byte. The heap grows on
-demand between the end of BSS and the bottom of the stack. Because there is no
-guard between them by default, size the stack deliberately with `-stack` for
-programs with deep recursion or large frames — or build with `-fstack-check`
-(above) to turn an overflow into a clean `?stack overflow` exit.
+image. The CP/M loader itself sets `SP` to its own small CCP stack, not to the
+top of free memory; DCCRTL's startup code is what then sets `SP` to the
+highest free byte before your program runs. The heap grows on demand between
+the end of BSS and the bottom of the stack. Because there is no guard between
+them by default, size the stack deliberately with `-stack` for programs with
+deep recursion or large frames — or build with `-fstack-check` (above) to turn
+an overflow into a clean `?stack overflow` exit.

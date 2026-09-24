@@ -1,6 +1,10 @@
 /* tclit.c - block-scope compound literals. */
 #include <stdio.h>
 
+#ifndef MIR_CLOBBER_POINTER_LITERAL
+#define MIR_CLOBBER_POINTER_LITERAL 77
+#endif
+
 struct Pair {
     int a;
     int b;
@@ -27,6 +31,16 @@ static void check_int(int got, int want, const char *name)
         failures++;
     }
 }
+
+#ifdef MIR_CLOBBER_ALT_LITERAL_CHECK
+static void check_int_alt(int got, int want, const char *name)
+{
+    check_int(got, want + 1, name);
+}
+#define MIR_LITERAL_INT_CHECK check_int_alt
+#else
+#define MIR_LITERAL_INT_CHECK check_int
+#endif
 
 static void check_long(long got, long want, const char *name)
 {
@@ -121,7 +135,8 @@ static void check_value_literals(void)
     check_pair(&init, 12, 34, "struct literal initializer");
     check_pair(&assigned, 56, 78, "struct literal assignment");
     check_pair(&echoed, 90, 10, "struct literal echo");
-    check_int((struct Pair){ 22, 33 }.a, 22, "struct literal member a");
+    MIR_LITERAL_INT_CHECK(
+        (struct Pair){ 22, 33 }.a, 22, "struct literal member a");
     check_int((struct Holder){ { 1, 2 }, { 3, 4, 5 }, 0 }.pair.b,
               2, "nested literal member");
     check_int((int){ 5 } + 1, 6, "scalar int literal value");
@@ -179,9 +194,10 @@ static void check_value_literals_extra(void)
 
     /* Pointer-typed compound literal used as a value (initializer context). */
     {
-        int x = 77;
+        int x = MIR_CLOBBER_POINTER_LITERAL;
         int *xp = (int *){ &x };
-        check_int(*xp, 77, "pointer-typed literal value");
+        check_int(*xp, MIR_CLOBBER_POINTER_LITERAL,
+                  "pointer-typed literal value");
     }
 }
 

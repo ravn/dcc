@@ -1,52 +1,34 @@
-/*
- * dcc.h - foundational shared contract for the modular dcc compiler.
+/**
+ * @file dcc.h
+ * @brief Defines the shared compiler contract and CP/M/Z80 target model.
  *
- * dcc uses C89 as its base language plus selected C99/C11 features suitable
- * for CP/M/Z80, and emits Z80 assembly for the M80-compatible toolchain.
- * Function bodies lower through a typed,
- * function-local AST. This header holds broadly shared target constants, core
- * records, state declarations, and cross-module APIs; narrower contracts live
- * in dcc_ast_gen_internal.h and dcc_preproc_internal.h.
+ * @par Role
+ * Provides common system includes, translation limits, token/type/storage
+ * constants, core records, shared-state declarations, and cross-module APIs.
+ * Function declarations are grouped by their owning module; the corresponding
+ * storage definitions live in dcc_state.c.
  *
- * This foundational contract includes:
- *   1. System headers used across the compiler.
- *   2. Capacity / translation-limit macros (MAX_*).
- *   3. Type-kind, storage-class and token-kind constants.
- *   4. The core record types (Token, Sym, Def, AsmName, TypeDef, FieldDef,
- *      StructDef, ConstVal, ByteOperand).
- *   5. `extern` declarations for the shared global state (defined once in
- *      dcc_state.c).
- *   6. Broadly used cross-module functions, grouped by owning module.
+ * @par Module map
+ * - dcc.c: command-line driver, source loading, includes, and stage ordering.
+ * - dcc_preproc.c / dcc_pp_expr.c: macro-aware lexing and directive
+ *   expressions.
+ * - dcc_types.c / dcc_constexpr.c / dcc_fold.c: types and constant semantics.
+ * - dcc_symbols.c / dcc_asmname.c: symbols, scopes, linkage, and target names.
+ * - dcc_func.c / dcc_stmt.c / dcc_decl.c: declarations, body traversal, and
+ *   local initialization.
+ * - dcc_global_init.c / dcc_data.c: file-scope initializer records and data
+ *   layout.
+ * - dcc_array_narrow.c / dcc_licm.c: conservative frontend proofs and plans.
+ * - dcc_expr.c / dcc_cmp.c / dcc_ops.c / dcc_assign.c / dcc_stmt_fast.c:
+ *   shared typing and low-level target helpers.
+ * - dcc_ast*.c: function-local trees, MIR capture support, and metadata only.
+ * - dcc_mir*.c: production function capture, selection, scheduling, and
+ *   emission.
  *
- * Module .c files and their responsibilities:
- *   dcc_state.c     definitions of cross-module compiler state
- *   dcc_asmname.c   C identifier -> M80 assembler symbol mapping
- *   dcc_diag_emit.c diagnostics, allocation, emit primitives, char input
- *   dcc_preproc.c   preprocessor + macro engine + lexer (next_token)
- *   dcc_pp_expr.c   preprocessor #if/#elif expression evaluator
- *   dcc_types.c     type system, struct/union/typedef parsing
- *   dcc_constexpr.c integer constant-expression parser
- *   dcc_symbols.c   symbol tables + symbol-access codegen + EXTRN
- *   dcc_fold.c      constant folding + sizeof/offsetof
- *   dcc_expr.c      declarator parsing + low-level expression emit helpers
- *   dcc_cmp.c       comparison + conditional-branch codegen
- *   dcc_ops.c       binary-operator / arithmetic codegen
- *   dcc_assign.c    float constants + global byte-array address helper
- *   dcc_stmt_fast.c in-place increment/decrement address helper
- *   dcc_decl.c      local declaration + initializer codegen
- *   dcc_stmt.c      token-to-AST statement bridge + switch helpers
- *   dcc_func.c      functions/top-level declarations + inline-body capture
- *   dcc_global_init.c file-scope object initializer parsing (record path)
- *   dcc_global_scan.c whole-file lexical global-write/address scan
- *   dcc_array_narrow.c conservative byte-narrowing proof
- *   dcc_licm.c      loop-invariant code motion and loop-local CSE
- *   dcc_ast*.c      function-local AST storage, building, gates and emission
- *   dcc_data.c      data-section emission
- *   dcc.c           driver: file I/O, #include, CLI, and main()
- *
- * Examples of state intentionally kept private to its owner:
- *   - pp_expr_p / pp_expr_depth        (dcc_pp_expr.c: #if expression cursor)
- *   - include_dirs / num_include_dirs  (dcc.c: include search path)
+ * @par Boundary
+ * Focused AST, MIR, and preprocessor contracts live in their dedicated
+ * headers. Post-parse AST work is not a body-codegen fallback: production
+ * function bodies come only from selected MIR candidates.
  */
 #ifndef DCC_H
 #define DCC_H
@@ -93,6 +75,7 @@
 #define MAX_FORREN     128
 /* General lexical block-scope nesting depth (C block scope, beyond for-init) */
 #define MAX_SCOPE_DEPTH 64
+#define MAX_BLOCK_SCOPE_RENAMES MAX_FORREN
 #define MAX_FLOW       128
 #define MAX_SNAPSHOT   256
 #define MAX_PROTO_PARAMS 16
@@ -215,6 +198,7 @@
 #define TOK_BOOL       316
 #define TOK_STATIC_ASSERT 317
 #define TOK_NORETURN   318
+#define TOK_FASTCALL   319
 #define TOK_SWITCH     300
 #define TOK_CASE       301
 #define TOK_DEFAULT    302
@@ -293,9 +277,11 @@ typedef struct DeclState {
     int is_static;
     int is_inline;
     int is_noreturn;
+    int is_fastcall;
     int is_const;
     int is_volatile;
     int pointee_is_volatile;
+    unsigned int pointee_volatile_mask;
     int is_register;
 } DeclState;
 
@@ -352,6 +338,9 @@ struct Sym {
     int elem_size; /* stride per first-dimension element */
     int dim_count; /* C array dimensions, e.g. a[2][3] -> 2 */
     int dims[MAX_ARRAY_DIMS];   /* dims[0] may be 0 until inferred for a[][N] */
+    int pointee_dim_count; /* dimensions retained by an array element pointer */
+    int pointee_dims[MAX_ARRAY_DIMS];
+    int pointee_elem_size; /* byte stride of the pointer's first target row */
     char runtime_stride_name[64]; /* parameter name for a runtime inner VLA bound */
     int needs_extrn; /* 1 = symbol has external linkage and may need EXTRN if referenced */
     int mir_extrn_attempt_stamp; /* last mir_extrn_begin_attempt() generation
@@ -365,6 +354,7 @@ struct Sym {
     int is_volatile; /* object declared with the volatile qualifier: access-
                       * contracting fast paths must decline for it */
     int pointee_is_volatile; /* immediate pointed-to type is volatile */
+    unsigned int pointee_volatile_mask;
     int is_register; /* object declared with the register qualifier: an MIR
                       * allocation hint copied onto MirObject and consulted by
                       * mir_allocate_registers to bias profitable
@@ -376,6 +366,16 @@ struct Sym {
                       * disqualifying eligibility scan, since nothing after
                       * the call in that control-flow path is ever reached -
                       * whatever it clobbers can't matter. */
+    int is_fastcall; /* function declared with __fastcall: up to 3 eligible
+                      * (char/short/int/pointer, non-variadic) parameters are
+                      * passed directly in HL, then DE, then BC instead of on
+                      * the stack - see gen_fastcall_user_call in
+                      * dcc_ast_gen_expr.c and validate_fastcall_prototype in
+                      * dcc_func.c. Phase 1: the function must be declared
+                      * extern and defined out of line as hand-written #asm
+                      * reading its arguments directly out of those
+                      * registers - dcc does not yet generate a __fastcall-
+                      * aware prologue for a plain C function body. */
     struct AstNode *inline_return_expr; /* simple static inline body, if captured */
     struct AstNode *inline_stmt_expr;   /* simple void inline expression body */
     struct AstNode *inline_stmt_body;   /* simple void inline statement body */
@@ -406,6 +406,8 @@ struct Sym {
     int proto_variadic;
     int proto_types[MAX_PROTO_PARAMS];
     int is_funcptr;           /* object has function-pointer declarator type */
+    int funcptr_return_type;
+        struct Sym *funcptr_result_prototype;
     int is_const_value;        /* local const scalar folded as immediate */
     unsigned long const_value; /* raw integer bits or IEEE float bits */
     int has_addr_cache;    /* this local array's address is materialized once
@@ -435,18 +437,25 @@ struct TypeDef {
     int type;
     int is_volatile;
     int pointee_is_volatile;
+    unsigned int pointee_volatile_mask;
     int array_len; /* >0 when typedef is an array type, e.g. typedef int T[4] */
+    int dim_count;
+    int dims[MAX_ARRAY_DIMS];
     int is_func;   /* typedef names a function type, e.g. typedef int F(int); */
     int has_proto;
     int proto_nargs;
     int proto_variadic;
     int proto_types[MAX_PROTO_PARAMS];
+    int funcptr_return_type;
+    struct Sym *funcptr_result_prototype;
 };
 
 struct FieldDef {
     char name[64];
     int type;
+    struct Sym *funcptr_prototype;
     int is_volatile;
+    unsigned int pointee_volatile_mask;
     int offset;
     int size;
     int is_array;
@@ -520,6 +529,9 @@ extern int opt_no_narrow;   /* -fno-narrow: disable every int-array/scalar/for-c
                               * output difference from any other cause - see
                               * scripts/runall.ps1 -NarrowDiff. */
 extern int opt_debug;       /* -g: emit source-level debug annotations */
+extern int opt_debug_lines; /* -gline: optimized code with line/function annotations only */
+#define DEBUG_METADATA_ENABLED (opt_debug || opt_debug_lines)
+extern int g_main_has_args; /* final app reserves hidden argc/argv startup BSS */
 
 /* typedef table */
 extern struct TypeDef typedefs[MAX_TYPEDEFS];
@@ -677,6 +689,8 @@ int global_text_addr_taken_count(const char *name);
 int global_text_written_in_function(const char *name, const char *func);
 int global_text_field_write_count(const char *base, const char *field);
 int global_text_field_addr_taken_count(const char *base, const char *field);
+int global_text_field_all_writes_byte_constants(
+    const char *base, const char *field);
 int global_text_field_written_in_function(
     const char *base, const char *field, const char *func);
 
@@ -699,8 +713,13 @@ extern int  nenum_consts;
 
 /* communicates array length from array-typedef through parse_base_type */
 extern int g_typedef_array_len;
+extern int g_typedef_array_dim_count;
+extern int g_typedef_array_dims[MAX_ARRAY_DIMS];
+extern int g_typedef_base_type;
 extern int g_typedef_is_func;
 extern int g_typedef_has_proto;
+extern int g_typedef_funcptr_return_type;
+extern struct Sym *g_typedef_funcptr_result_prototype;
 extern int g_typedef_proto_nargs;
 extern int g_typedef_proto_variadic;
 extern int g_typedef_proto_types[MAX_PROTO_PARAMS];
@@ -716,6 +735,8 @@ extern int g_proto_types[MAX_PROTO_PARAMS];
 extern int g_funcptr_decl_array_len;
 extern int g_funcptr_is_funcret_decl;
 extern int g_funcptr_has_proto;
+extern int g_funcptr_return_type;
+extern struct Sym *g_funcptr_result_prototype;
 extern int g_funcptr_proto_nargs;
 extern int g_funcptr_proto_variadic;
 extern int g_funcptr_proto_types[MAX_PROTO_PARAMS];
@@ -868,6 +889,7 @@ void add_typedef_name(const char *name, int type, int array_len);
 int parse_base_type(void);
 int is_unsupported_target_type_name(const char *name);
 int parse_type(void);
+void advance_pointer_qualifiers(void);
 void skip_type_name_param_list(void);
 int parse_type_name_decl(int *typep, int *sizep);
 
@@ -890,6 +912,8 @@ void emit_global_char_index_addr(struct Sym *s);
 void emit_test_global_char_index_zero(struct Sym *s, int false_label);
 struct Sym *add_global(const char *name, int type, int storage);
 struct Sym *add_local_known(const char *name, int type, int storage, int offset, int bytes);
+struct Sym *add_block_extern_alias(const char *name, const char *link_name,
+                                   int type, int bytes);
 struct Sym *add_local_alloc(const char *name, int type, int bytes);
 struct Sym *add_compound_literal_local(int type);
 struct Sym *add_param_alloc(const char *name, int type);
@@ -959,9 +983,12 @@ void emit_copy_de_to_hl_bytes(int n);
 void emit_push_struct_arg_from_hl(int n);
 void emit_load_hl_from_sp_offset(int off);
 int parse_funcptr_declarator(int *ptype, char *name, int namesz);
+void parse_funcptr_prototype_suffix(void);
 int parse_abstract_funcptr_declarator(int *ptype);
 int char_array_string_initializer_size(int base_type);
 void parse_array_declarator_dims(int base_type, int *total_len, int *first_stride_bytes, int allow_empty_first);
+int parse_parenthesized_array_declarator(int base_type, char *name, int namesz,
+                                         int *total_len, int *first_stride_bytes);
 int array_dim_has_runtime_identifier(void);
 void skip_array_dim_to_close(void);
 int count_initializer_atoms_level(void);
@@ -984,7 +1011,6 @@ int expected_arg_type(struct Sym *fn, int arg_index, int *ptype);
 void emit_cleanup_stack_bytes(int bytes);
 void emit_call_hl_from_stack_offset(int off);
 void emit_extract_bitfield(void);
-void emit_store_bitfield_from_hl(void);
 void emit_store_bitfield_de_to_addr_hl(int keep_result);
 int paren_starts_cast(void);
 void emit_incdec_value_in_dehl(int type, int op);
@@ -1068,7 +1094,6 @@ unsigned int pack_struct_bitfield_unit(int sid, int i, struct FieldDef *fd,
                                        int *nunits, int cap,
                                        int *out_unit_off, int *out_k,
                                        int *out_stop);
-void emit_store_const_bitfield_unit_to_local(struct Sym *s, int off, unsigned int unit);
 void emit_init_auto_struct_type(struct Sym *s, int baseoff, int type);
 void emit_init_auto_struct_from_list(struct Sym *s);
 void emit_init_auto_struct_array_from_list(struct Sym *s);
@@ -1089,7 +1114,9 @@ void skip_prototype_array_suffixes(int *ptype);
 void skip_prototype_function_suffix(void);
 void clear_parsed_prototype(void);
 void copy_parsed_prototype_to_sym(struct Sym *s);
+void validate_fastcall_prototype(struct Sym *s);
 void copy_funcptr_prototype_to_sym(struct Sym *s, int direct_declarator);
+struct Sym *capture_funcptr_prototype(int type, int direct_declarator);
 void remember_proto_param_type(int type);
 int old_style_param_list_starts(void);
 void parse_old_style_param_id_list(void);
@@ -1098,6 +1125,7 @@ void parse_param_list(void);
 void begin_function_mir(const char *name, int local_bytes);
 void emit_debug_variable(struct Sym *s);
 void emit_debug_variable_end(struct Sym *s);
+void debug_symbol_name(const struct Sym *s, char *name, size_t name_size);
 void emit_debug_types_once(void);
 void emit_debug_global(struct Sym *s);
 void maybe_reserve_addr_cache_for_array(struct Sym *s, const char *name);

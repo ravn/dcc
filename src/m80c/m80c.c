@@ -1,36 +1,48 @@
-/* RELFIX29: emit M80 location-counter records for trailing DS/ORG gaps too. */
-/* RELFIX17: add indexed BIT/RES/SET b,(IX/IY+d); prior fixes through RELFIX16. */
-/*
-* m80clone.c - portable C89, deliberately conservative clone of Microsoft M80
-*
-* This is a clean-room implementation scaffold aimed at building large CP/M
-* Z80/8080 assembly files on modern hosts and emitting LINK-80 compatible REL.
-*
-* RELFIX5 drop 2026-06-28: fixes LD A,(addr)/LD (addr),A absolute memory forms so they are not misassembled as immediate
-* loads; also treats . as the current location counter in expressions.
-* Status in this drop:
-*   - two-pass assembler, unbounded host memory instead of CP/M 64K tables
-*   - M80-style command line: obj,prn=source /Z /I /L /R /H /O /X /M
-*   - labels, public labels via FOO::, PUBLIC/ENTRY, EXTRN/EXT, NAME/TITLE
-*   - EQU, SET, ORG, ASEG/CSEG/DSEG, DB/DEFB, DW/DEFW, DS/DEFS, END
-*   - .RADIX, IF/ELSE/ENDIF/IFE/IFNDEF/IFDEF
-*   - 8080 opcodes plus a useful Z80 core: IX/IY indexed loads, CB/ED prefix
-*     ops, JR/DJNZ, EXX, LDI/R/D, CPI/R/D, IN/OUT forms, IM, RST, relative tests
-*   - PRN listing and SYM symbol listing
-*   - REL bitstream writer with module name, public definitions, program size,
-*     data bytes, program/data relative words, end-module and end-file items
-*
-* Not yet complete M80: macro bodies (MACRO/REPT/IRP/IRPC/LOCAL/EXITM), .COMMENT,
-* cross-reference .CRF, all listing controls, and some obscure expression forms.
-* The structure is intentionally table-free and easy to extend.
-*
-* Build:
-*   cc -std=c89 -Wall -Wextra -O2 -o m80clone m80clone.c
-*/
+/**
+ * @file m80c.c
+ * @brief Implements dcc's host-native, LINK-80-compatible M80 assembler.
+ *
+ * @par Role
+ * Two-pass assembles M80-style .MAC source with the 8080/Z80 instructions,
+ * directives, conditionals, relocations, and debug markers used by dcc. It
+ * emits LINK-80 .REL plus requested .PRN and .SYM files, source .DBG data, and
+ * per-module .LNK size metadata.
+ *
+ * @par Key entry points
+ * main(), parse_cmd(), assemble_pass(), write_rel(), write_sym(), and
+ * write_debug().
+ *
+ * @par Boundary
+ * Consumes assembly from dcc/dccpeep or dccrtlstrip; l80c or L80 owns final
+ * layout and linking. This clean-room implementation deliberately covers the
+ * M80 surface used by the dcc toolchain rather than every historical feature.
+ */
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+/* Each source is read twice and the FILE is private to this process. Avoid
+ * stdio's per-line stream lock on POSIX hosts; MSVC has no fgets_unlocked. */
+#ifdef _WIN32
+#define host_fgets(buf, size, stream) fgets((buf), (size), (stream))
+#else
+static char *host_fgets(char *buf, int size, FILE *stream) {
+    int c, n = 0;
+    if (size <= 0) return NULL;
+    while (n < size - 1 && (c = getc_unlocked(stream)) != EOF) {
+        buf[n++] = (char)c;
+        if (c == '\n') break;
+    }
+    if (n == 0) return NULL;
+    buf[n] = 0;
+    return buf;
+}
+#endif
 #define MAXLINE 2048
 #define MAXNAME 128
 #define MAXARGS 512 /* RELFIX19: long DB/DW argument lists from compiler output */
@@ -65,6 +77,7 @@ struct Sym {
     int is_public;
     int is_extern;
     int is_set;
+    int label_defs;
     int refs;
     int chain_valid;
     int chain_type;
@@ -396,7 +409,10 @@ static int parse_primary(Asm *a, Expr *e) {
         } else {
             e->v=0;
             e->type=T_ABS;
-            if(a->pass==2) e->undef=1;
+            if(a->pass==2) {
+                e->undef=1;
+                seterr(a,"undefined symbol");
+            }
         }
         return 1;
     }
@@ -562,6 +578,19 @@ static void emitw(Asm *a,Expr e) {
     emitb(a,(int)(e.v&255));
     emitb(a,(int)((e.v>>8)&255));
     if(a->pass==2 && (type==T_CODE || type==T_DATA || type==T_COMM)) add_fixup(a,seg,off,type,e.v);
+}
+static int relative_disp(Asm *a,Expr e,long here) {
+    long disp=e.v-(here+2);
+    if(a->pass==2) {
+        if(e.undef) {
+            if(e.ext[0]) seterr(a,"external relative target");
+        } else if(e.type!=T_ABS && e.type!=cur_type(a)) {
+            seterr(a,"relative target in different segment");
+        } else if(disp < -128 || disp > 127) {
+            seterr(a,"relative branch out of range");
+        }
+    }
+    return (int)disp;
 }
 static int reg8(const char *s) {
     static const char *r[] = {
@@ -856,8 +885,8 @@ static int assemble_op(Asm *a,char *op,char *args) {
     if(streqi(op,"STC")||streqi(op,"SCF")) O1(0x37);
     if(streqi(op,"CMC")||streqi(op,"CCF")) O1(0x3f);
     if(streqi(op,"DAA")) O1(0x27);
-    if(streqi(op,"RLC")||streqi(op,"RLCA")) O1(0x07);
-    if(streqi(op,"RRC")||streqi(op,"RRCA")) O1(0x0f);
+    if(streqi(op,"RLCA")||(streqi(op,"RLC")&&n==0)) O1(0x07);
+    if(streqi(op,"RRCA")||(streqi(op,"RRC")&&n==0)) O1(0x0f);
     if(streqi(op,"RAL")||streqi(op,"RLA")) O1(0x17);
     if(streqi(op,"RAR")||streqi(op,"RRA")) O1(0x1f);
     if(streqi(op,"XCHG")||streqi(op,"EXDEHL")) O1(0xeb);
@@ -885,7 +914,7 @@ static int assemble_op(Asm *a,char *op,char *args) {
     if(streqi(op,"LDIR")) O2(0xed,0xb0);
     if(streqi(op,"LDD")) O2(0xed,0xa8);
     if(streqi(op,"LDDR")) O2(0xed,0xb8);
-    if(streqi(op,"CPI")) O2(0xed,0xa1);
+    if(a->z80 && streqi(op,"CPI") && n==0) O2(0xed,0xa1);
     if(streqi(op,"CPIR")) O2(0xed,0xb1);
     if(streqi(op,"CPD")) O2(0xed,0xa9);
     if(streqi(op,"CPDR")) O2(0xed,0xb9);
@@ -1062,7 +1091,7 @@ static int assemble_op(Asm *a,char *op,char *args) {
         e=eval(a,s);
         O2(0xf6,(int)e.v);
     }
-    if(streqi(op,"CMP")||streqi(op,"CP")||streqi(op,"CPI")) {
+    if(streqi(op,"CMP")||streqi(op,"CP")||(!a->z80&&streqi(op,"CPI"))) {
         const char *s=(n==2&&streqi(av[0],"A"))?av[1]:(n?av[0]:args);
         if(emit_indexed_alu(a,"CP",s)) return 1;
         r=reg8(s);
@@ -1136,16 +1165,16 @@ static int assemble_op(Asm *a,char *op,char *args) {
     }
     if(streqi(op,"JR")||streqi(op,"DJNZ")) {
         long here=*cur_lc_ptr(a);
-        if(streqi(op,"DJNZ")) {
+        if(streqi(op,"DJNZ") && n==1) {
             e=eval(a,av[0]);
             emitb(a,0x10);
-            emitb(a,(int)(e.v-(here+2)));
+            emitb(a,relative_disp(a,e,here));
             return 1;
         }
         if(n==1) {
             e=eval(a,av[0]);
             emitb(a,0x18);
-            emitb(a,(int)(e.v-(here+2)));
+            emitb(a,relative_disp(a,e,here));
             return 1;
         }
         if(n==2) {
@@ -1157,7 +1186,7 @@ static int assemble_op(Asm *a,char *op,char *args) {
             if(opc>=0) {
                 e=eval(a,av[1]);
                 emitb(a,opc);
-                emitb(a,(int)(e.v-(here+2)));
+                emitb(a,relative_disp(a,e,here));
                 return 1;
             }
         }
@@ -1300,11 +1329,19 @@ static void record_static_name(Asm *a,const char *orig) {
 }
 static void define_label(Asm *a,const char *name,int pub) {
     Sym *s=sym_find(a,name,1);
-    if(a->pass==1 || s->is_set) {
+    if(a->pass==1) {
+        if(s->label_defs==0) {
+            s->value=*cur_lc_ptr(a);
+            s->type=cur_type(a);
+            s->defined=1;
+        }
+        s->label_defs++;
+    } else if(s->is_set) {
         s->value=*cur_lc_ptr(a);
         s->type=cur_type(a);
         s->defined=1;
     }
+    if(a->pass==2 && s->label_defs>1) seterr(a,"multiply defined symbol");
     if(pub) s->is_public=1;
     if(a->pending_static_name[0]) {
         free(s->orig_name);
@@ -1368,6 +1405,9 @@ static void record_debug_info(Asm *a,const char *orig) {
     } else if(strncmp(p,";@dcc-var-end",13)==0 && isspace((unsigned char)p[13])) {
         kind=7;
         args=p+13;
+    } else if(strncmp(p,";@dcc-loc",9)==0 && isspace((unsigned char)p[9])) {
+        kind=8;
+        args=p+9;
     } else return;
     while(*args && isspace((unsigned char)*args)) args++;
     d=(DebugInfo*)calloc(1,sizeof(DebugInfo));
@@ -1427,6 +1467,10 @@ static void do_ds(Asm *a,char *args) {
     Expr e=eval(a,args);
     long i,oldlc;
     oldlc=*cur_lc_ptr(a);
+    if(e.v<0) {
+        seterr(a,"negative storage size");
+        return;
+    }
     if(a->init_ds) for(i=0;i<e.v;i++) emitb(a,0);
     else {
         reserve_gap(a,oldlc,e.v);
@@ -1453,6 +1497,10 @@ static void pseudo(Asm *a,char *label,char *op,char *args) {
     if(streqi(op,"ORG")) {
         long oldlc=*cur_lc_ptr(a);
         e=eval(a,args);
+        if(e.v<0) {
+            seterr(a,"negative origin");
+            return;
+        }
         if(e.v>oldlc) reserve_gap(a,oldlc,e.v-oldlc);
         *cur_lc_ptr(a)=e.v;
         return;
@@ -1552,32 +1600,19 @@ static void conditional(Asm *a,char *op,char *args) {
     for(take=0;take<a->cond_sp;take++) if(!a->cond_stack[take]) a->skipping=1;
 }
 static int is_cond(const char *op) {
-    return streqi(op,"IF") || streqi(op,"IFE") || streqi(op,"IFDEF") ||
-        streqi(op,"IFNDEF") || streqi(op,"ELSE") || streqi(op,"ENDIF");
+    return !strcmp(op,"IF") || !strcmp(op,"IFE") || !strcmp(op,"IFDEF") ||
+        !strcmp(op,"IFNDEF") || !strcmp(op,"ELSE") || !strcmp(op,"ENDIF");
 }
-/* Case-insensitive ordering compare (streqi above only answers equal/not
- * equal, which bsearch needs an ordering from) - written by hand rather than
- * POSIX strcasecmp/MSVC _stricmp so it's portable across the three build
- * toolchains this project targets (MSVC/gcc/clang). */
-static int strcmp_order_ci(const char *a, const char *b) {
-    int ca, cb;
-    for (;;) {
-        ca = toupper((unsigned char)*a);
-        cb = toupper((unsigned char)*b);
-        if (ca != cb) return ca - cb;
-        if (ca == 0) return 0;
-        a++;
-        b++;
-    }
-}
+/* The full source line is already uppercase, so bytewise ordering is enough
+ * for the pseudo-op table lookup. */
 static int pseudo_name_cmp(const void *pa, const void *pb) {
     const char *a = *(const char * const *)pa;
     const char *b = *(const char * const *)pb;
-    return strcmp_order_ci(a, b);
+    return strcmp(a, b);
 }
 static int is_pseudo(const char *op) {
-    /* Sorted case-insensitively (verified by construction, matching
-     * strcmp_order_ci's ordering) so bsearch can find a match in ~5
+    /* Source lines are normalized to uppercase once in assemble_pass. The
+     * table is sorted in that same bytewise order, so bsearch finds a match in ~5
      * comparisons instead of the up to 25 streqi calls the previous
      * linear scan needed - is_pseudo alone was called ~39K times per
      * m80c invocation on a large app, profiled as a meaningful share of
@@ -1665,7 +1700,7 @@ static void parse_line(Asm *a,char *line,char *orig) {
     /* "SET" is ambiguous: label-less "SET b,r" is the Z80 bit-set opcode,
      * while "LABEL SET expr" is the redefinable-symbol pseudo-op. Only the
      * latter has a label by this point, so without one prefer the opcode. */
-    if(is_pseudo(op) && !(streqi(op,"SET") && !*label)) pseudo(a,(char*)label,op,args);
+    if(is_pseudo(op) && !(strcmp(op,"SET")==0 && !*label)) pseudo(a,(char*)label,op,args);
     else if(!assemble_op(a,op,args)) {
         if(!*label && (isdigit((unsigned char)op[0]) || op[0]=='$' || op[0]=='\'' || op[0]=='"')) {
             Expr ex=eval(a,op);
@@ -1698,7 +1733,7 @@ static int assemble_pass(Asm *a,int pass) {
             fclose(a->fp);
             return 0;
         }
-    } while(fgets(line,sizeof(line),a->fp)) {
+    } while(host_fgets(line,sizeof(line),a->fp)) {
         size_t len;
         a->lineno++;
         strcpy(orig,line);
@@ -2032,6 +2067,8 @@ static void write_debug(Asm *a) {
             fprintf(f,"global %s %04lX %s",debug_segment_name(gs->type),gs->value&0xffff,di->args);
         } else if(di->kind==5 || di->kind==6) {
             fprintf(f,"%s %s",di->kind==5?"struct":"field",di->args);
+        } else if(di->kind==8) {
+            fprintf(f,"location %s %04lX %s",debug_segment_name(di->seg),di->off&0xffff,di->args);
         } else {
             kind=di->kind==1?"function-begin":(di->kind==2?"function-end":
                  (di->kind==7?"variable-end":"variable"));

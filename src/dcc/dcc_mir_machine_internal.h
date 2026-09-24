@@ -1,10 +1,36 @@
+/**
+ * @file dcc_mir_machine_internal.h
+ * @brief Declares the private interface shared by exact-schedule modules.
+ *
+ * @par Role
+ * Exposes semantic proof helpers, common Z80 emission helpers, exact-family
+ * dispatchers, and phase/profile contracts used by dcc_mir_machine_emit.c and
+ * the dcc_mir_machine_*.c family modules. It is not a frontend or general MIR
+ * API.
+ */
 #ifndef DCC_MIR_MACHINE_INTERNAL_H
 #define DCC_MIR_MACHINE_INTERNAL_H
 
 #include "dcc_mir_internal.h"
 
+/* Forward declarations only: each is fully (and identically) defined in
+ * every dcc_mir_machine_*.c/dcc_mir_emit_common.c file that needs it, as a
+ * small duplicated plan-descriptor type rather than one shared definition.
+ * Declaring the tags here first ensures every translation unit that
+ * includes this header resolves them to the same file-scope tag, instead
+ * of each function declaration below implicitly creating its own
+ * prototype-scope (and therefore conflicting) incomplete type. */
+struct MirMachineForm;
+struct MirStateMember;
+
 int mir_machine_reject(const char *template_name, const char *reason);
+void mir_machine_accept(const char *template_name);
 int mir_machine_named_nonvolatile(const struct MirInsn *insn);
+/* Resolve a direct global/extern array and prove its element width, extent,
+ * and nonvolatile access contract. */
+int mir_machine_match_nonvolatile_array(
+    const struct MirInsn *insn, int element_size, int minimum_elements,
+    struct Sym **result);
 int mir_machine_constant_equals(int value, long expected);
 int mir_machine_evaluate_constant(int value, long *result, int depth);
 int mir_machine_same_location(const struct MirInsn *left,
@@ -23,6 +49,10 @@ int mir_match_buffered_declaration_buffer(
     int instruction, const struct MirInsn *first, int *offset_out);
 void mir_machine_emit_global_address_de(MirStream *out, struct Sym *symbol,
                                         int offset);
+/* Copy a fixed byte range between pointers held in IX-relative frame slots. */
+void mir_machine_emit_frame_block_copy(
+    MirStream *out, int destination_offset, int destination_adjust,
+    int source_offset, int source_adjust, int byte_count);
 void mir_machine_emit_hl_offset(MirStream *out, int offset, int preserve_bc);
 void mir_machine_emit_global_word(MirStream *out, struct Sym *symbol, int offset);
 void mir_machine_emit_global_word_store(
@@ -31,10 +61,48 @@ void mir_machine_emit_vla_allocate_rows(
     MirStream *out, unsigned long row_bytes);
 void mir_machine_emit_float_bits(MirStream *out, unsigned long bits);
 void mir_machine_emit_symbol_call(MirStream *out, struct Sym *symbol);
+/* Emit one scalar argument already in HL using the callee's declared ABI. */
+void mir_machine_emit_hl_scalar_call(MirStream *out, struct Sym *symbol);
 void mir_machine_emit_ix_wide_load(MirStream *out, int offset);
 void mir_machine_emit_ix_wide_store(MirStream *out, int offset);
 void mir_emit_final_call_constant(MirStream *out, unsigned long value, int width);
 void mir_emit_final_call_cleanup(MirStream *out, int words);
+
+/* Promoted from dcc_mir_machine_emit.c during the family split below:
+ * used by more than one dcc_mir_machine_*.c family, so they moved from
+ * static file-local helpers to shared definitions in dcc_mir_emit_common.c. */
+void mir_emit_byte_parameter_word(MirStream *out, int stack_offset,
+                                  int is_unsigned);
+void mir_emit_fixed_point_constant(MirStream *out, unsigned long value);
+void mir_emit_local_address(MirStream *out, int offset);
+void mir_emit_local_wide_argument(MirStream *out, int offset);
+void mir_emit_wide_parameter(MirStream *out, int stack_offset);
+int mir_machine_boolean_merge(int phi_index, int true_value_index,
+                              int false_value_index, int true_label_index,
+                              int false_label_index);
+int mir_machine_convert_integer(long value, int type, long *result);
+void mir_machine_emit_global_byte_a(MirStream *out, struct Sym *symbol,
+                                    int offset, int is_store);
+int mir_machine_five_call_arguments(const struct MirInsn *call,
+                                    int arguments[5]);
+int mir_machine_four_call_arguments(const struct MirInsn *call,
+                                    int arguments[4]);
+int mir_machine_name_nonvolatile(const char *name);
+int mir_machine_parameter_address(int value, int *stack_offset,
+                                  long *offset, int depth);
+int mir_machine_parameter_offset(int value, int *stack_offset);
+int mir_machine_phi_merge(int phi_index, int true_value_index,
+                          int false_value_index, int true_label_index,
+                          int false_label_index);
+int mir_machine_pointer_form(int value, int before,
+                             struct MirMachineForm *form, int depth);
+const struct MirInsn *mir_machine_resolve_local_alias(int value);
+int mir_machine_six_call_arguments(const struct MirInsn *call,
+                                   int arguments[6]);
+int mir_machine_ten_call_arguments(const struct MirInsn *call,
+                                   int arguments[10]);
+int mir_machine_transparent_pointer_unary(const struct MirInsn *unary);
+int mir_machine_wide_parameter_offset(int value, int *stack_offset);
 
 /* Returns -1 when neither family matches, otherwise the selector result. */
 int mir_try_emit_float_reports(MirStream *out);
@@ -47,6 +115,9 @@ int mir_try_emit_scanner_kernels(MirStream *out, int late);
 
 /* Returns -1 when no aggregate check schedule matches. */
 int mir_try_emit_aggregate_checks(MirStream *out);
+#ifdef DCC_MIR_VLA_SMOOTH_ISOLATION_TEST
+int mir_try_emit_vla_smooth_isolation(MirStream *out);
+#endif
 
 enum MirStrictSpilledProfile {
     MIR_STRICT_SPILLED_ADDRESS_REMAT = 1,
@@ -71,5 +142,32 @@ int mir_try_emit_endgame_runners(MirStream *out, int phase);
 
 /* The phase preserves each numeric schedule's existing selector position. */
 int mir_try_emit_numeric_kernels(MirStream *out, int phase);
+
+/* Returns -1 when no container kernel matches, otherwise the selector
+ * result. Array/stack/append/row-store plan kernels plus early float and
+ * constant comparison checks. */
+int mir_try_emit_container_kernels(MirStream *out);
+
+/* Returns -1 when no wide/record kernel matches. Wide-value and
+ * aggregate-member arithmetic, record append, and byte mismatch/arithmetic
+ * report kernels. */
+int mir_try_emit_wide_record_kernels(MirStream *out);
+
+/* Returns -1 when no structural check matches. Bitset/sieve/wrapper init,
+ * task array and literal/compound check runners, sort/crc/string mismatch
+ * reports, and float/struct/bitfield field checks. */
+int mir_try_emit_structural_checks(MirStream *out);
+
+/* Returns -1 when no float/recursion kernel matches. Float polynomial
+ * kernels and recursive frame/wide-product/tree-sum kernels. */
+int mir_try_emit_float_recursion_kernels(MirStream *out);
+
+/* Returns -1 when no byte-scan kernel matches. Byte/row scanning and fill
+ * kernels, prediction-count call kernels, hash and file-line loops. */
+int mir_try_emit_byte_scan_kernels(MirStream *out);
+
+/* Never returns -1 (its final kernel is the original dispatcher's absolute
+ * fallback). Constant-folding and result-switch kernels. */
+int mir_try_emit_constant_folding_kernels(MirStream *out);
 
 #endif

@@ -1,16 +1,21 @@
-/*
- * dcc_ast_build.c - function-local AST builder.
+/**
+ * @file dcc_ast_build.c
+ * @brief Parses function tokens into expression and statement ASTs.
  *
- * dcc lowers function bodies through a function-local AST (see dcc_ast.h).
+ * @par Role
+ * Implements recursive-descent expression parsing, statement/block parsing,
+ * declaration-span capture/replay, sizeof and callable-result typing, arena initialization, and
+ * diagnostic AST dumps. Building may reserve compiler-generated locals, so
+ * speculative callers must restore lexer and frame state when discarding a
+ * tree.
  *
- * ast_build_expr() is a recursive-descent expression parser that mirrors the
- * source grammar (including dcc's C99 conveniences -
- * it operates purely on the token stream, so for-init/mid-block expressions
- * and // comments are handled transparently by the shared lexer).  It builds
- * an AstNode tree from the current lexer position and emits no assembly.
- * Compound-literal and optimization shapes may reserve compiler-generated
- * locals while building, so speculative callers must restore lexer/frame state
- * when discarding a tree. MIR and the metadata walkers consume the result.
+ * @par Key entry points
+ * ast_build_expr(), ast_build_assign_expr(), ast_build_stmt(),
+ * ast_replay_decl_span(), ast_scan_decl_span(), ast_call_result_type(), and ast_build_init().
+ *
+ * @par Boundary
+ * This module emits no target code. MIR capture, metadata replay, and retained
+ * semantic classifiers consume its trees.
  */
 #include "dcc.h"
 #include "dcc_ast.h"
@@ -110,6 +115,19 @@ static int ast_index_root_and_count(const struct AstNode *n,
                                     const struct AstNode **root);
 static int ast_expr_is_array_row(const struct AstNode *n);
 
+int ast_call_result_type(const struct AstNode *n)
+{
+    const struct Sym *prototype = ast_indirect_call_proto_sym(n);
+    if (prototype != NULL) {
+        if (prototype->storage == SC_FUNC)
+            return prototype->type;
+        if (prototype->funcptr_return_type != 0)
+            return prototype->funcptr_return_type;
+        return type_decay_ptr(prototype->type);
+    }
+    return n != NULL && n->type != 0 ? n->type : TYPE_INT;
+}
+
 int ast_expr_type_for_sizeof(const struct AstNode *n)
 {
     struct Sym *s;
@@ -129,7 +147,14 @@ int ast_expr_type_for_sizeof(const struct AstNode *n)
     case AST_STR_LIT:
         return TYPE_CHAR | TYPE_PTR;
     case AST_IDENT:
-        s = find_sym(n->sval);
+        /* Prefer the symbol resolved at parse time (n->sym, set in p_primary)
+         * over a fresh name lookup: this function also runs during MIR
+         * lowering's AST-walk fallback, which happens after the whole
+         * function has been parsed - by then a nested block's locals are
+         * already out of scope (find_local truncates on block exit), so a
+         * name-based find_sym here would wrongly report "not found" for a
+         * still-live nested-block local and silently fall back to TYPE_INT. */
+        s = n->sym != NULL ? n->sym : find_sym(n->sval);
         if (s == NULL)
             return TYPE_INT;
         return s->type;
@@ -244,12 +269,7 @@ int ast_expr_type_for_sizeof(const struct AstNode *n)
     case AST_COMMA:
         return ast_expr_type_for_sizeof(n->b);
     case AST_CALL:
-        if (n->a != NULL && n->a->kind == AST_IDENT) {
-            s = find_sym(n->a->sval);
-            if (s != NULL)
-                return s->type;
-        }
-        return TYPE_INT;
+        return ast_call_result_type(n);
     case AST_SIZEOF_EXPR:
     case AST_SIZEOF_TYPE:
         return TYPE_INT;
@@ -310,6 +330,10 @@ static int ast_expr_base_ident_unresolved(const struct AstNode *n)
         switch (n->kind) {
         case AST_INDEX:
         case AST_MEMBER:
+        case AST_ASSIGN:
+            /* A chained assignment `a = y->b2` yields a's value/type (see
+             * ast_value_is_plain_int's AST_ASSIGN case), so its base
+             * identifier is the assignment's own lhs. */
             n = n->a;
             break;
         case AST_UNARY:
@@ -353,6 +377,16 @@ static int ast_expr_is_pointer_assignment_rhs(const struct AstNode *n)
      * assignment; a genuinely undeclared identifier is diagnosed later.
      */
     if (ast_expr_base_ident_unresolved(n))
+        return 1;
+    /* AST validation runs before nested-block declarations have entered the
+     * active symbol table.  Preserve that uncertainty through pointer
+     * arithmetic as well: `p[i] = local_ptr + 1` is otherwise inferred as
+     * integer arithmetic solely because local_ptr temporarily defaults to
+     * int here.  The later scoped build still diagnoses a genuinely
+     * undeclared identifier. */
+    if (n->kind == AST_BINARY && (n->op == '+' || n->op == '-') &&
+        (ast_expr_base_ident_unresolved(n->a) ||
+         (n->op == '+' && ast_expr_base_ident_unresolved(n->b))))
         return 1;
     if (type_ptr_depth(ast_expr_type_for_sizeof(n)) > 0)
         return 1;
@@ -573,12 +607,32 @@ static struct AstNode *p_primary(struct AstArena *ar)
             long v = parse_offsetof_value();
             return ast_int_lit(ar, v, TYPE_INT);
         }
+        /* C99's predefined __func__ identifier (and GCC's older, widely used
+         * __FUNCTION__ spelling) behaves as though each
+         * function body began with a static character array initialized to
+         * that function's source name.  Dcc already interns string literals
+         * for the duration of the translation unit, so represent its value
+         * with the same AST node.  g_current_compiling_func is set before all
+         * scan and emission passes over the body and contains the source name
+         * (assembly-name truncation is applied separately). */
+        if ((!strcmp(g_lex.tok.text, "__func__") ||
+             !strcmp(g_lex.tok.text, "__FUNCTION__")) &&
+            g_current_compiling_func[0] != 0) {
+            int len = (int)strlen(g_current_compiling_func);
+
+            n = ast_new(ar, AST_STR_LIT);
+            n->sval = ast_arena_memdup(ar, g_current_compiling_func, len);
+            n->ival = 0;
+            n->uval = (unsigned long)len;
+            n->type = TYPE_CHAR | TYPE_PTR;
+            next_token();
+            return n;
+        }
         n = ast_new(ar, AST_IDENT);
         n->sval = cur_text(ar);
-        /* read-only resolution; both lookups only scan existing tables */
-        n->sym = find_local_decl(g_lex.tok.text);
-        if (n->sym == NULL)
-            n->sym = find_global(g_lex.tok.text);
+        /* Freeze the declaration selected while its lexical rename is still
+         * active. */
+        n->sym = find_sym(g_lex.tok.text);
         next_token();
         return n;
     case '(':
@@ -598,6 +652,24 @@ static struct AstNode *p_postfix_tail(struct AstArena *ar, struct AstNode *n)
         if (g_lex.tok.kind == '[') {
             struct AstNode *m = ast_new(ar, AST_INDEX);
             int base_type = ast_expr_type_for_sizeof(n);
+            /* `(*p)[i]` is exactly `p[0][i]` when p points to an array.
+             * Preserve that equivalence in the AST so every later lowering
+             * uses the established pointer-to-N-dimensional-array indexing
+             * path (and its row strides), rather than treating `*p` as a
+             * scalar pointer load. */
+            if (n != NULL && n->kind == AST_UNARY && n->op == '*' &&
+                n->a != NULL && n->a->kind == AST_IDENT) {
+                struct Sym *pointer_sym = find_sym(n->a->sval);
+                if (pointer_sym != NULL && !pointer_sym->is_array &&
+                    type_ptr_depth(pointer_sym->type) > 0 &&
+                    pointer_sym->dim_count > 0) {
+                    struct AstNode *zero_index = ast_new(ar, AST_INDEX);
+                    zero_index->a = n->a;
+                    zero_index->b = ast_int_lit(ar, 0, TYPE_INT);
+                    n = zero_index;
+                    base_type = ast_expr_type_for_sizeof(n);
+                }
+            }
             if (n != NULL && n->kind == AST_IDENT) {
                 struct Sym *base_sym = find_sym(n->sval);
                 if (base_sym != NULL && !base_sym->is_array && type_ptr_depth(base_type) == 0)
@@ -715,13 +787,22 @@ static struct AstNode *p_unary(struct AstArena *ar)
         struct AstNode *operand;
         int cty;
         int csz;
+        unsigned int volatile_mask;
+        struct AstNode *cast;
+        struct Sym *prototype = NULL;
         next_token();                    /* consume '(' */
         parse_type_name_decl(&cty, &csz); /* parse ( type-name */
+        volatile_mask = g_decl.pointee_volatile_mask |
+            (unsigned int)(g_decl.pointee_is_volatile != 0);
+        prototype = capture_funcptr_prototype(cty, g_funcptr_return_type != 0);
         expect(')');
         if (g_lex.tok.kind == '{')
             return p_postfix_tail(ar, ast_build_compound_literal(ar, cty));
         operand = p_unary(ar);
-        return ast_cast(ar, cty, operand);
+        cast = ast_cast(ar, cty, operand);
+        cast->pointee_volatile_mask = volatile_mask;
+        cast->sym = prototype;
+        return cast;
     }
 
     return p_postfix(ar);
@@ -744,6 +825,33 @@ static int binop_level(int k)
     case TOK_OROR:                      return 1;
     default:                            return 0;
     }
+}
+
+static int ast_promoted_binary_operand_type(const struct AstNode *n)
+{
+    int type = n != NULL && n->type != 0
+        ? n->type : ast_expr_type_for_sizeof(n);
+
+    if (n != NULL && n->kind == AST_MEMBER) {
+        struct FieldDef *field = ast_member_field_for_sizeof(n);
+        /* A signed bit-field, and an unsigned bit-field whose complete range
+         * fits in the target's 16-bit signed int, promotes to int.  An
+         * explicit cast is an AST_CAST and deliberately bypasses this rule. */
+        if (field != NULL && field->bit_width > 0 &&
+            (!(field->type & TYPE_UNSIGNED) || field->bit_width <= 15))
+            return TYPE_INT;
+    }
+    return promote_int_type(type);
+}
+
+static int ast_binary_operand_is_bitfield(const struct AstNode *n)
+{
+    struct FieldDef *field;
+
+    if (n == NULL || n->kind != AST_MEMBER)
+        return 0;
+    field = ast_member_field_for_sizeof(n);
+    return field != NULL && field->bit_width > 0;
 }
 
 static struct AstNode *p_binary(struct AstArena *ar, int min_level)
@@ -775,16 +883,22 @@ static struct AstNode *p_binary(struct AstArena *ar, int min_level)
         else if (k == TOK_OROR)
             lhs = ast_binary(ar, AST_LOGOR, k, lhs, rhs, 0);
         else {
+            int left_type;
+            int right_type;
             lhs = ast_binary(ar, AST_BINARY, k, lhs, rhs, 0);
             lhs->peek_type = peek;
             lhs->type = ast_expr_type_for_sizeof(lhs);
+            left_type = ast_promoted_binary_operand_type(lhs->a);
+            right_type = ast_promoted_binary_operand_type(lhs->b);
             if (k == TOK_SHL || k == TOK_SHR)
-                lhs->operand_type = promote_int_type(
-                    ast_expr_type_for_sizeof(lhs->a));
+                lhs->operand_type = left_type;
             else
-                lhs->operand_type = common_arith_type(
-                    ast_expr_type_for_sizeof(lhs->a),
-                    ast_expr_type_for_sizeof(lhs->b));
+                lhs->operand_type = common_arith_type(left_type, right_type);
+            if (k != '<' && k != '>' && k != TOK_LE && k != TOK_GE &&
+                k != TOK_EQ && k != TOK_NE &&
+                (ast_binary_operand_is_bitfield(lhs->a) ||
+                 ast_binary_operand_is_bitfield(lhs->b)))
+                lhs->type = lhs->operand_type;
         }
     }
     return lhs;

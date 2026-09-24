@@ -1,18 +1,49 @@
-/*
- * dccrtlstrip.c - conservative pre-link reducer for dccrtl.mac
+/**
+ * @file dccrtlstrip.c
+ * @brief Strips unreachable app blocks and selects a minimal DCCRTL.MAC.
  *
- * Usage:
- *   dccrtlstrip [-k symbol ...] -r dccrtl.mac -o rtlmin.mac app.mac [app2.mac ...]
+ * @par Role
+ * In app mode, delegates structural whole-program function/object stripping
+ * to dcc_app_strip.c. In runtime mode, reads DCCRTL.MAC plus application
+ * references, groups runtime text around PUBLIC entry points, follows
+ * references to a fixed point, and writes RTLMIN.MAC.
  *
- * This version treats PUBLIC directives as runtime block boundaries, not
- * arbitrary labels.  That is important for routines like _printf whose body
- * contains private labels/data such as __pf_run, pf_sink, etc.  Splitting on
- * every label can keep only the entry stub and strip the real body.
+ * @par Key entry points
+ * main(), build_blocks(), scan_app(), mark_reachable(), and write_output().
+ *
+ * @par Boundary
+ * Runs after dcc/dccpeep emit application assembly and before m80c assembles
+ * either the application or selected runtime. It performs conservative
+ * textual reachability analysis, not assembly or linking.
  */
+#ifndef _WIN32
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "dcc_app_strip.h"
+
+/* Runtime and app streams are never shared between threads. On POSIX hosts,
+ * skip the otherwise repeated stdio lock/unlock around every source line. */
+#ifdef _WIN32
+#define host_fgets(buf, size, stream) fgets((buf), (size), (stream))
+#else
+static char *host_fgets(char *buf, int size, FILE *stream) {
+    int c, n = 0;
+    if (size <= 0) return NULL;
+    while (n < size - 1 && (c = getc_unlocked(stream)) != EOF) {
+        buf[n++] = (char)c;
+        if (c == '\n') break;
+    }
+    if (n == 0) return NULL;
+    buf[n] = 0;
+    return buf;
+}
+#endif
 
 #define MAX_LINES   60000
 #define MAX_BLOCKS   4096
@@ -470,7 +501,7 @@ static void read_runtime(const char *fn)
         exit(1);
     }
 
-    while (fgets(buf, sizeof(buf), f)) {
+    while (host_fgets(buf, sizeof(buf), f)) {
         if (nlines >= MAX_LINES) {
             fprintf(stderr, "too many runtime lines\n");
             exit(1);
@@ -812,6 +843,36 @@ static void add_refs_from_line(const char *line)
         return;
     }
 
+    if (!strcmp(op, "equ")) {
+        p = skipws(p);
+        if (parse_ident_token(&p, sym))
+            add_root(sym);
+        return;
+    }
+
+    /*
+     * M80 also accepts the traditional no-colon form "label EQU symbol".
+     * EQU emits no bytes, so runtime blocks use it to express a zero-cost
+     * dependency when execution deliberately falls through a PUBLIC boundary.
+     */
+    {
+        const char *q;
+        char directive[64];
+        int j;
+
+        q = p;
+        if (parse_ident_token(&q, directive)) {
+            for (j = 0; directive[j]; ++j)
+                directive[j] = (char)tolower((unsigned char)directive[j]);
+            if (!strcmp(directive, "equ")) {
+                q = skipws(q);
+                if (parse_ident_token(&q, sym))
+                    add_root(sym);
+                return;
+            }
+        }
+    }
+
     if (!strcmp(op, "call") || !strcmp(op, "jp") || !strcmp(op, "jr")) {
         /* jp z,label has condition first. */
         p = skipws(p);
@@ -871,32 +932,12 @@ static void add_refs_from_line(const char *line)
 }
 
 
-static int symbol_mentioned_in_clean_line(const char *clean, const char *sym)
-{
-    const char *p;
-    int n;
-
-    n = (int)strlen(sym);
-    if (n <= 0)
-        return 0;
-
-    p = clean;
-    while ((p = strstr(p, sym)) != NULL) {
-        int before_ok;
-        int after_ok;
-        before_ok = (p == clean) || !is_ident_char2((unsigned char)p[-1]);
-        after_ok = !is_ident_char2((unsigned char)p[n]);
-        if (before_ok && after_ok)
-            return 1;
-        p++;
-    }
-    return 0;
-}
-
 static void add_known_runtime_refs_from_line(const char *line)
 {
-    int i;
     char clean[MAX_LINE];
+    const char *p;
+    char tok[128];
+    int idx;
 
     /*
      * Fallback root scan: after the runtime has been parsed, every PUBLIC and
@@ -913,11 +954,34 @@ static void add_known_runtime_refs_from_line(const char *line)
      * strip_comment_copy calls, ~75% of dccrtlstrip's total runtime). `line`
      * is a pure function of its own text regardless of which symbol is being
      * looked for, so strip it once here instead.
-     */
+     *
+     * This used to also loop over every runtime symbol (syms[i], i < nsyms)
+     * and strstr-search this one line for each - the intended semantics were
+     * always "does this line mention an exact runtime symbol as a whole
+     * identifier token", which is symmetric: walking the line's own tokens
+     * once and hash-looking-up each against syms[] (via add_sym's own
+     * case-sensitive sym_index_find/sym_buckets index, already fully built
+     * by build_blocks() before scan_app ever runs) finds exactly the same
+     * matches, replacing an O(line length * nsyms) strstr scan with an
+     * O(line length) tokenize plus O(1) lookups per token - profiled as the
+     * dominant remaining cost on cobint.c's ~13K-line .MAC after the
+     * strip_comment_copy fix above (is_ident_char2 alone: ~685K calls per
+     * run, almost entirely from strstr's own inner loop against every
+     * candidate position for every one of nsyms symbols). is_ident_start
+     * gates each position exactly like parse_ident_token's own leading
+     * check, so this never extracts a token parse_ident_token itself
+     * wouldn't have accepted, and never skips over one either. */
     strip_comment_copy(line, clean, sizeof(clean));
-    for (i = 0; i < nsyms; ++i) {
-        if (symbol_mentioned_in_clean_line(clean, syms[i].name))
-            add_root(syms[i].name);
+    p = clean;
+    while (*p) {
+        if (is_ident_start((unsigned char)*p)) {
+            parse_ident_token(&p, tok);
+            idx = sym_index_find(tok);
+            if (idx >= 0)
+                add_root(syms[idx].name);
+        } else {
+            p++;
+        }
     }
 }
 
@@ -931,7 +995,7 @@ static void scan_app(const char *fn)
         perror(fn);
         exit(1);
     }
-    while (fgets(buf, sizeof(buf), f)) {
+    while (host_fgets(buf, sizeof(buf), f)) {
         rtrim(buf);
         add_refs_from_line(buf);
         add_known_runtime_refs_from_line(buf);
@@ -1120,6 +1184,7 @@ static void write_output(const char *fn)
 static void usage(void)
 {
     fprintf(stderr, "usage: dccrtlstrip [-k symbol ...] -r dccrtl.mac -o rtlmin.mac app.mac [app2.mac ...]\n");
+    fprintf(stderr, "       dccrtlstrip --strip-apps [-k root ...] app.mac [app2.mac ...]\n");
     exit(1);
 }
 
@@ -1129,6 +1194,47 @@ int main(int argc, char **argv)
     const char *out = NULL;
     int i;
     int saw_app = 0;
+
+    if (argc > 1 && !strcmp(argv[1], "--strip-apps")) {
+        char **apps;
+        char **app_roots;
+        int app_count;
+        int app_root_count;
+
+        apps = (char **)malloc((size_t)argc * sizeof(*apps));
+        app_roots = (char **)malloc((size_t)argc * sizeof(*app_roots));
+        if (apps == NULL || app_roots == NULL) {
+            fprintf(stderr, "dccrtlstrip: out of memory\n");
+            free(apps);
+            free(app_roots);
+            return 1;
+        }
+        app_count = 0;
+        app_root_count = 0;
+        app_roots[app_root_count++] = "__mrun";
+        for (i = 2; i < argc; ++i) {
+            if ((!strcmp(argv[i], "-k") ||
+                 !strcmp(argv[i], "-root")) && i + 1 < argc) {
+                app_roots[app_root_count++] = argv[++i];
+            } else if (argv[i][0] == '-') {
+                free(apps);
+                free(app_roots);
+                usage();
+            } else {
+                apps[app_count++] = argv[i];
+            }
+        }
+        if (app_count == 0) {
+            free(apps);
+            free(app_roots);
+            usage();
+        }
+        i = dcc_strip_app_files(
+            app_count, apps, app_root_count, app_roots);
+        free(apps);
+        free(app_roots);
+        return i ? 0 : 1;
+    }
 
     for (i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-r") && i + 1 < argc) {

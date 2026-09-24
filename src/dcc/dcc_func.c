@@ -1,15 +1,22 @@
-/*
- * dcc_func.c - function and top-level declaration parsing.
+/**
+ * @file dcc_func.c
+ * @brief Parses file-scope declarations and coordinates function capture.
  *
- * Parameter lists (prototype and K&R old-style), function prologue/epilogue
- * and frame layout, inline/narrowing candidate capture, the function-body scan,
- * typedef declarations, and
- * top-level declaration dispatch (parse_function_or_global,
- * parse_translation_unit). File-scope initializer parsing is in
- * dcc_global_init.c.
+ * @par Role
+ * Handles prototype and K&R parameter lists, typedefs, top-level declaration
+ * dispatch, frame-sizing scans, inline and narrowing metadata, debug records,
+ * translation-unit-lifetime callable prototypes, deferred static bodies, and
+ * the begin/end lifecycle for each MIR function.
  *
- * MODULE: compiled as its own translation unit.
- * Source provenance: monolith src/ddc.c lines 15880-17705.
+ * @par Key entry points
+ * parse_translation_unit(), parse_function_or_global(), scan_function_body(),
+ * begin_function_mir(), finish_function_mir(), and
+ * emit_needed_deferred_bodies(), and capture_funcptr_prototype().
+ *
+ * @par Boundary
+ * dcc_stmt.c traverses compound bodies and dcc_global_init.c records file-scope
+ * initializers. This module coordinates MIR capture; selected MIR candidates,
+ * never AST or legacy output, supply production function bodies.
  */
 
 #include "dcc.h"
@@ -462,7 +469,7 @@ static void record_inline_function_if_simple(struct Sym *s)
         return;
     if ((s->type & 15) != TYPE_VOID &&
         (!(type_size(s->type) == 1 || type_size(s->type) == 2 || type_size(s->type) == 4) ||
-         type_is_bool(s->type) || type_is_struct_object(s->type)))
+         type_is_struct_object(s->type)))
         return;
 
     nparams = 0;
@@ -519,6 +526,18 @@ static void record_inline_function_if_simple(struct Sym *s)
     if (ret_expr == NULL)
         return;
     if (!inline_expr_is_simple(s, ret_expr))
+        return;
+    /* A bool-returning function normally gets its 0/1 canonicalization from
+     * AST_RETURN's own codegen (mir_lower_conversion on the return value) -
+     * substituting ret_expr directly at a call site bypasses that entirely,
+     * so only accept it here when ret_expr already provably yields 0/1 on
+     * its own (ast_expr_yields_bool01: a bool-typed subexpression, a 0/1
+     * literal, `!`, a comparison, `&&`/`||`, or a cast to bool - the same
+     * proof dcc_ast_gen_expr.c already trusts elsewhere for an RHS being
+     * stored into a bool). Anything else (e.g. `return some_int_expr;` used
+     * where C's implicit bool conversion would normally truncate/canonicalize
+     * it) is declined rather than risk splicing in a non-canonical value. */
+    if (type_is_bool(s->type) && !ast_expr_yields_bool01(ret_expr))
         return;
 
     s->inline_return_expr = ret_expr;
@@ -1052,6 +1071,58 @@ int current_void_is_empty_param_list(void)
     return r;
 }
 
+/* Runtime array-parameter bounds are adjusted away from the parameter's type,
+ * but in a function definition their expressions are still evaluated on
+ * entry.  Keep their token positions until begin_function_mir(), where the
+ * parameter symbols and MIR function are both available. */
+static LexState param_vla_bound_states[MAX_ARRAY_DIMS];
+static int param_vla_bound_count;
+
+static int param_array_bound_has_side_effect(void)
+{
+    LexState saved = lex_save();
+    int paren_depth = 0;
+    int side_effect = 0;
+    int previous_was_id = 0;
+
+    while (g_lex.tok.kind != TOK_EOF &&
+           (g_lex.tok.kind != ']' || paren_depth > 0)) {
+        int kind = g_lex.tok.kind;
+        struct Sym *symbol = kind == TOK_ID ? find_sym(g_lex.tok.text) : NULL;
+
+        if (kind == TOK_INC || kind == TOK_DEC || kind == '=' ||
+            (kind >= TOK_ADDEQ && kind <= TOK_SHREQ) ||
+            (kind == '(' && previous_was_id) ||
+            (symbol != NULL && symbol->is_volatile)) {
+            side_effect = 1;
+            break;
+        }
+        if (kind == '(')
+            paren_depth++;
+        else if (kind == ')' && paren_depth > 0)
+            paren_depth--;
+        previous_was_id = kind == TOK_ID;
+        next_token();
+    }
+    lex_restore(&saved);
+    return side_effect;
+}
+
+static void emit_param_vla_bound_expressions(void)
+{
+    LexState body;
+    int i;
+
+    if (param_vla_bound_count <= 0)
+        return;
+    body = lex_save();
+    for (i = 0; i < param_vla_bound_count; ++i) {
+        lex_restore(&param_vla_bound_states[i]);
+        ast_emit_discarded_expr();
+    }
+    lex_restore(&body);
+}
+
 void skip_prototype_array_suffixes(int *ptype)
 {
     int dims[MAX_ARRAY_DIMS];
@@ -1095,6 +1166,9 @@ void skip_prototype_array_suffixes(int *ptype)
              * `T p[x][col]` shape (single inner bound, a lone identifier) can
              * be lowered, while any other runtime inner shape is rejected
              * below rather than silently miscompiled. */
+            if (param_array_bound_has_side_effect() &&
+                param_vla_bound_count < MAX_ARRAY_DIMS)
+                param_vla_bound_states[param_vla_bound_count++] = lex_save();
             if (ndims > 0) {
                 rt_count++;
                 if (rt_dim < 0) {
@@ -1211,6 +1285,35 @@ void clear_parsed_prototype(void)
         g_proto_types[i] = 0;
 }
 
+/* __fastcall eligibility: up to 3 parameters, each a char/short/int/pointer
+ * (nothing that needs more than one 16-bit register pair or a hidden
+ * pointer - long, float, struct/union by value), no varargs, no struct
+ * return, and a real prototype (rules out K&R old-style parameter lists,
+ * which never populate proto_types). Call after copy_parsed_prototype_to_sym
+ * so proto_nargs/proto_types/proto_variadic are current. See gen_fastcall_
+ * user_call in dcc_ast_gen_expr.c for the matching HL/DE/BC codegen. */
+void validate_fastcall_prototype(struct Sym *s)
+{
+    int i;
+
+    if (!s->is_fastcall)
+        return;
+    if (!s->has_proto)
+        error_here("__fastcall function must have a prototyped parameter list");
+    if (s->proto_variadic)
+        error_here("__fastcall function cannot be variadic");
+    if (s->proto_nargs > 3)
+        error_here("__fastcall function may have at most 3 parameters");
+    for (i = 0; i < s->proto_nargs; ++i) {
+        int t = s->proto_types[i];
+        if (type_is_struct_object(t) || type_is_long(t) || type_is_float(t) ||
+            type_size(t) > 2)
+            error_here("__fastcall parameter must be char, short, int, or a pointer");
+    }
+    if (type_is_struct_object(s->type))
+        error_here("__fastcall function cannot return a struct or union");
+}
+
 void copy_parsed_prototype_to_sym(struct Sym *s)
 {
     int i;
@@ -1228,20 +1331,47 @@ void copy_funcptr_prototype_to_sym(struct Sym *s, int direct_declarator)
 
     if (s == NULL || type_ptr_depth(s->type) <= 0)
         return;
-    s->is_funcptr = direct_declarator || g_typedef_has_proto;
+    s->is_funcptr = direct_declarator || g_typedef_has_proto ||
+        g_typedef_funcptr_return_type != 0;
     if (direct_declarator) {
+        s->funcptr_return_type = g_funcptr_return_type;
+        s->funcptr_result_prototype = g_funcptr_result_prototype;
         s->has_proto = g_funcptr_has_proto;
         s->proto_nargs = g_funcptr_proto_nargs;
         s->proto_variadic = g_funcptr_proto_variadic;
         for (i = 0; i < MAX_PROTO_PARAMS; ++i)
             s->proto_types[i] = g_funcptr_proto_types[i];
-    } else if (g_typedef_has_proto) {
+    } else if (g_typedef_has_proto || g_typedef_funcptr_return_type != 0) {
+        s->funcptr_return_type = g_typedef_funcptr_return_type;
+        s->funcptr_result_prototype = g_typedef_funcptr_result_prototype;
         s->has_proto = g_typedef_has_proto;
         s->proto_nargs = g_typedef_proto_nargs;
         s->proto_variadic = g_typedef_proto_variadic;
         for (i = 0; i < MAX_PROTO_PARAMS; ++i)
             s->proto_types[i] = g_typedef_proto_types[i];
     }
+}
+
+struct Sym *capture_funcptr_prototype(int type, int direct_declarator)
+{
+    static struct AstArena prototype_arena;
+    static int initialized;
+    struct Sym *prototype;
+
+    if (type_ptr_depth(type) == 0 ||
+        (direct_declarator ? g_funcptr_return_type == 0 : g_typedef_funcptr_return_type == 0))
+        return NULL;
+    if (!initialized) {
+        ast_arena_init(&prototype_arena);
+        initialized = 1;
+    }
+    prototype = (struct Sym *)ast_arena_alloc(&prototype_arena, sizeof(*prototype));
+    memset(prototype, 0, sizeof(*prototype));
+    prototype->type = type;
+    prototype->pointee_volatile_mask = g_decl.pointee_volatile_mask |
+        (unsigned int)(g_decl.pointee_is_volatile != 0);
+    copy_funcptr_prototype_to_sym(prototype, direct_declarator);
+    return prototype;
 }
 
 void remember_proto_param_type(int type)
@@ -1336,7 +1466,9 @@ void parse_old_style_param_declarations(void)
     int base_is_register;
     int base_is_volatile;
     int base_pointee_is_volatile;
+    unsigned int base_volatile_mask;
     int type;
+    int direct_funcptr;
     char name[64];
     struct Sym *s;
 
@@ -1345,27 +1477,31 @@ void parse_old_style_param_declarations(void)
         base_is_register = g_decl.is_register;
         base_is_volatile = g_decl.is_volatile;
         base_pointee_is_volatile = g_decl.pointee_is_volatile;
+        base_volatile_mask = g_decl.pointee_volatile_mask;
 
         for (;;) {
             type = base;
+            direct_funcptr = 0;
             g_decl.is_volatile = base_is_volatile;
             g_decl.pointee_is_volatile = base_pointee_is_volatile;
+            g_decl.pointee_volatile_mask = base_volatile_mask;
             while (accept('*')) {
-                g_decl.pointee_is_volatile = g_decl.is_volatile;
-                g_decl.is_volatile = skip_type_qualifiers_volatile();
+                advance_pointer_qualifiers();
                 type = type_add_ptr(type);
             }
 
-            if (g_lex.tok.kind != TOK_ID) {
+            if (parse_funcptr_declarator(&type, name, sizeof(name))) {
+                direct_funcptr = 1;
+            } else if (g_lex.tok.kind != TOK_ID) {
                 error_here("parameter declaration name expected");
                 while (g_lex.tok.kind != ';' && g_lex.tok.kind != TOK_EOF && g_lex.tok.kind != '{')
                     next_token();
                 break;
+            } else {
+                strncpy(name, g_lex.tok.text, sizeof(name) - 1);
+                name[sizeof(name) - 1] = 0;
+                next_token();
             }
-
-            strncpy(name, g_lex.tok.text, sizeof(name) - 1);
-            name[sizeof(name) - 1] = 0;
-            next_token();
 
             skip_prototype_array_suffixes(&type);
             if (g_lex.tok.kind == '(') {
@@ -1382,6 +1518,8 @@ void parse_old_style_param_declarations(void)
                 s->is_register = base_is_register;
                 s->is_volatile = g_decl.is_volatile;
                 s->pointee_is_volatile = g_decl.pointee_is_volatile;
+                s->pointee_volatile_mask = g_decl.pointee_volatile_mask;
+                copy_funcptr_prototype_to_sym(s, direct_funcptr);
                 if (g_ptr_array_dim_count > 0) {
                     s->elem_size = g_ptr_array_elem_size;
                     s->dim_count = g_ptr_array_dim_count;
@@ -1408,11 +1546,15 @@ void parse_param_list(void)
     int direct_funcptr;
     char name[64];
     int unnamed_id;
+    int typedef_array_len;
+    int typedef_array_decay_depth;
+    int typedef_array_elem_size;
 
     g_frame.nlocals = 0;
     g_frame.local_size = 0;
     g_frame.param_offset = frame_first_param_offset();
     clear_parsed_prototype();
+    param_vla_bound_count = 0;
 
     if (current_void_is_empty_param_list()) {
         g_proto_has = 1;
@@ -1438,15 +1580,27 @@ void parse_param_list(void)
 
         type = parse_type();
         direct_funcptr = 0;
+        typedef_array_len = g_typedef_array_len;
+        {
+            int typedef_element_type = type;
+            typedef_array_decay_depth = type_ptr_depth(type) > 0;
+            while (type_ptr_depth(typedef_element_type) > 0)
+                typedef_element_type = type_decay_ptr(typedef_element_type);
+            typedef_array_elem_size = type_size(typedef_element_type);
+        }
         if (g_typedef_array_len > 0) {
-            type = type_add_ptr(type);
+            /* A declarator pointer over an array typedef is represented by
+             * that existing pointer plus row-dimension metadata.  Adding a
+             * second pointer here turns `A *p` into T ** and makes `(*p)[i]`
+             * load the first bytes of the row as another address. */
+            if (!typedef_array_decay_depth)
+                type = type_add_ptr(type);
             g_typedef_array_len = 0;
         }
         unnamed_id = 0;
 
         while (accept('*')) {
-            g_decl.pointee_is_volatile = g_decl.is_volatile;
-            g_decl.is_volatile = skip_type_qualifiers_volatile();
+            advance_pointer_qualifiers();
             type = type_add_ptr(type);
         }
         skip_type_qualifiers();
@@ -1495,6 +1649,18 @@ void parse_param_list(void)
                 ps->is_register = g_decl.is_register;
                 ps->is_volatile = g_decl.is_volatile;
                 ps->pointee_is_volatile = g_decl.pointee_is_volatile;
+                ps->pointee_volatile_mask = g_decl.pointee_volatile_mask;
+                /* A pointer declared on top of an array typedef preserves
+                 * the typedef's row shape: `typedef T A[N]; A *p` is a
+                 * pointer to an N-element row, not merely T **. */
+                if (g_ptr_array_dim_count == 0 && typedef_array_len > 0 &&
+                    typedef_array_decay_depth) {
+                    ps->dim_count = 1;
+                    ps->dims[0] = typedef_array_len;
+                    ps->elem_size = typedef_array_len *
+                        (typedef_array_elem_size > 0
+                            ? typedef_array_elem_size : 1);
+                }
             }
             copy_funcptr_prototype_to_sym(ps, direct_funcptr);
             if (ps && g_ptr_array_dim_count > 0) {
@@ -1516,7 +1682,7 @@ void parse_param_list(void)
     }
 }
 
-static char current_debug_function[64];
+static char current_debug_function[66];
 static char current_debug_function_source_name[64];
 static int debug_types_emitted;
 
@@ -1532,7 +1698,7 @@ static void emit_debug_dims(const int *dims, int count)
 void emit_debug_types_once(void)
 {
     int i;
-    if (!opt_debug || scan_mode || debug_types_emitted)
+    if (!DEBUG_METADATA_ENABLED || scan_mode || debug_types_emitted)
         return;
     debug_types_emitted = 1;
     for (i = 0; i < nstruct_defs; ++i)
@@ -1553,7 +1719,7 @@ void emit_debug_types_once(void)
 
 void emit_debug_global(struct Sym *s)
 {
-    if (!opt_debug || scan_mode || s == NULL || s->storage == SC_FUNC ||
+    if (!DEBUG_METADATA_ENABLED || scan_mode || s == NULL || s->storage == SC_FUNC ||
         s->storage == SC_EXTERN || s->name[0] == '#')
         return;
     emit_debug_types_once();
@@ -1566,13 +1732,16 @@ void emit_debug_global(struct Sym *s)
 
 void emit_debug_variable(struct Sym *s)
 {
-    if (!opt_debug || scan_mode || current_debug_function[0] == 0 || s == NULL ||
-        s->name[0] == '#')
+    char variable_name[64];
+    if (!DEBUG_METADATA_ENABLED || scan_mode || current_debug_function[0] == 0 || s == NULL ||
+        (s->storage != SC_LOCAL && s->storage != SC_PARAM) ||
+        s->name[0] == '#' || (s->is_const_value && !opt_debug_lines))
         return;
     if (mir_capture_debug_variable(current_debug_function, s, 0))
         return;
+    debug_symbol_name(s, variable_name, sizeof(variable_name));
     fprintf(g_emit_sink.stream, ";@dcc-var \"%s\" \"%s\" %d %d %d %d %d %d %d %d ",
-            current_debug_function, s->name, s->type, s->storage,
+            current_debug_function, variable_name, s->type, s->storage,
             s->offset, s->size, s->is_array, s->is_vla, s->elem_size,
             s->is_funcptr);
     emit_debug_dims(s->dims, s->dim_count);
@@ -1581,13 +1750,16 @@ void emit_debug_variable(struct Sym *s)
 
 void emit_debug_variable_end(struct Sym *s)
 {
-    if (!opt_debug || scan_mode || current_debug_function[0] == 0 || s == NULL ||
-        s->name[0] == '#')
+    char variable_name[64];
+    if (!DEBUG_METADATA_ENABLED || scan_mode || current_debug_function[0] == 0 || s == NULL ||
+        (s->storage != SC_LOCAL && s->storage != SC_PARAM) ||
+        s->name[0] == '#' || (s->is_const_value && !opt_debug_lines))
         return;
     if (mir_capture_debug_variable(current_debug_function, s, 1))
         return;
+    debug_symbol_name(s, variable_name, sizeof(variable_name));
     fprintf(g_emit_sink.stream, ";@dcc-var-end \"%s\" \"%s\" %d\n",
-            current_debug_function, s->name, s->offset);
+            current_debug_function, variable_name, s->offset);
 }
 
 void begin_function_mir(const char *name, int local_bytes)
@@ -1609,7 +1781,9 @@ void begin_function_mir(const char *name, int local_bytes)
     strncpy(current_debug_function_source_name, name, sizeof(current_debug_function_source_name) - 1);
     current_debug_function_source_name[sizeof(current_debug_function_source_name) - 1] = 0;
 
-    if (opt_debug && !scan_mode)
+    if (!scan_mode)
+        fprintf(g_emit_sink.stream, ";@dcc.lto begin %s\n", aname);
+    if (DEBUG_METADATA_ENABLED && !scan_mode)
         fprintf(g_emit_sink.stream, ";@dcc-func-begin \"%s\" \"%s\"\n",
                 current_debug_function, current_debug_function_source_name);
 
@@ -1625,10 +1799,11 @@ void begin_function_mir(const char *name, int local_bytes)
 
     fprintf(g_emit_sink.stream, "%s:\n", aname);
     mir_begin_function(
-        name, g_emit_sink.purpose, current_function_has_vla, local_bytes,
+        name, aname, g_emit_sink.purpose, current_function_has_vla, local_bytes,
         strcmp(name, "main") == 0 &&
             (function_type & 15) == TYPE_INT &&
             type_ptr_depth(function_type) == 0);
+    emit_param_vla_bound_expressions();
     for (i = 0; i < g_frame.nlocals; ++i)
         if (locals[i].storage == SC_PARAM)
             emit_debug_variable(&locals[i]);
@@ -1637,18 +1812,37 @@ void begin_function_mir(const char *name, int local_bytes)
 void finish_function_mir(int implicit_zero_return)
 {
     (void)implicit_zero_return;
+    if (opt_debug_lines) {
+        mir_end_function();
+        if (!scan_mode && g_func_close_line > 0)
+            ast_record_debug_location(g_func_close_file, g_func_close_line);
+        g_func_close_line = 0;
+        if (!scan_mode && current_debug_function[0])
+            fprintf(g_emit_sink.stream, ";@dcc-func-end \"%s\" \"%s\"\n",
+                    current_debug_function, current_debug_function_source_name);
+        if (!scan_mode && current_debug_function[0])
+            fprintf(g_emit_sink.stream, ";@dcc.lto end %s\n",
+                    current_debug_function);
+        current_debug_function[0] = 0;
+        current_debug_function_source_name[0] = 0;
+        flush_pending_asm();
+        return;
+    }
     /* Map the shared return label to the function's closing brace when the
      * body always exits, so an early `return` that jumps here shows the
      * closing brace instead of inheriting the previous statement's line. */
-    if (opt_debug && !scan_mode && g_func_close_line > 0)
+    if (DEBUG_METADATA_ENABLED && !scan_mode && g_func_close_line > 0)
         ast_record_debug_location(g_func_close_file, g_func_close_line);
     g_func_close_line = 0;
-    if (opt_debug && !scan_mode && current_debug_function[0] &&
+    if (DEBUG_METADATA_ENABLED && !scan_mode && current_debug_function[0] &&
         !mir_capture_debug_function_end(
             current_debug_function, current_debug_function_source_name))
         fprintf(g_emit_sink.stream, ";@dcc-func-end \"%s\" \"%s\"\n",
                 current_debug_function, current_debug_function_source_name);
     mir_end_function();
+    if (!scan_mode && current_debug_function[0])
+        fprintf(g_emit_sink.stream, ";@dcc.lto end %s\n",
+                current_debug_function);
     current_debug_function[0] = 0;
     current_debug_function_source_name[0] = 0;
     flush_pending_asm();
@@ -2025,6 +2219,7 @@ typedef struct SpecParseState {
     int licm_seq;
     int decl_is_volatile;
     int decl_pointee_is_volatile;
+    unsigned int decl_volatile_mask;
 } SpecParseState;
 
 static SpecParseState spec_parse_save(void)
@@ -2042,6 +2237,7 @@ static SpecParseState spec_parse_save(void)
     s.licm_seq = g_func_pass.licm_seq;
     s.decl_is_volatile = g_decl.is_volatile;
     s.decl_pointee_is_volatile = g_decl.pointee_is_volatile;
+    s.decl_volatile_mask = g_decl.pointee_volatile_mask;
     return s;
 }
 
@@ -2059,6 +2255,7 @@ static void spec_parse_restore(const SpecParseState *s)
     g_func_pass.licm_seq = s->licm_seq;
     g_decl.is_volatile = s->decl_is_volatile;
     g_decl.pointee_is_volatile = s->decl_pointee_is_volatile;
+    g_decl.pointee_volatile_mask = s->decl_volatile_mask;
 }
 
 /* Speculatively parses the rest of the enclosing block (from the current
@@ -2256,28 +2453,40 @@ void scan_local_decl_after_type(int base)
     int type, bytes, arrlen;
     int base_is_volatile;
     int base_pointee_is_volatile;
+    unsigned int base_volatile_mask;
     int total_elems;
     int direct_funcptr;
+    int parenthesized_array;
+    int parenthesized_total;
+    int parenthesized_stride;
     char name[64];
     char source_name[64];
     struct Sym *s;
 
     base_is_volatile = g_decl.is_volatile;
     base_pointee_is_volatile = g_decl.pointee_is_volatile;
+    base_volatile_mask = g_decl.pointee_volatile_mask;
 
     for (;;) {
         type = base;
         g_decl.is_volatile = base_is_volatile;
         g_decl.pointee_is_volatile = base_pointee_is_volatile;
+        g_decl.pointee_volatile_mask = base_volatile_mask;
         direct_funcptr = 0;
+        parenthesized_array = 0;
+        parenthesized_total = 0;
+        parenthesized_stride = 0;
 
         while (accept('*')) {
-            g_decl.pointee_is_volatile = g_decl.is_volatile;
-            g_decl.is_volatile = skip_type_qualifiers_volatile();
+            advance_pointer_qualifiers();
             type = type_add_ptr(type);
         }
 
-        if (parse_funcptr_declarator(&type, name, sizeof(name))) {
+        if (parse_parenthesized_array_declarator(type, name, sizeof(name),
+                                                 &parenthesized_total,
+                                                 &parenthesized_stride)) {
+            parenthesized_array = 1;
+        } else if (parse_funcptr_declarator(&type, name, sizeof(name))) {
             direct_funcptr = 1;
         } else {
             if (g_lex.tok.kind != TOK_ID) return;
@@ -2309,13 +2518,16 @@ void scan_local_decl_after_type(int base)
             name[sizeof(name) - 1] = 0;
         }
 
-        arrlen = g_funcptr_decl_array_len;
+        arrlen = parenthesized_array ? parenthesized_total
+                                     : g_funcptr_decl_array_len;
         g_funcptr_decl_array_len = 0;
         total_elems = arrlen;
         {
             int first_stride_bytes;
             first_stride_bytes = 0;
-            if (arrlen == 0)
+            if (parenthesized_array)
+                first_stride_bytes = parenthesized_stride;
+            else if (arrlen == 0)
                 parse_array_declarator_dims(type, &total_elems, &first_stride_bytes, 1);
             else
                 total_elems = arrlen;
@@ -2365,10 +2577,39 @@ void scan_local_decl_after_type(int base)
         if (arrlen == 0 && g_typedef_array_len > 0) {
             arrlen = g_typedef_array_len;
             total_elems = g_typedef_array_len;
+        } else if (g_last_array_dim_count > 0 && g_typedef_array_len > 0 &&
+                   g_last_array_dim_count < MAX_ARRAY_DIMS) {
+            /* `ARR2 table[2]` composes the typedef's own array length as an
+             * extra trailing dimension - see the identical composition in
+             * parse_function_or_global (dcc_func.c) and
+             * gen_local_decl_after_type (dcc_decl.c), which must reach the
+             * same conclusion for the codegen pass. */
+            g_last_array_dims[g_last_array_dim_count++] = g_typedef_array_len;
+            if (target_size_multiply(arrlen, g_typedef_array_len, &arrlen))
+                total_elems = arrlen;
+            else
+                error_here("object size exceeds 16-bit address space");
+            /* current_field_array_elem_size (-> Sym.elem_size) was computed by
+             * parse_array_declarator_dims from only this declarator's OWN
+             * dims, before the typedef's dimension was appended above; redo
+             * it now as the stride across every dim past the first, or the
+             * first-dimension row stride stays too narrow (miscomputed as the
+             * bare element size instead of the whole row) even though
+             * dim_count/dims are now correct. */
+            {
+                int inner_stride = 1;
+                int elem_bytes = type_size(type);
+                int di;
+                if (elem_bytes <= 0) elem_bytes = 2;
+                for (di = 1; di < g_last_array_dim_count; ++di)
+                    if (g_last_array_dims[di] > 0)
+                        inner_stride *= g_last_array_dims[di];
+                current_field_array_elem_size = inner_stride * elem_bytes;
+            }
         }
 
-        if (!g_decl.is_volatile &&
-            try_narrow_local_int_array(name, type, arrlen, total_elems)) {
+        if (!g_decl.is_extern && !g_decl.is_volatile &&
+            try_narrow_local_int_array(source_name, type, arrlen, total_elems)) {
             type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
             /* first_stride_bytes (see parse_array_declarator_dims) was
              * computed from the pre-narrowing int element size and is still
@@ -2379,10 +2620,11 @@ void scan_local_decl_after_type(int base)
              * below fall through to type_size(type), matching the narrowed
              * type instead of silently keeping the stale, too-wide stride. */
             current_field_array_elem_size = 0;
-        } else if (!g_decl.is_volatile &&
-                   try_narrow_register_scalar(name, type, g_decl.is_register, arrlen, total_elems)) {
+        } else if (!g_decl.is_extern && !g_decl.is_volatile &&
+                   try_narrow_register_scalar(name, type, g_decl.is_register,
+                                              arrlen, total_elems)) {
             type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
-        } else if (!g_decl.is_volatile &&
+        } else if (!g_decl.is_extern && !g_decl.is_volatile &&
                    try_narrow_for_counter(name, type, arrlen, total_elems)) {
             type = (type & ~15) | TYPE_CHAR | TYPE_UNSIGNED;
         }
@@ -2410,10 +2652,13 @@ void scan_local_decl_after_type(int base)
         {
         int freshly_allocated = 0;
         if (!s) {
-            s = add_local_alloc(name, type, bytes);
+            s = g_decl.is_extern
+                ? add_block_extern_alias(name, source_name, type, bytes)
+                : add_local_alloc(name, type, bytes);
             copy_funcptr_prototype_to_sym(s, direct_funcptr);
             s->is_volatile = g_decl.is_volatile;
             s->pointee_is_volatile = g_decl.pointee_is_volatile;
+            s->pointee_volatile_mask = g_decl.pointee_volatile_mask;
             freshly_allocated = 1;
             if (arrlen > 0 || g_last_array_dim_count > 0) {
                 s->is_array = 1;
@@ -2488,6 +2733,7 @@ void scan_static_local_decl_after_type(int base)
     int type, bytes, arrlen;
     int base_is_volatile;
     int base_pointee_is_volatile;
+    unsigned int base_volatile_mask;
     char name[64];
     char source_name[64];
     char backing_name[64];
@@ -2496,15 +2742,16 @@ void scan_static_local_decl_after_type(int base)
 
     base_is_volatile = g_decl.is_volatile;
     base_pointee_is_volatile = g_decl.pointee_is_volatile;
+    base_volatile_mask = g_decl.pointee_volatile_mask;
 
     for (;;) {
         type = base;
         g_decl.is_volatile = base_is_volatile;
         g_decl.pointee_is_volatile = base_pointee_is_volatile;
+        g_decl.pointee_volatile_mask = base_volatile_mask;
 
         while (accept('*')) {
-            g_decl.pointee_is_volatile = g_decl.is_volatile;
-            g_decl.is_volatile = skip_type_qualifiers_volatile();
+            advance_pointer_qualifiers();
             type = type_add_ptr(type);
         }
 
@@ -2536,6 +2783,29 @@ void scan_static_local_decl_after_type(int base)
         }
         if (arrlen == 0 && g_typedef_array_len > 0)
             arrlen = g_typedef_array_len;
+        else if (g_last_array_dim_count > 0 && g_typedef_array_len > 0 &&
+                 g_last_array_dim_count < MAX_ARRAY_DIMS) {
+            /* `ARR2 table[2]` composes the typedef's own array length as an
+             * extra trailing dimension - see the identical composition in
+             * parse_function_or_global and scan_local_decl_after_type. */
+            g_last_array_dims[g_last_array_dim_count++] = g_typedef_array_len;
+            if (!target_size_multiply(arrlen, g_typedef_array_len, &arrlen))
+                error_here("object size exceeds 16-bit address space");
+            /* current_field_array_elem_size (-> Sym.elem_size) reflected only
+             * this declarator's own dims; redo it as the stride across every
+             * dim past the first now that the typedef's dimension is appended
+             * - see the identical fixup in scan_local_decl_after_type. */
+            {
+                int inner_stride = 1;
+                int elem_bytes = type_size(type);
+                int di;
+                if (elem_bytes <= 0) elem_bytes = 2;
+                for (di = 1; di < g_last_array_dim_count; ++di)
+                    if (g_last_array_dims[di] > 0)
+                        inner_stride *= g_last_array_dims[di];
+                current_field_array_elem_size = inner_stride * elem_bytes;
+            }
+        }
 
         bytes = type_size(type);
         if (arrlen > 0)
@@ -2568,6 +2838,7 @@ void scan_static_local_decl_after_type(int base)
         g->is_static = 1;
         g->is_volatile = g_decl.is_volatile;
         g->pointee_is_volatile = g_decl.pointee_is_volatile;
+        g->pointee_volatile_mask = g_decl.pointee_volatile_mask;
         g->size = bytes;
         if (arrlen != 0 || g_last_array_dim_count > 0) {
             g->is_array = 1;
@@ -2581,6 +2852,7 @@ void scan_static_local_decl_after_type(int base)
             l = add_local_known(name, type, SC_GLOBAL, 0, bytes);
             l->is_volatile = g_decl.is_volatile;
             l->pointee_is_volatile = g_decl.pointee_is_volatile;
+            l->pointee_volatile_mask = g_decl.pointee_volatile_mask;
             strncpy(l->link_name, backing_name, sizeof(l->link_name) - 1);
             l->link_name[sizeof(l->link_name) - 1] = 0;
             if (arrlen != 0 || g_last_array_dim_count > 0) {
@@ -2743,6 +3015,7 @@ void parse_typedef_decl(void)
     int base_type;
     int base_is_volatile;
     int base_pointee_is_volatile;
+    unsigned int base_volatile_mask;
     int done;
 
     expect(TOK_TYPEDEF);
@@ -2755,33 +3028,50 @@ void parse_typedef_decl(void)
     base_type = parse_base_type();
     base_is_volatile = g_decl.is_volatile;
     base_pointee_is_volatile = g_decl.pointee_is_volatile;
+    base_volatile_mask = g_decl.pointee_volatile_mask;
     done = 0;
 
     while (!done && g_lex.tok.kind != TOK_EOF) {
         int type;
         int typedef_array_len;
+        int typedef_dim_count;
+        int typedef_dims[MAX_ARRAY_DIMS];
+        int inherited_dim_count;
+        int inherited_dims[MAX_ARRAY_DIMS];
         int is_func;
         int is_volatile;
         int pointee_is_volatile;
+        unsigned int volatile_mask;
         char name[64];
 
         type = base_type;
         typedef_array_len = 0;
+        typedef_dim_count = 0;
+        inherited_dim_count = g_typedef_array_dim_count;
+        memcpy(inherited_dims, g_typedef_array_dims, sizeof(inherited_dims));
         is_func = 0;
         is_volatile = base_is_volatile;
         pointee_is_volatile = base_pointee_is_volatile;
+        volatile_mask = base_volatile_mask;
         name[0] = 0;
 
         while (accept('*')) {
+            volatile_mask = ((volatile_mask |
+                (unsigned int)(pointee_is_volatile != 0)) << 1) |
+                (unsigned int)(is_volatile != 0);
             pointee_is_volatile = is_volatile;
             is_volatile = skip_type_qualifiers_volatile();
             type = type_add_ptr(type);
         }
 
+        g_decl.is_volatile = is_volatile;
+        g_decl.pointee_is_volatile = pointee_is_volatile;
+        g_decl.pointee_volatile_mask = volatile_mask;
         if (parse_funcptr_declarator(&type, name, sizeof(name))) {
             /* Parenthesized function-pointer typedef. */
             is_volatile = g_decl.is_volatile;
             pointee_is_volatile = g_decl.pointee_is_volatile;
+            volatile_mask = g_decl.pointee_volatile_mask;
         } else {
             if (g_lex.tok.kind != TOK_ID) {
                 error_here("identifier expected in typedef");
@@ -2795,35 +3085,48 @@ void parse_typedef_decl(void)
         }
 
         if (g_lex.tok.kind == '[') {
-            next_token();
-            if (g_lex.tok.kind == ']') {
-                typedef_array_len = 0;
-                next_token();
-            } else {
-                typedef_array_len = parse_typed_array_bound_expr();
-                expect(']');
-            }
-            /* Multidimensional array typedefs (typedef T A[2][3]) collapse to a
-             * flat element count: fold every inner dimension into the total so
-             * sizeof(A) is element_size * product-of-dims, not just the first
-             * dimension.  A typedef tracks only a single total length, so the
-             * product is the correct flattened size. */
             while (g_lex.tok.kind == '[') {
+                int dimension;
                 next_token();
-                if (g_lex.tok.kind != ']') {
-                    int inner = parse_typed_array_bound_expr();
-                    if (typedef_array_len > 0 && inner > 0)
-                        typedef_array_len *= inner;
-                }
+                dimension = g_lex.tok.kind == ']' ? 0
+                    : parse_typed_array_bound_expr();
                 expect(']');
+                if (typedef_dim_count < MAX_ARRAY_DIMS)
+                    typedef_dims[typedef_dim_count++] = dimension;
+                else
+                    error_here("too many array dimensions");
             }
         } else if (g_lex.tok.kind == '(') {
             skip_prototype_function_suffix();
             is_func = (type_ptr_depth(type) == 0);
         }
 
-        add_typedef_name_ex(name, type, typedef_array_len, is_func,
+        {
+            int ti;
+            int product = 1;
+            int di;
+            for (di = 0; di < inherited_dim_count &&
+                         typedef_dim_count < MAX_ARRAY_DIMS; ++di)
+                typedef_dims[typedef_dim_count++] = inherited_dims[di];
+            for (di = 0; di < typedef_dim_count; ++di) {
+                if (typedef_dims[di] <= 0 ||
+                    !target_size_multiply(product, typedef_dims[di], &product)) {
+                    product = 0;
+                    break;
+                }
+            }
+            typedef_array_len = typedef_dim_count > 0 ? product : 0;
+            add_typedef_name_ex(name, type, typedef_array_len, is_func,
                     is_volatile, pointee_is_volatile);
+            ti = find_typedef(name);
+            if (ti >= 0) {
+                typedefs[ti].pointee_volatile_mask = volatile_mask;
+                typedefs[ti].dim_count = typedef_dim_count;
+                for (di = 0; di < MAX_ARRAY_DIMS; ++di)
+                    typedefs[ti].dims[di] = di < typedef_dim_count
+                        ? typedef_dims[di] : 0;
+            }
+        }
 
         if (accept(','))
             continue;
@@ -2837,10 +3140,12 @@ void parse_function_or_global(int base_type)
     int done;
     int base_is_volatile;
     int base_pointee_is_volatile;
+    unsigned int base_volatile_mask;
 
     done = 0;
     base_is_volatile = g_decl.is_volatile;
     base_pointee_is_volatile = g_decl.pointee_is_volatile;
+    base_volatile_mask = g_decl.pointee_volatile_mask;
 
     while (!done && g_lex.tok.kind != TOK_EOF) {
         int type;
@@ -2859,32 +3164,60 @@ void parse_function_or_global(int base_type)
         int base_is_func_typedef;
         int is_funcret_funcptr_decl;
         int direct_funcptr_decl;
+        int pointer_over_array_typedef;
         int object_is_volatile;
         int pointee_is_volatile;
+        unsigned int volatile_mask;
 
         type = base_type;
         object_is_volatile = base_is_volatile;
         pointee_is_volatile = base_pointee_is_volatile;
+        volatile_mask = base_volatile_mask;
         base_is_func_typedef = g_typedef_is_func;
         is_funcret_funcptr_decl = 0;
         direct_funcptr_decl = 0;
+        pointer_over_array_typedef = g_typedef_array_dim_count > 0 &&
+            type_ptr_depth(type) > type_ptr_depth(g_typedef_base_type);
         name[0] = 0;
+        /* __fastcall is per-declarator (like MSVC placement, between the
+         * return type/pointers and the function name), not a shared
+         * declaration specifier like static/inline/extern above - reset it
+         * fresh for each comma-separated declarator so `int foo(int),
+         * __fastcall bar(int);` doesn't leak __fastcall onto foo. */
+        g_decl.is_fastcall = 0;
 
         /* Each declarator starts again from the shared declaration-specifier
          * base type.  This is the important C declarator rule for forms like:
          *     int *a, b, c[10];
          * where only a is a pointer. */
         while (accept('*')) {
+            volatile_mask = ((volatile_mask |
+                (unsigned int)(pointee_is_volatile != 0)) << 1) |
+                (unsigned int)(object_is_volatile != 0);
             pointee_is_volatile = object_is_volatile;
             object_is_volatile = skip_type_qualifiers_volatile();
             type = type_add_ptr(type);
             base_is_func_typedef = 0;
+            if (g_typedef_array_dim_count > 0)
+                pointer_over_array_typedef = 1;
         }
 
+        /* MSVC placement: RETTYPE __fastcall name(...), after any pointers
+         * and before the declarator name - not a storage-class-style prefix
+         * specifier, so it is not accepted in parse_base_type. */
+        if (g_lex.tok.kind == TOK_FASTCALL) {
+            g_decl.is_fastcall = 1;
+            next_token();
+        }
+
+        g_decl.is_volatile = object_is_volatile;
+        g_decl.pointee_is_volatile = pointee_is_volatile;
+        g_decl.pointee_volatile_mask = volatile_mask;
         if (parse_funcptr_declarator(&type, name, sizeof(name))) {
             direct_funcptr_decl = 1;
             object_is_volatile = g_decl.is_volatile;
             pointee_is_volatile = g_decl.pointee_is_volatile;
+            volatile_mask = g_decl.pointee_volatile_mask;
         } else {
             if (g_lex.tok.kind != TOK_ID) {
                 error_here("identifier expected");
@@ -2910,6 +3243,8 @@ void parse_function_or_global(int base_type)
          * fn_t *fp have already cleared base_is_func_typedef above. */
         if (base_is_func_typedef && g_funcptr_decl_array_len == 0) {
             s = add_global(name, type, SC_FUNC);
+            s->pointee_is_volatile = pointee_is_volatile;
+            s->pointee_volatile_mask = volatile_mask;
             s->is_inline |= g_decl.is_inline;
             s->is_noreturn |= g_decl.is_noreturn;
             parse_function_return_type = type;
@@ -2927,8 +3262,19 @@ void parse_function_or_global(int base_type)
         /* Function declarator or definition. */
         if (is_funcret_funcptr_decl || (g_funcptr_decl_array_len == 0 && accept('('))) {
             s = add_global(name, type, SC_FUNC);
+            s->pointee_is_volatile = pointee_is_volatile;
+            s->pointee_volatile_mask = volatile_mask;
+            s->funcptr_result_prototype = capture_funcptr_prototype(type, is_funcret_funcptr_decl);
+            /* Unlike is_inline (an optimization hint dcc tolerates picking up
+             * from any one declaration), a __fastcall mismatch between
+             * declarations is a real ABI disagreement between call sites
+             * compiled against each one - so it's checked, not OR'd in,
+             * once a prototype already exists for this symbol. */
+            if (s->has_proto && s->is_fastcall != g_decl.is_fastcall)
+                error_here("__fastcall specifier does not match previous declaration");
             s->is_inline |= g_decl.is_inline;
             s->is_noreturn |= g_decl.is_noreturn;
+            s->is_fastcall |= g_decl.is_fastcall;
             parse_function_return_type = type;
             if (g_ptr_array_dim_count > 0) {
                 int pi;
@@ -2946,6 +3292,7 @@ void parse_function_or_global(int base_type)
             if (!is_funcret_funcptr_decl)
                 parse_param_list();
             copy_parsed_prototype_to_sym(s);
+            validate_fastcall_prototype(s);
             if (!is_funcret_funcptr_decl)
                 expect(')');
 
@@ -2957,6 +3304,16 @@ void parse_function_or_global(int base_type)
                 parse_old_style_param_declarations();
 
             if (g_lex.tok.kind == '{') {
+                /* Phase 1 of __fastcall: dcc does not yet generate a
+                 * register-argument-aware prologue for a compiled C body, so
+                 * a __fastcall function must be declared extern and defined
+                 * out of line as hand-written #asm reading HL/DE/BC directly
+                 * (see _get_mem in tests/a1.c for the established pattern
+                 * this mirrors - an extern prototype with the real body in a
+                 * freestanding #asm block, never seen here as a '{' body). */
+                if (s->is_fastcall)
+                    error_here("__fastcall function bodies are not yet supported; "
+                               "declare it extern and define it as a hand-written #asm block");
                 /* Set once here, covering both frame-sizing scan passes below
                  * and the real codegen pass later in this same block, so a
                  * hoist decision keyed on "am I compiling function X" (see
@@ -3095,14 +3452,15 @@ void parse_function_or_global(int base_type)
                 if (strcmp(name, "main") == 0) {
                     int has_args = !((s->has_proto  && s->proto_nargs == 0) ||
                                      (!s->has_proto && pre_params_nlocals == 0));
-                    fprintf(g_emit_sink.stream, "\n\tpublic __mrun\n");
+                    g_main_has_args = has_args;
+                    fprintf(g_emit_sink.stream,
+                            "\n;@dcc.lto begin __mrun\n\tpublic __mrun\n");
                     if (has_args) {
                         fprintf(g_emit_sink.stream, "\textrn __build_argv\n");
                         fprintf(g_emit_sink.stream, "\textrn __argc\n");
-                        fprintf(g_emit_sink.stream, "\textrn argv\n");
                         fprintf(g_emit_sink.stream, "__mrun:\n");
                         fprintf(g_emit_sink.stream, "\tcall __build_argv\n");
-                        fprintf(g_emit_sink.stream, "\tld hl,argv\n");
+                        fprintf(g_emit_sink.stream, "\tld hl,__bsse\n");
                         fprintf(g_emit_sink.stream, "\tpush hl\n");
                         fprintf(g_emit_sink.stream, "\tld hl,(__argc)\n");
                         fprintf(g_emit_sink.stream, "\tpush hl\n");
@@ -3114,6 +3472,8 @@ void parse_function_or_global(int base_type)
                         fprintf(g_emit_sink.stream, "\tcall _main\n");
                     }
                     fprintf(g_emit_sink.stream, "\tret\n");
+                    fprintf(g_emit_sink.stream,
+                            ";@dcc.lto end __mrun\n");
                 }
 
                 lex_restore(&_le);
@@ -3197,12 +3557,37 @@ void parse_function_or_global(int base_type)
             }
 
             arrlen = first_dim;
-            if (arrlen == 0 && dim_count == 0 && g_typedef_array_len > 0) {
-                arrlen = g_typedef_array_len;
-                first_dim = g_typedef_array_len;
-                total_count = g_typedef_array_len;
-                dim_count = 1;
-                dims[0] = g_typedef_array_len;
+            if (arrlen == 0 && dim_count == 0 &&
+                g_typedef_array_dim_count > 0 && !pointer_over_array_typedef) {
+                total_count = 1;
+                for (i = 0; i < g_typedef_array_dim_count; ++i) {
+                    dims[dim_count++] = g_typedef_array_dims[i];
+                    if (!target_size_multiply(total_count,
+                                              g_typedef_array_dims[i],
+                                              &total_count))
+                        total_count = 0;
+                }
+                arrlen = dims[0];
+                first_dim = dims[0];
+            } else if (dim_count > 0 && g_typedef_array_len > 0 &&
+                       !pointer_over_array_typedef &&
+                       dim_count < MAX_ARRAY_DIMS) {
+                /* `ARR2 table[2]` where `typedef T ARR2[N]` composes the
+                 * typedef's own array length as an extra trailing dimension,
+                 * so the declaration behaves exactly like `T table[2][N]` (a
+                 * typedef name is just another spelling of its type - C89
+                 * 6.5.6).  Without this the typedef's dimension is silently
+                 * dropped and only this declarator's own `[2]` survives. */
+                for (i = 0; i < g_typedef_array_dim_count &&
+                            dim_count < MAX_ARRAY_DIMS; ++i) {
+                    dims[dim_count++] = g_typedef_array_dims[i];
+                    if (!target_size_multiply(total_count,
+                                              g_typedef_array_dims[i],
+                                              &total_count)) {
+                        error_here("object size exceeds 16-bit address space");
+                        total_count = 0;
+                    }
+                }
             }
 
             inner_count = 1;
@@ -3229,7 +3614,71 @@ void parse_function_or_global(int base_type)
                 s = add_global(name, type, SC_EXTERN);
                 s->is_volatile = object_is_volatile;
                 s->pointee_is_volatile = pointee_is_volatile;
+                s->pointee_volatile_mask = volatile_mask;
                 copy_funcptr_prototype_to_sym(s, direct_funcptr_decl);
+                /* Keep the same array-shape metadata as a definition.  The
+                 * expression parser needs it immediately for declarations
+                 * such as `extern fn_ptr dispatch[];`: without is_array and
+                 * elem_size, dispatch[i] is lowered as indexing the pointed-to
+                 * function's return type (void in particular has size zero),
+                 * rather than indexing a table of two-byte function pointers.
+                 * A later definition cannot repair functions already parsed. */
+                if (dim_count > 0 || arrlen || total_count == 0) {
+                    s->is_array = 1;
+                    s->array_len = arrlen;
+                    s->dim_count = dim_count;
+                    for (i = 0; i < MAX_ARRAY_DIMS; ++i)
+                        s->dims[i] = (i < dim_count) ? dims[i] : 0;
+
+                    if (dim_count > 1) {
+                        if (!target_size_multiply(inner_count, base_size,
+                                                  &s->elem_size))
+                            s->elem_size = 0;
+                    } else
+                        s->elem_size = base_size;
+                    if (s->elem_size <= 0)
+                        s->elem_size = 2;
+                    if (pointer_over_array_typedef &&
+                        g_typedef_array_dim_count > 0) {
+                        int pi;
+                        int stride = type_size(type_decay_ptr(type));
+                        if (stride <= 0) stride = 1;
+                        s->pointee_dim_count = g_typedef_array_dim_count;
+                        for (pi = 0; pi < MAX_ARRAY_DIMS; ++pi) {
+                            s->pointee_dims[pi] = pi < g_typedef_array_dim_count
+                                ? g_typedef_array_dims[pi] : 0;
+                            if (pi < g_typedef_array_dim_count &&
+                                !target_size_multiply(stride,
+                                                      g_typedef_array_dims[pi],
+                                                      &stride))
+                                stride = 0;
+                        }
+                        s->pointee_elem_size = stride;
+                    }
+                } else if (pointer_over_array_typedef &&
+                           g_typedef_array_dim_count > 0) {
+                    int pi;
+                    int stride = type_size(type_decay_ptr(type));
+                    if (stride <= 0) stride = 1;
+                    for (pi = 0; pi < g_typedef_array_dim_count; ++pi) {
+                        s->dims[pi] = g_typedef_array_dims[pi];
+                        if (!target_size_multiply(stride,
+                                                  g_typedef_array_dims[pi],
+                                                  &stride))
+                            stride = 0;
+                    }
+                    s->dim_count = g_typedef_array_dim_count;
+                    s->elem_size = stride;
+                } else if (g_ptr_array_dim_count > 0) {
+                    int pi;
+                    s->elem_size = g_ptr_array_elem_size;
+                    s->dim_count = g_ptr_array_dim_count;
+                    for (pi = 0; pi < MAX_ARRAY_DIMS; ++pi)
+                        s->dims[pi] = pi < g_ptr_array_dim_count
+                            ? g_ptr_array_dims[pi] : 0;
+                }
+                g_ptr_array_dim_count = 0;
+                g_ptr_array_elem_size = 0;
                 if (!already_declared && !asm_name_is_internal_public(name))
                     s->needs_extrn = 1;
                 else if (asm_name_is_internal_public(name))
@@ -3252,6 +3701,7 @@ void parse_function_or_global(int base_type)
             s->needs_extrn = 0;
             s->is_volatile = object_is_volatile;
             s->pointee_is_volatile = pointee_is_volatile;
+            s->pointee_volatile_mask = volatile_mask;
             if (g_decl.is_static)
                 s->is_static = 1;
 
@@ -3269,10 +3719,42 @@ void parse_function_or_global(int base_type)
                     s->elem_size = base_size;
                 if (s->elem_size <= 0) s->elem_size = 2;
 
+                if (pointer_over_array_typedef &&
+                    g_typedef_array_dim_count > 0) {
+                    int pi;
+                    int stride = type_size(type_decay_ptr(type));
+                    if (stride <= 0) stride = 1;
+                    s->pointee_dim_count = g_typedef_array_dim_count;
+                    for (pi = 0; pi < MAX_ARRAY_DIMS; ++pi) {
+                        s->pointee_dims[pi] = pi < g_typedef_array_dim_count
+                            ? g_typedef_array_dims[pi] : 0;
+                        if (pi < g_typedef_array_dim_count &&
+                            !target_size_multiply(stride,
+                                                  g_typedef_array_dims[pi],
+                                                  &stride))
+                            stride = 0;
+                    }
+                    s->pointee_elem_size = stride;
+                }
+
                 if (total_count > 0)
                     s->size = object_size;
                 else
                     s->size = 0;
+            } else if (pointer_over_array_typedef &&
+                       g_typedef_array_dim_count > 0) {
+                int pi;
+                int stride = type_size(type_decay_ptr(type));
+                if (stride <= 0) stride = 1;
+                for (pi = 0; pi < g_typedef_array_dim_count; ++pi) {
+                    s->dims[pi] = g_typedef_array_dims[pi];
+                    if (!target_size_multiply(stride,
+                                              g_typedef_array_dims[pi],
+                                              &stride))
+                        stride = 0;
+                }
+                s->dim_count = g_typedef_array_dim_count;
+                s->elem_size = stride;
             } else if (g_ptr_array_dim_count > 0) {
                 int pi;
                 s->elem_size = g_ptr_array_elem_size;

@@ -1,41 +1,21 @@
-/*
- * dcc_global_scan.c - whole-translation-unit lexical scan of which
- * identifiers are ever written to or have their address taken, and (for
- * writes) which function that happens in.
+/**
+ * @file dcc_global_scan.c
+ * @brief Collects conservative whole-file global write and address facts.
  *
- * This exists to let a codegen fast path (see ast_for_hoist_global_member_
- * value_supported, dcc_ast_gen_support.c) prove a global variable's value is
- * invariant across an entire function's execution - specifically, across a
- * hot loop full of calls that the compiler cannot otherwise rule out as
- * reassigning it. dcc compiles in a single forward pass over the source, so
- * while generating one function it has no way to know whether some
- * later-defined function also reassigns a given global; this module runs a
- * dedicated pre-pass over the *entire* file first (before any real parsing
- * or codegen begins) purely to answer that one question, then rewinds all
- * lexer/preprocessor state as if it had never run.
+ * @par Role
+ * Runs a one-time lexical prepass over the finalized source, records writes
+ * and address-taking for names and direct fields with enclosing-function
+ * attribution, then restores source, lexer, macro, and option state before
+ * normal parsing begins.
  *
- * This is a lexical pattern match, not a semantic one: it does not resolve
- * identifiers through the real symbol table (which does not exist yet at
- * pre-pass time) and only recognises "this token looks like a write to name
- * X" from token-kind adjacency (an identifier immediately followed by an
- * assignment/increment/decrement operator, or immediately preceded by one,
- * or immediately preceded by '&', and not immediately preceded by '.' or
- * "->" - which would make it a struct member name, not a variable
- * reference). A local variable or struct field that happens to share a
- * global's name can therefore be counted as if it were a write to that
- * global; this is always the SAFE direction (it only makes the analysis
- * more conservative, never less), which is what matters here.
+ * @par Key entry points
+ * scan_global_write_info(), global_text_write_count(),
+ * global_text_addr_taken_count(), and the global_text_field_*() queries.
  *
- * What this does NOT prove: that the one recorded writer function can never
- * be re-entered from within the call graph of the function asking the
- * question. That would need real interprocedural call-graph analysis, which
- * this module does not attempt. The residual assumption is: once a global
- * has been written by its one writer, nothing later in the program's
- * execution calls that writer again. This holds for the ordinary "init once,
- * then treat as read-only" idiom this feature targets, and is exactly the
- * shape ast_for_hoist_global_member_value_supported requires (a single
- * textual write site outside the function being optimised) before it will
- * ever consider the global invariant.
+ * @par Boundary
+ * This is token-pattern analysis, not symbol resolution or call-graph proof;
+ * shadowing and uncertain shapes may only add conservative false positives.
+ * It builds no AST or symbols and emits no code.
  */
 
 #include "dcc.h"
@@ -68,6 +48,7 @@ struct GlobalScanFieldEntry {
     char field[64];
     int write_count;
     int addr_taken_count;
+    int all_writes_byte_constants;
 };
 
 static struct GlobalScanFieldEntry g_scan_field_entries[MAX_GLOBAL_SCAN_FIELDS];
@@ -96,8 +77,8 @@ static struct GlobalScanEntry *find_or_add_scan_entry(const char *name)
         return NULL;
     }
 
-    strncpy(g_scan_entries[g_scan_nentries].name, name, 63);
-    g_scan_entries[g_scan_nentries].name[63] = 0;
+    snprintf(g_scan_entries[g_scan_nentries].name,
+             sizeof(g_scan_entries[g_scan_nentries].name), "%s", name);
     g_scan_entries[g_scan_nentries].write_count = 0;
     g_scan_entries[g_scan_nentries].addr_taken_count = 0;
     return &g_scan_entries[g_scan_nentries++];
@@ -124,6 +105,7 @@ static struct GlobalScanFieldEntry *find_or_add_scan_field_entry(
     g_scan_field_entries[g_scan_nfield_entries].field[63] = 0;
     g_scan_field_entries[g_scan_nfield_entries].write_count = 0;
     g_scan_field_entries[g_scan_nfield_entries].addr_taken_count = 0;
+    g_scan_field_entries[g_scan_nfield_entries].all_writes_byte_constants = 1;
     return &g_scan_field_entries[g_scan_nfield_entries++];
 }
 
@@ -152,12 +134,15 @@ static void record_addr_taken(const char *name)
 }
 
 static void record_field_write(const char *base, const char *field,
-                               const char *func)
+                               const char *func, int byte_constant)
 {
     struct GlobalScanFieldEntry *e =
         find_or_add_scan_field_entry(base, field);
-    if (e != NULL)
+    if (e != NULL) {
         e->write_count++;
+        if (!byte_constant)
+            e->all_writes_byte_constants = 0;
+    }
 
     if (g_scan_nfield_writes >= MAX_GLOBAL_SCAN_FIELD_WRITES) {
         g_scan_overflowed = 1;
@@ -192,6 +177,12 @@ static int token_starts_assignment_or_incdec(int kind)
     default:
         return 0;
     }
+}
+
+static int token_ends_simple_assignment_rhs(int kind)
+{
+    return kind == ';' || kind == ',' || kind == ')' ||
+           kind == ']' || kind == ':';
 }
 
 /* One-time whole-file lexical scan (see file header). Must run before any
@@ -273,6 +264,9 @@ void scan_global_write_info(void)
             int next_kind;
             int field_kind = TOK_EOF;
             int field_next_kind = TOK_EOF;
+            int field_rhs_kind = TOK_EOF;
+            int field_rhs_end_kind = TOK_EOF;
+            long field_rhs_value = 0;
             char field_name[64];
 
             strncpy(name, g_lex.tok.text, 63);
@@ -289,6 +283,13 @@ void scan_global_write_info(void)
                     field_name[63] = 0;
                     next_token();
                     field_next_kind = g_lex.tok.kind;
+                    if (field_next_kind == '=') {
+                        next_token();
+                        field_rhs_kind = g_lex.tok.kind;
+                        field_rhs_value = g_lex.tok.val;
+                        next_token();
+                        field_rhs_end_kind = g_lex.tok.kind;
+                    }
                 }
             }
 
@@ -315,10 +316,16 @@ void scan_global_write_info(void)
                     field_next_kind != '[') {
                     record_field_addr_taken(name, field_name);
                 } else if (prev_kind == TOK_INC || prev_kind == TOK_DEC) {
-                    record_field_write(name, field_name, func_at_depth0);
+                    record_field_write(name, field_name, func_at_depth0, 0);
                 } else if (token_starts_assignment_or_incdec(
                                field_next_kind)) {
-                    record_field_write(name, field_name, func_at_depth0);
+                    record_field_write(
+                        name, field_name, func_at_depth0,
+                        field_next_kind == '=' &&
+                        field_rhs_kind == TOK_NUM &&
+                        field_rhs_value >= 0 && field_rhs_value <= 255 &&
+                        token_ends_simple_assignment_rhs(
+                            field_rhs_end_kind));
                 }
             }
 
@@ -450,6 +457,21 @@ int global_text_field_addr_taken_count(const char *base, const char *field)
         if (!strcmp(g_scan_field_entries[i].base, base) &&
             !strcmp(g_scan_field_entries[i].field, field))
             return g_scan_field_entries[i].addr_taken_count;
+    return 0;
+}
+
+int global_text_field_all_writes_byte_constants(
+    const char *base, const char *field)
+{
+    int i;
+
+    if (g_scan_overflowed)
+        return 0;
+    for (i = 0; i < g_scan_nfield_entries; ++i)
+        if (!strcmp(g_scan_field_entries[i].base, base) &&
+            !strcmp(g_scan_field_entries[i].field, field))
+            return g_scan_field_entries[i].write_count > 0 &&
+                   g_scan_field_entries[i].all_writes_byte_constants;
     return 0;
 }
 

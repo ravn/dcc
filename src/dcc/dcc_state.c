@@ -1,17 +1,17 @@
-/*
- * dcc_state.c - definitions of the shared mutable state for the dcc compiler.
+/**
+ * @file dcc_state.c
+ * @brief Defines compiler-wide mutable state declared by dcc.h.
  *
- * Defines cross-module compiler state declared in dcc.h and focused internal
- * headers. Truly module-local state remains static in its owning file.
+ * @par Role
+ * Instantiates shared option, type, symbol, lexer, preprocessing, function,
+ * scope, diagnostic, initializer, debug, and emission state. Related live
+ * fields are grouped in lifecycle records such as LexState, FrameState,
+ * ExprState, FunctionPassState, DeclState, and EmitSink.
  *
- * Why dcc keeps so much shared state: parser, AST builder, and codegen helpers
- * share a large amount of "current position" state (the source buffer, the
- * lookahead token, the symbol tables, per-function codegen flags, ...).
- * Related live fields are grouped by lifecycle in LexState, FrameState,
- * ExprState, FunctionPassState, DeclState, and EmitSink rather than exposed as
- * independent scalars.
- *
- * Source provenance: monolith src/ddc.c lines 199-203, 347-348, 378-489.
+ * @par Boundary
+ * This file provides storage, not behavior. State used by only one module
+ * remains static in that owner rather than becoming part of the shared
+ * contract.
  */
 
 #include "dcc.h"
@@ -28,6 +28,8 @@ int opt_stack_size;  /* bytes reserved above heap for C stack */
 int opt_stack_check; /* -fstack-check: emit a stack-overflow guard at function entry */
 int opt_no_narrow;   /* -fno-narrow: disable every byte-narrowing pass */
 int opt_debug;       /* -g: emit source-level debug annotations */
+int opt_debug_lines; /* -gline: optimized code with line/function annotations only */
+int g_main_has_args; /* final app needs hidden runtime argv/command-tail BSS */
 
 /* ---- typedef table ----------------------------------------------------- */
 struct TypeDef typedefs[MAX_TYPEDEFS];
@@ -168,8 +170,13 @@ int  nenum_consts;
 
 /* Communicates array length from array-typedef through parse_base_type to declarators */
 int g_typedef_array_len;
+int g_typedef_array_dim_count;
+int g_typedef_array_dims[MAX_ARRAY_DIMS];
+int g_typedef_base_type;
 int g_typedef_is_func;
 int g_typedef_has_proto;
+int g_typedef_funcptr_return_type;
+struct Sym *g_typedef_funcptr_result_prototype;
 int g_typedef_proto_nargs;
 int g_typedef_proto_variadic;
 int g_typedef_proto_types[MAX_PROTO_PARAMS];
@@ -185,6 +192,8 @@ int g_proto_types[MAX_PROTO_PARAMS];
 int g_funcptr_decl_array_len;
 int g_funcptr_is_funcret_decl;
 int g_funcptr_has_proto;
+int g_funcptr_return_type;
+struct Sym *g_funcptr_result_prototype;
 int g_funcptr_proto_nargs;
 int g_funcptr_proto_variadic;
 int g_funcptr_proto_types[MAX_PROTO_PARAMS];

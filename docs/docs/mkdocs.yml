@@ -6,6 +6,11 @@ site_description: >-
 docs_dir: en
 site_dir: ../site
 
+validation:
+  links:
+    anchors: warn
+    unrecognized_links: warn
+
 repo_name: DCC C Compiler
 repo_url: https://github.com/davidly/dcc
 
@@ -16,6 +21,7 @@ nav:
   - Introduction: en/index.md
   - The toolchain: en/00-setup-toolchain.md
   - VS Code debugging: en/00-vscode-debugging.md
+  - Debugger host and I/O adapters: en/00-debug-host.md
   - Agentic skills: en/00-agent-skills.md
   - C conformance: en/01-c-conformance.md
   - Building and linking: en/02-build-and-link.md
@@ -27,8 +33,10 @@ nav:
       - "errno.h: Error reporting": en/standard-lib/02-errno.md
       - "float.h: Floating-point limits": en/standard-lib/03-float.md
       - "limits.h: Integer limits": en/standard-lib/04-limits.md
+      - "locale.h: Localization": en/standard-lib/17-locale.md
       - "math.h: Floating point math": en/standard-lib/08-math.md
       - "setjmp.h: Non-local jumps": en/standard-lib/09-setjmp.md
+      - "signal.h: Signal handling": en/standard-lib/16-signal.md
       - "stdarg.h: Variadic arguments": en/standard-lib/10-stdarg.md
       - "stdbool.h: Boolean type": en/standard-lib/11-stdbool.md
       - "stddef.h: Common definitions": en/standard-lib/12-stddef.md
@@ -36,6 +44,7 @@ nav:
       - "stdio.h: Console and file I/O": en/standard-lib/05-stdio.md
       - "stdlib.h: Memory and utilities": en/standard-lib/06-stdlib.md
       - "string.h: String handling": en/standard-lib/14-string.md
+      - "time.h: Date and time": en/standard-lib/15-time.md
       - System and CP/M services: en/10-system-and-cpm.md
   - Limitations: en/11-limitations.md
   - Worked examples: en/12-examples.md
@@ -44,7 +53,6 @@ nav:
       - Runtime optimization: en/appendix/01-dccrtlstrip.md
       - Runtime function sizes: en/appendix/02-runtime-sizes.md
       - Utilities: en/appendix/03-utilities.md
-      - Package testing: en/appendix/04-package-testing.md
       - Building project docs: en/appendix/05-building-project-docs.md
 
 plugins:

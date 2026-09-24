@@ -1,13 +1,20 @@
-/* peep_pass_loops.c - loop-scoped registerization passes.
+/**
+ * @file peep_pass_loops.c
+ * @brief Promotes proven loop variables and bounds into registers.
  *
- * These passes promote proven byte/word loop variables into BC, C, E, or
- * IYL. Register-specific rewrites remain separate; only their exact shared
- * proof helpers live in this module.
+ * @par Role
+ * Matches exact byte and word loop shapes, proves slot, escape, call, and
+ * register-ownership safety, then promotes counters or bounds into BC, C, or
+ * E for the loop's live interval.
+ *
+ * @par Key entry points
+ * The pass_*_to_reg_*() loop passes declared in dccpeep_internal.h.
+ *
+ * @par Boundary
+ * This is pattern-specific loop registerization, not general frame allocation.
+ * dccpeep.c owns pass order.
  */
 #include "dccpeep_internal.h"
-
-static int loop_body_escapes_safe_for_offset(int lo, int hi,
-                                             const char *pat_ix);
 
 enum CounterZeroExtendUse {
     COUNTER_USE_NONE,
@@ -15,22 +22,6 @@ enum CounterZeroExtendUse {
     COUNTER_USE_HL
 };
 
-static int find_straight_line_loop_back(int body_start, const char *label)
-{
-    int k;
-    char target[128];
-
-    for (k = body_start; k < nlines; ++k) {
-        if (starts_label(lines[k]))
-            break;
-        if (is_uncond_jp(lines[k])) {
-            if (jump_target(lines[k], target) && strcmp(target, label) == 0)
-                return k;
-            break;
-        }
-    }
-    return -1;
-}
 
 static enum CounterZeroExtendUse match_counter_zero_extend(
     int line, const char *load_de, const char *load_hl)
@@ -42,127 +33,160 @@ static enum CounterZeroExtendUse match_counter_zero_extend(
     return COUNTER_USE_NONE;
 }
 
-static int line_uses_iy_half_register(int line)
+static int regional_word_slot_address_taken(int func_start, int func_end,
+                                             int off)
 {
-    return strncmp(lines[line], "db 0FDh,", 8) == 0;
+    int j;
+    char pat_addr_l[32], pat_addr_h[32];
+
+    sprintf(pat_addr_l, "ld de,%d", off);
+    sprintf(pat_addr_h, "ld de,%d", off + 1);
+    for (j = func_start; j + 3 < func_end; ++j) {
+        char t0[MAX_LINE], t1[MAX_LINE], t2[MAX_LINE], t3[MAX_LINE];
+        int addr_off, k;
+
+        strip_peep_comment_lower_copy(t0, lines[j]);
+        strip_peep_comment_lower_copy(t1, lines[j + 1]);
+        if (strcmp(t0, "push ix") != 0 || strcmp(t1, "pop hl") != 0)
+            continue;
+
+        addr_off = 0;
+        for (k = j + 2; k < func_end; ++k) {
+            strip_peep_comment_lower_copy(t2, lines[k]);
+            if (strcmp(t2, "inc hl") == 0)
+                ++addr_off;
+            else if (strcmp(t2, "dec hl") == 0)
+                --addr_off;
+            else
+                break;
+            if (addr_off == off || addr_off == off + 1)
+                return 1;
+        }
+
+        strip_peep_comment_lower_copy(t2, lines[j + 2]);
+        strip_peep_comment_lower_copy(t3, lines[j + 3]);
+        if (strcmp(t3, "add hl,de") == 0 &&
+            (!strcmp(t2, pat_addr_l) || !strcmp(t2, pat_addr_h)))
+            return 1;
+    }
+    return 0;
 }
 
-/* Recognizes a byte-sized ix-local used purely as a self-guarding
- * decrementing loop counter - dcc_array_narrow.c's `while(--n)` idiom,
- * once narrowing has made the counter's own storage a single byte (see
- * try_narrow_register_scalar in dcc_func.c) - and promotes it to register
- * C for the loop's duration, eliminating the ix-frame reload on every use.
- *
- * Matches:
- *   LABEL:
- *   dec (ix+O)
- *   jp z, EXIT
- *   <body, ending in a bare "jp LABEL">
- * where every reference to (ix+O) inside the body is one of exactly two
- * whitelisted "zero-extend into a 16-bit register pair" shapes -
- *   ld e,(ix+O)        ld l,(ix+O)
- *   ld d,0              ld h,0
- * - and every call inside the body is to __mods or __divs specifically:
- * runtime helpers documented (see DCCRTL.MAC) to preserve BC across the
- * call, so C can stand in for the whole loop with no spill/reload at all.
- *
- * Declines (the safe default, missing the optimization but never
- * misapplying it) if any other reference to the counter's slot, any other
- * call, or any other label appears in the body - this pass does not try
- * to reason about what such a reference might mean. */
-int pass_byte_loop_counter_to_reg_c(void)
+/* Keep a word local in BC for one structurally simple loop.  Unlike the
+ * whole-function pass below, this permits the known BC-preserving
+ * __udivmod helper and unrelated BC use outside the loop. */
+int pass_regional_word_loop_var_to_reg_bc(void)
 {
-    int i;
-    int changed;
-    int off;
-    char label[128];
-    char target[128];
-    int loop_end;
-    int k;
-    int ok;
-    char pat_ix[40];
-    char pat_lde[40];
-    char pat_lhl[40];
-    char prime[40];
-    char writeback[40];
+    int i, j, changed = 0;
 
-    changed = 0;
+    for (i = 0; i + 3 < nlines; ++i) {
+        int off, label_line = -1, backedge = -1, func_start, func_end;
+        int bad = 0, saw_udivmod = 0;
+        char t[MAX_LINE], label[128];
+        char pat_l[32], pat_h[32], pat_e[32], pat_d[32];
+        char pat_stl[32], pat_sth[32], pat_al[32], pat_ah[32];
+        char off_l[32], off_h[32];
 
-    for (i = 0; i + 2 < nlines; ++i) {
-        if (!starts_label(lines[i]))
+        strip_peep_comment_lower_copy(t, lines[i]);
+        if (strncmp(t, "ld (ix", 6) || sscanf(t + 6, "%d),l", &off) != 1 || off >= 0)
             continue;
-        if (!peep_parse_dec_ix_byte(lines[i + 1], &off))
-            continue;
-        if (!parse_jp_cond_label(lines[i + 2], "z", target))
+        sprintf(pat_sth, "ld (ix%d),h", off + 1);
+        if (!eq(i + 1, pat_sth))
             continue;
 
-        strcpy(label, lines[i]);
-        strip_label_colon(label);
-
-        /* Find the matching loop-back jump to this same label, with no
-         * other label in between (single-entry, single-exit body). */
-        loop_end = find_straight_line_loop_back(i + 3, label);
-        if (loop_end < 0)
-            continue;
-
-        sprintf(pat_ix, "(ix%+d)", off);
-        sprintf(pat_lde, "ld e,(ix%+d)", off);
-        sprintf(pat_lhl, "ld l,(ix%+d)", off);
-
-        ok = 1;
-        for (k = i + 3; k < loop_end && ok; ++k) {
-            if (strncmp(lines[k], "call ", 5) == 0) {
-                if (!eq(k, "call __mods") && !eq(k, "call __divs"))
-                    ok = 0;
-                continue;
+        /* Permit only a short, straight-line gap between priming and top. */
+        for (j = i + 2; j <= i + 8 && j < nlines; ++j) {
+            if (starts_label(lines[j])) {
+                label_line = j;
+                break;
             }
-            if (strstr(lines[k], pat_ix) == NULL)
-                continue;
-            if (match_counter_zero_extend(k, pat_lde, pat_lhl) != COUNTER_USE_NONE) {
-                ++k;
-                continue;
+            if (line_touches_bc(lines[j])) {
+                bad = 1;
+                break;
             }
-            ok = 0;
         }
-        if (!ok)
+        if (bad || label_line < 0 || !label_name_at(label_line, label))
             continue;
 
-        /* This loop's own body never mentions B/C outside the whitelisted
-         * shapes above, but that alone doesn't prove BC is actually free
-         * here - dcc's own reg_alloc may already hold a whole-function or
-         * earlier-loop candidate resident in BC across this exact point,
-         * invisible to a scan confined to [i+3, loop_end) alone. The
-         * counter this pass puts in C is live only for the loop, so the
-         * span to ask about is exactly [i, loop_end) - a claim dcc has
-         * already released before the loop no longer blocks it. */
-        if (bc_regalloc_claimed_in_range(i, loop_end))
+        find_function_bounds_any(i, &func_start, &func_end);
+        for (j = label_line + 1; j < func_end; ++j) {
+            char target[128];
+            if (jump_target_any(lines[j], target) && !strcmp(target, label))
+                backedge = j;
+        }
+        if (backedge < 0)
+            continue;
+        for (j = label_line + 1; j < backedge; ++j)
+            if (starts_label(lines[j])) {
+                bad = 1;
+                break;
+            }
+        if (bad || regional_word_slot_address_taken(func_start, func_end, off))
             continue;
 
-        /* In-place replacements first, while every index computed above is
-         * still valid (no lines inserted/deleted yet). */
-        replace1_tagged(i + 1, "dec c", "byte_loop_counter_to_reg_c");
-        for (k = i + 3; k < loop_end; ++k) {
-            if (eq(k, pat_lde)) { replace1(k, "ld e,c"); continue; }
-            if (eq(k, pat_lhl)) { replace1(k, "ld l,c"); continue; }
+        sprintf(pat_l, "ld l,(ix%d)", off);
+        sprintf(pat_h, "ld h,(ix%d)", off + 1);
+        sprintf(pat_e, "ld e,(ix%d)", off);
+        sprintf(pat_d, "ld d,(ix%d)", off + 1);
+        sprintf(pat_stl, "ld (ix%d),l", off);
+        sprintf(pat_al, "ld a,(ix%d)", off);
+        sprintf(pat_ah, "ld a,(ix%d)", off + 1);
+        sprintf(off_l, "(ix%d)", off);
+        sprintf(off_h, "(ix%d)", off + 1);
+
+        /* Every slot access must be understood, and the value must die at
+         * the back-edge.  Calls are rejected except for the runtime helper
+         * whose documented ABI saves and restores BC. */
+        for (j = func_start; j < func_end; ++j) {
+            strip_peep_comment_lower_copy(t, lines[j]);
+            if (j > backedge && (strstr(t, off_l) || strstr(t, off_h))) {
+                bad = 1;
+                break;
+            }
+            if (strstr(t, off_l) || strstr(t, off_h)) {
+                if (strcmp(t, pat_l) && strcmp(t, pat_h) &&
+                    strcmp(t, pat_e) && strcmp(t, pat_d) &&
+                    strcmp(t, pat_stl) && strcmp(t, pat_sth) &&
+                    strcmp(t, pat_al) && strcmp(t, pat_ah)) {
+                    bad = 1;
+                    break;
+                }
+            }
+            if (j >= label_line && j <= backedge) {
+                if (!strcmp(t, "call __udivmod"))
+                    saw_udivmod = 1;
+                if (!strncmp(t, "call ", 5) && strcmp(t, "call __udivmod")) {
+                    bad = 1;
+                    break;
+                }
+                if (line_touches_bc(t)) {
+                    bad = 1;
+                    break;
+                }
+            }
         }
+        /* This regional form exists specifically to cross a call that the
+         * whole-function pass cannot cross.  Without that payoff, leave
+         * call-free loops to the older, more conservative pass. */
+        if (bad || !saw_udivmod)
+            continue;
 
-        /* Write the counter back to its frame slot right after the
-         * decrement (LD does not touch flags, so the Z flag "dec c" just
-         * set is still valid two lines later at the exit branch) - makes
-         * the transform safe regardless of whether anything after the
-         * loop still reads the slot, without needing to prove it doesn't. */
-        sprintf(writeback, "ld (ix%+d),c", off);
-        insert_line(i + 2, writeback);
-
-        /* Prime the register right before the loop label. */
-        sprintf(prime, "ld c,(ix%+d)", off);
-        insert_line_tagged(i, prime, "byte_loop_counter_to_reg_c");
-
+        for (j = i; j <= backedge; ++j) {
+            strip_peep_comment_lower_copy(t, lines[j]);
+            if (!strcmp(t, pat_l)) replace1_tagged(j, "ld l,c", "regional_word_loop_var_bc");
+            else if (!strcmp(t, pat_h)) replace1_tagged(j, "ld h,b", "regional_word_loop_var_bc");
+            else if (!strcmp(t, pat_e)) replace1_tagged(j, "ld e,c", "regional_word_loop_var_bc");
+            else if (!strcmp(t, pat_d)) replace1_tagged(j, "ld d,b", "regional_word_loop_var_bc");
+            else if (!strcmp(t, pat_stl)) replace1_tagged(j, "ld c,l", "regional_word_loop_var_bc");
+            else if (!strcmp(t, pat_sth)) replace1_tagged(j, "ld b,h", "regional_word_loop_var_bc");
+            else if (!strcmp(t, pat_al)) replace1_tagged(j, "ld a,c", "regional_word_loop_var_bc");
+            else if (!strcmp(t, pat_ah)) replace1_tagged(j, "ld a,b", "regional_word_loop_var_bc");
+        }
         changed = 1;
     }
-
     return changed;
 }
+
 
 /*
  * pass_word_loop_var_to_reg_bc:
@@ -461,6 +485,7 @@ int pass_narrow_bc_loop_bound_to_reg_c(void)
 {
     int i, k;
     int changed;
+    int byte_counter;
     char label[128];
     int label_line;
     int loop_end;
@@ -470,13 +495,15 @@ int pass_narrow_bc_loop_bound_to_reg_c(void)
     changed = 0;
 
     for (i = 0; i + 10 < nlines; ++i) {
-        if (!eq(i, "ld c,l") || !eq(i + 1, "ld b,h"))
+        if (!eq(i, "ld c,l"))
             continue;
-        if (!starts_label(lines[i + 2]))
+        byte_counter = starts_label(lines[i + 1]);
+        if (!byte_counter &&
+            (!eq(i + 1, "ld b,h") || !starts_label(lines[i + 2])))
             continue;
-        if (!label_name_at(i + 2, label))
+        label_line = i + (byte_counter ? 1 : 2);
+        if (!label_name_at(label_line, label))
             continue;
-        label_line = i + 2;
 
         /* The init value must be exactly the constant 0 - "ld hl,0"
          * shortly before this priming, skipping only intervening,
@@ -508,7 +535,9 @@ int pass_narrow_bc_loop_bound_to_reg_c(void)
          * byte-range constant bound. The swapped ex-de,hl variant needs
          * different arithmetic entirely and is not handled here (see
          * pass_signed_cmp_const_bias_fold_mir's own comment). */
-        if (!eq(label_line + 1, "ld l,c") || !eq(label_line + 2, "ld h,b"))
+        if (!eq(label_line + 1, "ld l,c") ||
+            !eq(label_line + 2,
+                byte_counter ? "ld h,0" : "ld h,b"))
             continue;
         if (!peep_parse_ld_de_signed(lines[label_line + 3], &imm))
             continue;
@@ -539,7 +568,9 @@ int pass_narrow_bc_loop_bound_to_reg_c(void)
          * exactly as pass_word_loop_var_to_reg_bc left it. */
         increment_found = 0;
         for (k = label_line + 9; k + 2 <= loop_end; ++k) {
-            if (eq(k, "ld l,c") && eq(k + 1, "ld h,b") && eq(k + 2, "inc hl")) {
+            if (eq(k, "ld l,c") &&
+                eq(k + 1, byte_counter ? "ld h,0" : "ld h,b") &&
+                eq(k + 2, "inc hl")) {
                 increment_found = 1;
                 break;
             }
@@ -708,8 +739,24 @@ int pass_byte_loop_var_to_reg_c(void)
         if (bad)
             continue;
 
+        for (j = backedge_line + 1; j < func_end; ++j) {
+            char t[MAX_LINE];
+            char off_txt[32];
+
+            strip_peep_comment_lower_copy(t, lines[j]);
+            sprintf(off_txt, "(ix%d)", off);
+            if (strstr(t, off_txt) != NULL) {
+                if (strncmp(t, "ld (ix", 6) != 0) {
+                    bad = 1;
+                    break;
+                }
+            }
+        }
+        if (bad)
+            continue;
+
         bc_used_elsewhere = 0;
-        for (j = func_start; j < func_end; j++) {
+        for (j = func_start; j <= backedge_line; j++) {
             if (line_clobbers_bc(lines[j])) {
                 bc_used_elsewhere = 1;
                 break;
@@ -718,7 +765,7 @@ int pass_byte_loop_var_to_reg_c(void)
         if (bc_used_elsewhere)
             continue;
 
-        for (j = func_start; j < func_end; j++) {
+        for (j = func_start; j <= backedge_line; j++) {
             char t[MAX_LINE];
 
             strip_peep_comment_lower_copy(t, lines[j]);
@@ -901,581 +948,4 @@ int pass_byte_for_counter_to_reg_c(void)
     }
 
     return changed;
-}
-
-/*
- * pass_byte_for_counter_to_reg_e:
- *
- * Like pass_byte_for_counter_to_reg_c above, but targets register E
- * instead of C - for when C/BC is already claimed by something else in
- * the same loop (most commonly pass_hoist_index_ptr_to_bc's pointer,
- * which is exactly why this exists: tests/tbig.c's fill_record/
- * check_record hoist their pointer into BC, which then blocks the C
- * version of this pass outright). D/E are free in the same situation,
- * since the whole family of these passes centers on a "zero-extend the
- * counter into a 16-bit pair" shape that never involves B/C on its own.
- * This matches z88dk's own zsdcc output for this exact loop shape: it
- * keeps the counter in E for the whole loop and never touches the frame
- * slot at all until (if ever) it's needed after the loop.
- *
- * One meaningful difference from the C version: since E is the SAME
- * register the zero-extend shape already loads the counter into, "ld
- * e,(ix+O)" is not just safe to redirect - once e IS the counter, that
- * load is entirely redundant and is deleted rather than rewritten (one
- * fewer instruction per occurrence than the C version manages).
- *
- * Same restrictions as pass_byte_for_counter_to_reg_c: single-entry,
- * straight-line body (no internal label - this pass has not been proven
- * safe with one the way pass_hoist_index_ptr_to_bc was), every reference
- * to the counter's slot is one of the three whitelisted shapes, and every
- * call is __mods/__divs.
- */
-int pass_byte_for_counter_to_reg_e(void)
-{
-    int i;
-    int changed;
-    int off;
-    int low_val;
-    int high_val;
-    char label[128];
-    int loop_end;
-    int k;
-    int ok;
-    char pat_ix[40];
-    char pat_lde[40];
-    char pat_lhl[40];
-    char pat_adda[40];
-    char prime[16];
-    char writeback[40];
-    char exp_lda[40];
-
-    changed = 0;
-
-    for (i = 1; i + 1 < nlines; ++i) {
-        int init_line;
-        int scan_limit;
-
-        if (!starts_label(lines[i]))
-            continue;
-
-        /* The counter's own init store is usually right before the label,
-         * but pass_hoist_index_ptr_to_bc may have inserted its own
-         * pointer-prime lines in between (it runs earlier in the fixed-
-         * point pass list) - scan backward a bounded distance to find it,
-         * stopping at the first label (a different construct entirely). */
-        init_line = -1;
-        scan_limit = i - 8;
-        if (scan_limit < 0) scan_limit = 0;
-        for (k = i - 1; k >= scan_limit; --k) {
-            if (starts_label(lines[k]))
-                break;
-            if (peep_parse_ld_ix_byte_imm(lines[k], &off, &low_val)) {
-                init_line = k;
-                break;
-            }
-        }
-        if (init_line < 0)
-            continue;
-
-        strcpy(label, lines[i]);
-        strip_label_colon(label);
-
-        /* Find the loop's own closing branch - the LAST line in the
-         * function that jumps back to the label (see
-         * pass_hoist_index_ptr_to_bc's own history for why "last", not
-         * "first"). An internal label (an if/early-return inside the loop
-         * body, e.g. tests/tbig.c's check_record) is fine PROVIDED
-         * loop_body_internal_labels_safe proves it's purely an intra-loop
-         * merge point, and loop_body_escapes_safe_for_offset proves every
-         * early-exit path out of the loop never reads the counter's frame
-         * slot before reaching the function's own epilogue - the register
-         * holds the authoritative value for the whole loop, and unlike
-         * pass_hoist_index_ptr_to_bc (which never writes the frame slot at
-         * all, so any read of it anywhere is always correct), this pass's
-         * write-back only runs once, at the loop's own NORMAL exit, never
-         * on an early-exit path. */
-        loop_end = find_last_loop_back(i + 1, label, 0);
-        if (loop_end < i + 4)
-            continue;
-        if (!loop_body_internal_labels_safe(i + 1, loop_end))
-            continue;
-
-        {
-            int inc_off;
-            if (!peep_parse_inc_ix_byte(lines[loop_end - 3], &inc_off) || inc_off != off)
-                continue;
-        }
-        sprintf(exp_lda, "ld a,(ix%+d)", off);
-        if (!eq(loop_end - 2, exp_lda))
-            continue;
-        if (!peep_parse_cp_const(lines[loop_end - 1], &high_val))
-            continue;
-        if (low_val < 0 || low_val > 255 || high_val < 0 || high_val > 255)
-            continue;
-
-        sprintf(pat_ix, "(ix%+d)", off);
-        if (!loop_body_escapes_safe_for_offset(i + 1, loop_end, pat_ix))
-            continue;
-        /* Anything skipped between the init line and the label must not
-         * itself reference our counter's offset - it should only be an
-         * unrelated pass's own prime lines for some other variable. */
-        {
-            int bad_gap = 0;
-            for (k = init_line + 1; k < i; ++k) {
-                if (strstr(lines[k], pat_ix) != NULL) { bad_gap = 1; break; }
-            }
-            if (bad_gap)
-                continue;
-        }
-        sprintf(pat_lde, "ld e,(ix%+d)", off);
-        sprintf(pat_lhl, "ld l,(ix%+d)", off);
-        sprintf(pat_adda, "add a,(ix%+d)", off);
-
-        ok = 1;
-        for (k = i + 1; k < loop_end - 3 && ok; ++k) {
-            if (strncmp(lines[k], "call ", 5) == 0) {
-                if (!eq(k, "call __mods") && !eq(k, "call __divs")) { ok = 0; break; }
-                continue;
-            }
-            if (match_counter_zero_extend(k, pat_lde, pat_lhl) == COUNTER_USE_DE) {
-                /* The zero-extend is almost always immediately consumed by
-                 * "add hl,de" (the address computation this whole family of
-                 * passes exists to speed up) - that's the expected, safe
-                 * use of the value just zero-extended into d/e, not some
-                 * other conflicting use of the pair. */
-                ++k;
-                if (eq(k + 1, "add hl,de"))
-                    ++k;
-                continue;
-            }
-            if (match_counter_zero_extend(k, pat_lde, pat_lhl) == COUNTER_USE_HL) {
-                ++k;
-                continue;
-            }
-            if (eq(k, pat_adda)) continue;
-            if (strstr(lines[k], pat_ix) != NULL) { ok = 0; break; }
-            /* D/E must be free for the whole loop body except the exact
-             * shapes above - the same guard pass_hoist_index_ptr_to_bc
-             * uses for B/C, parameterized for D/E instead. */
-            if (line_touches_de(lines[k])) { ok = 0; break; }
-        }
-        if (!ok)
-            continue;
-
-        /* Transform back-to-front: the "ld e,(ix+O)" deletion shifts every
-         * later line up by one, so process from the end of the range
-         * backward, exactly like pass_ix_frame_ptr_load_deadd's own
-         * delete+insert combo - each deletion then only affects indices
-         * already handled, never ones still to be checked. */
-        for (k = loop_end - 4; k >= i + 1; --k) {
-            if (eq(k, pat_lhl)) { replace1(k, "ld l,e"); continue; }
-            if (eq(k, pat_adda)) { replace1(k, "add a,e"); continue; }
-            if (eq(k, pat_lde) && eq(k + 1, "ld d,0")) {
-                delete_n(k, 1);
-                loop_end--;
-                continue;
-            }
-        }
-        replace1_tagged(loop_end - 3, "inc e", "byte_for_counter_to_reg_e");
-        replace1(loop_end - 2, "ld a,e");
-
-        /* Write the counter back to its frame slot once, right after the
-         * loop exits, same rationale as pass_byte_for_counter_to_reg_c. */
-        sprintf(writeback, "ld (ix%+d),e", off);
-        insert_line(loop_end + 1, writeback);
-
-        /* Prime the register in place of the old init store. */
-        sprintf(prime, "ld e,%d", low_val);
-        replace1_tagged(init_line, prime, "byte_for_counter_to_reg_e");
-
-        changed = 1;
-    }
-
-    return changed;
-}
-
-/*
- * IYL counterpart of pass_byte_loop_counter_to_reg_c: the identical self-
- * guarding decrementing-loop-counter shape (see that pass's comment), but
- * promoted into IY's low byte via undocumented FD-prefixed opcodes instead
- * of register C, since M80 (and m80c) don't recognize the "iyl"/"iyh"
- * mnemonic spellings directly: each use site emits the raw opcode bytes as
- * "db 0FDh,xx" instead (DEC IYL=2Dh, LD A,IYL=7Dh, LD IYL,A=6Fh, LD E,IYL=
- * 5Dh, INC IYL=2Ch). These used to be M80 MACRO/ENDM definitions invoked by
- * name (IYDECL/IYLDA/IYSTA/IYLDE), but m80c - the native assembler that
- * later became the default toolchain - never implemented MACRO/ENDM, so
- * that indirection was replaced with the equivalent literal bytes at each
- * site; the nested-loop collision check below now recognizes the "db
- * 0FDh," prefix instead of an "IY" name prefix.
- *
- * Because ordinary runtime calls preserve IY (see scan_local_func_labels
- * above), this pass allows ANY call inside the loop body, not just
- * __mods/__divs, except one that is_local_func_label flags as another
- * function in this same file - declined exactly like
- * pass_byte_loop_counter_to_reg_c declines a call that isn't __mods/__divs.
- *
- * "ld l,(ix+off)" can't become a single "ld l,iyl": the FD prefix redirects
- * EVERY H/L reference in an instruction, so "ld l,iyl" would actually
- * encode "ld iyl,iyl" - there is no single-instruction undocumented form
- * that reads IYL into the real L register (E, unaffected by the H/L
- * substitution rule, has no such problem - "ld e,iyl" is a clean single
- * instruction). That whitelisted shape expands to two lines (the LD A,IYL
- * byte sequence, then "ld l,a") instead of a single-line replacement.
- */
-int pass_byte_loop_counter_to_reg_iyl(void)
-{
-    int i;
-    int changed;
-    int off;
-    char label[128];
-    char target[128];
-    int loop_end;
-    int k;
-    int ok;
-    int needs_iyl;
-    char pat_ix[40];
-    char pat_lde[40];
-    char pat_lhl[40];
-    char prime[40];
-    char writeback[40];
-    char callee[128];
-    const char *p;
-
-    changed = 0;
-
-    for (i = 0; i + 2 < nlines; ++i) {
-        if (!starts_label(lines[i]))
-            continue;
-        if (!peep_parse_dec_ix_byte(lines[i + 1], &off))
-            continue;
-        if (!parse_jp_cond_label(lines[i + 2], "z", target))
-            continue;
-
-        strcpy(label, lines[i]);
-        strip_label_colon(label);
-
-        /* Find the matching loop-back jump to this same label, with no
-         * other label in between (single-entry, single-exit body). */
-        loop_end = find_straight_line_loop_back(i + 3, label);
-        if (loop_end < 0)
-            continue;
-
-        sprintf(pat_ix, "(ix%+d)", off);
-        sprintf(pat_lde, "ld e,(ix%+d)", off);
-        sprintf(pat_lhl, "ld l,(ix%+d)", off);
-
-        ok = 1;
-        needs_iyl = 0;
-        for (k = i + 3; k < loop_end && ok; ++k) {
-            /* IY is a single register: a NESTED loop (this candidate's body
-             * contains another loop already promoted to IYL by an earlier
-             * match in this same scan - inner loops are found first, since
-             * their tail text appears before an enclosing loop's own tail)
-             * would silently clobber it. Decline outright - a real bug
-             * here corrupted mm.c's matrix multiply (all three nested
-             * i/j/k counters tried to claim IYL at once) before this check
-             * existed. Detected by the literal "db 0FDh," prefix every
-             * IYDECL/IYLDA/IYSTA/IYLDE/IYINCL emission site below produces
-             * (was a "IY" prefix check back when these were M80 macro
-             * invocations by name; m80c has no MACRO/ENDM support at all,
-             * so they're emitted as raw opcode bytes directly now). */
-            if (line_uses_iy_half_register(k)) {
-                ok = 0;
-                continue;
-            }
-            if (strncmp(lines[k], "call ", 5) == 0) {
-                strip_peep_comment_copy(callee, lines[k]);
-                p = callee + 5;
-                while (*p == ' ' || *p == '\t')
-                    p++;
-                if (is_local_func_label(p))
-                    ok = 0;
-                else if (strcmp(p, "__mods") != 0 && strcmp(p, "__divs") != 0)
-                    needs_iyl = 1;
-                continue;
-            }
-            if (strstr(lines[k], pat_ix) == NULL)
-                continue;
-            if (match_counter_zero_extend(k, pat_lde, pat_lhl) != COUNTER_USE_NONE) {
-                ++k;
-                continue;
-            }
-            ok = 0;
-        }
-        /* If every call in the body is __mods/__divs (or there are none),
-         * pass_byte_loop_counter_to_reg_c's own whitelist already covers
-         * this loop - defer to it rather than racing it for the same
-         * pattern. Whichever of the two runs first within a given
-         * fixed-point pass depends on how many other passes' preconditions
-         * this exact loop still needs to satisfy first, which is NOT the
-         * same thing as their static order in the pass list; a real
-         * regression on e.c (whose loop is fully __mods/__divs-eligible)
-         * showed IYL winning that race after an unrelated pass reordering,
-         * which is strictly worse than register C here (no FD-prefix tax,
-         * and no forced two-line expansion for the "ld l,(ix+off)" shape).
-         * IYL should only ever be used for what C structurally cannot
-         * handle at all. */
-        if (!needs_iyl)
-            ok = 0;
-        if (!ok)
-            continue;
-
-        /* In-place replacements first, while every index computed above is
-         * still valid. The "ld l,(ix+off)" shape is the one exception -
-         * expanding to two lines shifts everything after it, so loop_end
-         * and k are bumped in lockstep right there. */
-        replace1_tagged(i + 1, "db 0FDh,02Dh", "byte_loop_counter_to_reg_iyl");
-        for (k = i + 3; k < loop_end; ++k) {
-            if (eq(k, pat_lde)) {
-                replace1_tagged(k, "db 0FDh,05Dh", "byte_loop_counter_to_reg_iyl");
-                continue;
-            }
-            if (eq(k, pat_lhl)) {
-                replace1_tagged(k, "db 0FDh,07Dh", "byte_loop_counter_to_reg_iyl");
-                insert_line(k + 1, "ld l,a");
-                loop_end++;
-                ++k;
-                continue;
-            }
-        }
-
-        /* Write the counter back to its frame slot right after the
-         * decrement, same rationale as pass_byte_loop_counter_to_reg_c
-         * (safe regardless of whether anything after the loop still reads
-         * the slot). IYLDA/writeback don't touch flags, so the Z flag
-         * IYDECL just set is still valid at the exit branch. */
-        insert_line_tagged(i + 2, "db 0FDh,07Dh", "byte_loop_counter_to_reg_iyl");
-        sprintf(writeback, "ld (ix%+d),a", off);
-        insert_line(i + 3, writeback);
-
-        /* Prime the register right before the loop label. */
-        sprintf(prime, "ld a,(ix%+d)", off);
-        insert_line(i, prime);
-        insert_line_tagged(i + 1, "db 0FDh,06Fh", "byte_loop_counter_to_reg_iyl");
-
-        changed = 1;
-    }
-
-    return changed;
-}
-
-/*
- * Increasing-loop counterpart of pass_byte_loop_counter_to_reg_iyl: dcc's
- * codegen for a byte-narrowed `for (i = 0; i < K; i++) BODY` (see
- * dcc_array_narrow.c's narrow_cond_upper_bounds_lt) tests at the BOTTOM of
- * the loop rather than the top:
- *
- *   LOOP:
- *     <body>
- *     inc (ix+off)
- *     ld a,(ix+off)
- *     cp K
- *     jp c, LOOP
- *
- * Same IYL promotion and same call-safety rule (scan_local_func_labels/
- * is_local_func_label) as pass_byte_loop_counter_to_reg_iyl. The writeback
- * is nearly free here: IYLDA already has to reload the fresh value into A
- * for the "cp K" comparison, so one more "ld (ix+off),a" covers every
- * iteration's writeback at essentially no extra cost - unlike the
- * decrementing pass (and unlike the "ld l,(ix+off)" shape below, which
- * still needs its own dedicated two-line expansion for the same H/L-
- * substitution reason documented there).
- */
-int pass_byte_incr_loop_counter_to_reg_iyl(void)
-{
-    int i;
-    int changed;
-    int off;
-    int bound;
-    char label[128];
-    char tmp[128];
-    int loop_start;
-    int k;
-    int ok;
-    char pat_ix[40];
-    char pat_lde[40];
-    char pat_lhl[40];
-    char pat_lda[40];
-    char callee[128];
-    const char *p;
-
-    changed = 0;
-
-    for (i = 0; i + 3 < nlines; ++i) {
-        if (!peep_parse_inc_ix_byte(lines[i], &off))
-            continue;
-        sprintf(pat_lda, "ld a,(ix%+d)", off);
-        if (!eq(i + 1, pat_lda))
-            continue;
-        if (!peep_parse_cp_const(lines[i + 2], &bound))
-            continue;
-        if (!parse_jp_cond_label(lines[i + 3], "c", label))
-            continue;
-
-        /* Find the loop's own start label (the jp c,LABEL target),
-         * searching backward - it must precede this tail. */
-        loop_start = -1;
-        for (k = i; k >= 0; --k) {
-            if (!starts_label(lines[k]))
-                continue;
-            strcpy(tmp, lines[k]);
-            {
-                int n = (int)strlen(tmp);
-                if (n > 0 && tmp[n - 1] == ':')
-                    tmp[n - 1] = 0;
-            }
-            if (!strcmp(tmp, label)) {
-                loop_start = k;
-                break;
-            }
-        }
-        if (loop_start < 0)
-            continue;
-
-        sprintf(pat_ix, "(ix%+d)", off);
-        sprintf(pat_lde, "ld e,(ix%+d)", off);
-        sprintf(pat_lhl, "ld l,(ix%+d)", off);
-
-        ok = 1;
-        for (k = loop_start + 1; k < i && ok; ++k) {
-            /* IY is a single register: a NESTED loop already promoted to
-             * IYL by an earlier match in this same scan would silently
-             * clobber it - see pass_byte_loop_counter_to_reg_iyl's comment
-             * on the exact bug this caused in mm.c before this check
-             * existed (i/j/k all tried to claim IYL simultaneously), and on
-             * why this checks for the literal "db 0FDh," prefix rather than
-             * an "IY" macro-name prefix. */
-            if (line_uses_iy_half_register(k)) {
-                ok = 0;
-                continue;
-            }
-            if (strncmp(lines[k], "call ", 5) == 0) {
-                strip_peep_comment_copy(callee, lines[k]);
-                p = callee + 5;
-                while (*p == ' ' || *p == '\t')
-                    p++;
-                if (is_local_func_label(p))
-                    ok = 0;
-                continue;
-            }
-            if (strstr(lines[k], pat_ix) == NULL)
-                continue;
-            if (match_counter_zero_extend(k, pat_lde, pat_lhl) != COUNTER_USE_NONE) {
-                ++k;
-                continue;
-            }
-            ok = 0;
-        }
-        if (!ok)
-            continue;
-
-        /* In-place replacements first, bumping i in lockstep with the one
-         * two-line expansion (mirrors pass_byte_loop_counter_to_reg_iyl). */
-        for (k = loop_start + 1; k < i; ++k) {
-            if (eq(k, pat_lde)) {
-                replace1_tagged(k, "db 0FDh,05Dh", "byte_incr_loop_counter_to_reg_iyl");
-                continue;
-            }
-            if (eq(k, pat_lhl)) {
-                replace1_tagged(k, "db 0FDh,07Dh", "byte_incr_loop_counter_to_reg_iyl");
-                insert_line(k + 1, "ld l,a");
-                ++i;
-                ++k;
-                continue;
-            }
-        }
-
-        replace1_tagged(i, "db 0FDh,02Ch", "byte_incr_loop_counter_to_reg_iyl");
-        replace1_tagged(i + 1, "db 0FDh,07Dh", "byte_incr_loop_counter_to_reg_iyl");
-        {
-            char storeback[40];
-            sprintf(storeback, "ld (ix%+d),a", off);
-            insert_line(i + 2, storeback);
-        }
-
-        /* Prime IYL right before the loop's own start label - inserted
-         * last, since it shifts everything from loop_start onward (the
-         * body/tail edits above are already done). */
-        {
-            char primeload[40];
-            sprintf(primeload, "ld a,(ix%+d)", off);
-            insert_line(loop_start, primeload);
-            insert_line_tagged(loop_start + 1, "db 0FDh,06Fh", "byte_incr_loop_counter_to_reg_iyl");
-        }
-
-        changed = 1;
-    }
-
-    return changed;
-}
-
-
-/* Trace forward from `start` following only unconditional control flow
- * (label fall-through and unconditional jumps), for up to a bounded
- * number of hops, to see whether this path reaches the function's own
- * epilogue ("ld sp,ix") before referencing `pat_ix` anywhere. Used by a
- * counter-registerization pass to prove that an early-exit path out of
- * its loop (e.g. an `if (...) return X;` inside the loop body) never
- * reads the counter's frame slot while it's stale - the register holds
- * the authoritative value for the whole loop, and the write-back that
- * resyncs the frame slot only runs once, at the loop's own normal exit,
- * never on an early-exit path. A conditional jump (ambiguous which way
- * execution goes), a call (could do anything), or running out of hops
- * without reaching "ld sp,ix" is treated as unprovable - a decline, not a
- * misapplication. */
-static int escape_path_reaches_epilogue_safely(int start, const char *pat_ix,
-                                               int func_end)
-{
-    int pos;
-    int hops;
-    char tgt[128];
-
-    pos = start;
-    for (hops = 0; hops < 60; ++hops) {
-        if (pos < 0 || pos >= func_end)
-            return 0;
-        if (eq(pos, "ld sp,ix"))
-            return 1;
-        if (strstr(lines[pos], pat_ix) != NULL)
-            return 0;
-        if (starts_label(lines[pos])) { ++pos; continue; }
-        if (is_uncond_jp(lines[pos])) {
-            if (!jump_target(lines[pos], tgt))
-                return 0;
-            pos = find_label_line_in_range(tgt, 0, func_end);
-            continue;
-        }
-        if (strncmp(lines[pos], "call ", 5) == 0)
-            return 0;
-        if (jump_target(lines[pos], tgt))
-            return 0;  /* a conditional jump - which way is ambiguous */
-        ++pos;
-    }
-    return 0;
-}
-
-/* For every jump within [lo, hi) whose target is OUTSIDE [lo, hi) (an
- * early-exit path out of the loop), verify via
- * escape_path_reaches_epilogue_safely that it never reads `pat_ix` before
- * reaching the function's own epilogue. Returns 1 iff every such escape
- * is safe (or there are none). */
-static int loop_body_escapes_safe_for_offset(int lo, int hi, const char *pat_ix)
-{
-    int func_start, func_end;
-    int k;
-    char tgt[128];
-
-    find_function_bounds(lo, &func_start, &func_end);
-    for (k = lo; k < hi; ++k) {
-        if (!jump_target(lines[k], tgt))
-            continue;
-        {
-            int target_line = find_label_line_in_range(tgt, func_start, func_end);
-            if (target_line >= lo && target_line < hi)
-                continue;  /* jumps back into the loop's own range - fine */
-            if (!escape_path_reaches_epilogue_safely(target_line, pat_ix, func_end))
-                return 0;
-        }
-    }
-    return 1;
 }

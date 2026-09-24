@@ -1,8 +1,20 @@
-/*
- * dcc_ast_gen_support.c - ast_gen_supported dispatch, call/struct gates, const folds.
+/**
+ * @file dcc_ast_gen_support.c
+ * @brief Implements AST support gates, constant folds, and structural proofs.
  *
- * Split from dcc_ast_gen.c; part of the AST codegen module.  Shared
- * prototypes live in dcc_ast_gen_internal.h.
+ * @par Role
+ * Caches expression-shape admission, validates call/argument, pointer,
+ * aggregate, and assignment forms, folds target-width constants, and proves
+ * reusable loop/address transformations used by MIR capture and metadata
+ * planning.
+ *
+ * @par Key entry points
+ * ast_gen_supported(), ast_support_cache_begin(), ast_const_*_fold(),
+ * ast_call_*_supported(), and the ast_for_*_supported() proof helpers.
+ *
+ * @par Boundary
+ * A successful gate proves the frontend understands a shape; it does not
+ * select a production body emitter or establish profitability.
  */
 #include <string.h>
 #include <stdint.h>
@@ -59,15 +71,14 @@ int ast_expr_yields_bool01(const struct AstNode *n)
 }
 
 /* RHS acceptable for storing into a plain-int (char/int) array or pointer
- * element via assignment `n`.  A plain-int RHS always works.  A long-typed RHS
- * is also accepted for a plain `=`: the element store path evaluates the RHS to
- * DE:HL and writes only the low word (int) or low byte (char), i.e. it
- * truncates to the element width - exactly the C conversion for `int_elem =
- * long_value`.  Compound ops are left to the plain-int-only path. */
+ * element via assignment `n`.  Plain-int, long, and float RHS values all use
+ * the generic address store; it narrows long values and converts float values
+ * to the destination integer type.  Compound ops remain plain-int-only. */
 static int ast_int_elem_assign_rhs_ok(const struct AstNode *n)
 {
     return ast_value_is_plain_int(n->b) ||
-           (n->op == '=' && ast_value_is_long_word(n->b));
+           (n->op == '=' && (ast_value_is_long_word(n->b) ||
+                             ast_value_is_float_word(n->b)));
 }
 
 int ast_gen_supported(const struct AstNode *n)
@@ -362,7 +373,20 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
                                ast_value_is_long_word(n->b);
                     return 0;
                 }
+                if (type_ptr_depth(elem) > 0) {
+                    if (n->op == '=')
+                        return type_size(elem) == 2 &&
+                               ast_pointer_assign_rhs_supported(n->b);
+                    return type_size(elem) == 2 &&
+                           expr_result_dead &&
+                           (n->op == TOK_ADDEQ || n->op == TOK_SUBEQ) &&
+                           ast_gen_supported(n->b) &&
+                           ast_value_is_plain_int(n->b);
+                }
             }
+            /* The common lvalue query above already returns for every long
+             * and float element, so the shape-specific fallbacks below only
+             * need pointer and narrow-integer policies. */
             /* Deref-of-pointer-to-array subscript store `(*p)[i] = rhs` (p a
              * pointer-to-array local/param, e.g. `int (*p)[4]`).  Long and
              * float element stores are already accepted by the
@@ -379,15 +403,13 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
                     return (type_size(elem) == 1 || type_size(elem) == 2) &&
                            ast_int_elem_assign_rhs_ok(n);
             }
+            /* The general non-identifier compound tail preserves a word
+             * result in HL.  Keep byte elements dead-result-only because
+             * their stored truncation is not rebuilt for expression use. */
             if (ast_index_symbol_nd_elem_type(n->a, &elem)) {
-                if (type_is_long(elem))
-                    return (n->op == '=' || (is_compound && expr_result_dead)) &&
-                           (ast_value_is_long_word(n->b) || ast_value_is_plain_int(n->b));
-                if (type_is_float(elem))
-                    return (n->op == '=' || n->op == TOK_ADDEQ || n->op == TOK_SUBEQ ||
-                            n->op == TOK_MULEQ || n->op == TOK_DIVEQ) &&
-                           (ast_value_is_float_word(n->b) || ast_value_is_plain_int(n->b));
-                if (n->op != '=' && !(is_compound && expr_result_dead))
+                if (n->op != '=' &&
+                    !(is_compound &&
+                      (expr_result_dead || type_size(elem) == 2)))
                     return 0;
                 if (type_ptr_depth(elem) > 0)
                     return n->op == '=' && type_size(elem) == 2 &&
@@ -398,13 +420,6 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
                        ast_int_elem_assign_rhs_ok(n);
             }
             if (ast_index_pointer_expr_elem_type(n->a, &elem)) {
-                if (type_is_long(elem))
-                    return n->op == '=' &&
-                           (ast_value_is_long_word(n->b) || ast_value_is_plain_int(n->b));
-                if (type_is_float(elem))
-                    return (n->op == '=' || n->op == TOK_ADDEQ || n->op == TOK_SUBEQ ||
-                            n->op == TOK_MULEQ || n->op == TOK_DIVEQ) &&
-                           (ast_value_is_float_word(n->b) || ast_value_is_plain_int(n->b));
                 if (n->op != '=')
                     return 0;
                 if (type_ptr_depth(elem) > 0)
@@ -415,54 +430,16 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
                        ast_int_elem_assign_rhs_ok(n);
             }
             if (n->op == '=' && ast_index_addressable_addr(n->a)) {
-                if (ast_index_2d_array_elem_type(n->a, &elem)) {
-                    /* elem set by helper */
-                } else if (n->a->a != NULL && n->a->a->kind == AST_IDENT) {
-                    base = find_sym(n->a->a->sval);
-                    if (base == NULL)
-                        return 0;
-                    decayed = base->is_array ? type_add_ptr(base->type) : base->type;
-                    elem = type_decay_ptr(decayed);
-                } else {
-                    elem = 0;
-                }
-                if (type_is_long(elem))
-                    return ast_value_is_long_word(n->b) || ast_value_is_plain_int(n->b);
-                if (type_is_float(elem))
-                    return ast_value_is_float_word(n->b) || ast_value_is_plain_int(n->b);
+                base = find_sym(n->a->a->sval);
+                decayed = base->is_array ? type_add_ptr(base->type) : base->type;
+                elem = type_decay_ptr(decayed);
                 if (type_ptr_depth(elem) > 0)
                     return type_size(elem) == 2 && ast_pointer_assign_rhs_supported(n->b);
             }
-            if (is_compound && ast_index_addressable_addr(n->a)) {
-                if (ast_index_2d_array_elem_type(n->a, &elem)) {
-                    /* elem set by helper */
-                } else if (n->a->a != NULL && n->a->a->kind == AST_IDENT) {
-                    base = find_sym(n->a->a->sval);
-                    if (base == NULL)
-                        return 0;
-                    decayed = base->is_array ? type_add_ptr(base->type) : base->type;
-                    elem = type_decay_ptr(decayed);
-                } else {
-                    elem = 0;
-                }
-                if (type_is_long(elem))
-                    return expr_result_dead &&
-                           (ast_value_is_long_word(n->b) || ast_value_is_plain_int(n->b));
-                if (type_is_float(elem))
-                    return (n->op == TOK_ADDEQ || n->op == TOK_SUBEQ ||
-                            n->op == TOK_MULEQ || n->op == TOK_DIVEQ) &&
-                           expr_result_dead &&
-                           (ast_value_is_float_word(n->b) || ast_value_is_plain_int(n->b));
-            }
             if (ast_index_2d_array_elem_type(n->a, &elem)) {
-                if (type_is_long(elem))
-                    return n->op == '=' &&
-                           (ast_value_is_long_word(n->b) || ast_value_is_plain_int(n->b));
-                if (type_is_float(elem))
-                    return (n->op == '=' || n->op == TOK_ADDEQ || n->op == TOK_SUBEQ ||
-                            n->op == TOK_MULEQ || n->op == TOK_DIVEQ) &&
-                           (ast_value_is_float_word(n->b) || ast_value_is_plain_int(n->b));
-                if (n->op != '=')
+                if (n->op != '=' &&
+                    !(is_compound &&
+                      (expr_result_dead || type_size(elem) == 2)))
                     return 0;
                 if (type_ptr_depth(elem) > 0)
                     return type_size(elem) == 2 && ast_pointer_assign_rhs_supported(n->b);
@@ -471,18 +448,7 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
                 return (type_size(elem) == 1 || type_size(elem) == 2) &&
                        ast_int_elem_assign_rhs_ok(n);
             }
-            if (ast_index_pointer_array_elem_type(n->a, &elem)) {
-                if (n->op != '=')
-                    return 0;
-                return ast_pointer_assign_rhs_supported(n->b);
-            }
             if (ast_index_member_pointer_elem_type(n->a, &elem)) {
-                if (type_is_long(elem))
-                    return n->op == '=' &&
-                           (ast_value_is_long_word(n->b) || ast_value_is_plain_int(n->b));
-                if (type_is_float(elem))
-                    return n->op == '=' &&
-                           (ast_value_is_float_word(n->b) || ast_value_is_plain_int(n->b));
                 if (type_ptr_depth(elem) > 0)
                     return n->op == '=' && type_size(elem) == 2 &&
                            ast_pointer_assign_rhs_supported(n->b);
@@ -516,12 +482,8 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
                            ast_value_is_plain_int(n->b);
                 if (!ast_index_subscript_supported(n->a->b))
                     return 0;
-                if (type_is_float(elem))
-                    return ast_value_is_float_word(n->b) || ast_value_is_plain_int(n->b);
                 if (type_is_bool(elem))
                     return ast_value_is_plain_int(n->b) || ast_value_is_long_word(n->b) || ast_value_is_float_word(n->b);
-                if (type_is_long(elem))
-                    return ast_value_is_long_word(n->b) || ast_value_is_plain_int(n->b);
                 if (type_ptr_depth(elem) > 0)
                     return type_size(elem) == 2 && ast_pointer_assign_rhs_supported(n->b);
                 if (!ast_is_plain_int_type(elem))
@@ -530,51 +492,29 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
             }
             if (!ast_index_plain_int_read(n->a))
                 return 0;
-            if (n->a->a->kind == AST_IDENT) {
-                if (!ast_int_elem_assign_rhs_ok(n))
-                    return 0;
-                base = find_sym(n->a->a->sval);
-                decayed = base->is_array ? type_add_ptr(base->type) : base->type;
-                elem = type_decay_ptr(decayed);
-                /* A byte element normally requires plain `=`; also accept a
-                 * dead-result compound assign (`a[i] += k;` as its own
-                 * statement, e.g. inside a for-loop body) the same way the
-                 * N-D array and pointer-element branches above already do -
-                 * this final fallback (a plain local/global 1-D array
-                 * reached by a computed index) had no such exception, so
-                 * every byte array here declined += even though nothing
-                 * about reaching the array through this specific helper
-                 * makes that unsafe. */
-                if (type_size(elem) != 2 &&
-                    (type_size(elem) != 1 ||
-                     (n->op != '=' && !(is_compound && expr_result_dead))))
-                    return 0;
-                if (type_size(elem) == 1 && base->is_array &&
-                    (base->storage == SC_GLOBAL || base->storage == SC_EXTERN))
-                    return expr_result_dead && n->op == '=';
-            } else if (n->a->a->kind == AST_MEMBER) {
-                if (ast_member_plain_array_field_elem_type(n->a->a, &elem)) {
-                    if (!ast_value_is_plain_int(n->b))
-                        return 0;
-                    if (type_size(elem) != 2 && (n->op != '=' || type_size(elem) != 1))
-                        return 0;
-                } else {
-                    int field_type;
-                    if (!ast_member_lvalue_type(n->a->a, &field_type))
-                        return 0;
-                    if (type_ptr_depth(field_type) <= 0)
-                        return 0;
-                    elem = type_decay_ptr(field_type);
-                    if (!ast_is_plain_int_type(elem))
-                        return 0;
-                    if (type_size(elem) != 2 && (n->op != '=' || type_size(elem) != 1))
-                        return 0;
-                    if (!ast_value_is_plain_int(n->b))
-                        return 0;
-                }
-            } else {
+            if (n->a->a->kind != AST_IDENT)
                 return 0;
-            }
+            if (!ast_int_elem_assign_rhs_ok(n))
+                return 0;
+            base = find_sym(n->a->a->sval);
+            decayed = base->is_array ? type_add_ptr(base->type) : base->type;
+            elem = type_decay_ptr(decayed);
+            /* A byte element normally requires plain `=`; also accept a
+             * dead-result compound assign (`a[i] += k;` as its own
+             * statement, e.g. inside a for-loop body) the same way the
+             * N-D array and pointer-element branches above already do -
+             * this final fallback (a plain local/global 1-D array
+             * reached by a computed index) had no such exception, so
+             * every byte array here declined += even though nothing
+             * about reaching the array through this specific helper
+             * makes that unsafe. */
+            if (type_size(elem) != 2 &&
+                (type_size(elem) != 1 ||
+                 (n->op != '=' && !(is_compound && expr_result_dead))))
+                return 0;
+            if (type_size(elem) == 1 && base->is_array &&
+                (base->storage == SC_GLOBAL || base->storage == SC_EXTERN))
+                return expr_result_dead && (n->op == '=' || is_compound);
             return 1;
         }
         /* Member lvalue store: s.f = rhs / p->f OP= rhs.  Plain int fields use
@@ -582,8 +522,15 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
          * wide-value tail for the supported arithmetic compound operators. */
         if (n->a->kind == AST_MEMBER) {
             int field_type;
-            if (ast_member_bitfield_lvalue_type(n->a, &field_type))
+            if (ast_member_bitfield_lvalue_type(n->a, &field_type)) {
+                /* Plain assignment converts numeric RHS values before the
+                 * masked bitfield store, just like other integer lvalues. */
+                if (n->op == '=')
+                    return ast_value_is_plain_int(n->b) ||
+                           ast_value_is_long_word(n->b) ||
+                           ast_value_is_float_word(n->b);
                 return ast_value_is_plain_int(n->b);
+            }
             if (!ast_member_lvalue_type(n->a, &field_type))
                 return 0;
             if (type_is_long(field_type)) {
@@ -619,8 +566,19 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
                     return ast_value_is_plain_int(n->b);
                 return 0;
             }
-            if (!ast_value_is_plain_int(n->b))
-                return 0;
+            if (!ast_value_is_plain_int(n->b)) {
+                /* Plain assignment converts float values and narrows long
+                 * values to byte- and word-sized integer fields.  This is the
+                 * same defined scalar conversion already admitted for
+                 * identifier, indexed, dereferenced, and bit-field lvalues. */
+                if (!(n->op == '=' &&
+                      (type_size(field_type) == 1 ||
+                       type_size(field_type) == 2) &&
+                      (ast_value_is_long_word(n->b) ||
+                       ast_value_is_float_word(n->b))))
+                    return 0;
+                return 1;
+            }
             if (type_size(field_type) == 1)
                 return 1;
             if (type_size(field_type) != 2)
@@ -635,9 +593,28 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
             int deref_type;
             if (!ast_deref_lvalue_type(n->a, &deref_type))
                 return 0;
+            if (type_ptr_depth(deref_type) > 0) {
+                if (n->op == '=')
+                    return type_size(deref_type) == 2 &&
+                           ast_pointer_assign_rhs_supported(n->b);
+                return type_size(deref_type) == 2 &&
+                       expr_result_dead &&
+                       (n->op == TOK_ADDEQ || n->op == TOK_SUBEQ) &&
+                       ast_gen_supported(n->b) &&
+                       ast_value_is_plain_int(n->b);
+            }
             if (ast_is_plain_int_type(deref_type) &&
-                (type_size(deref_type) == 1 || type_size(deref_type) == 2))
+                (type_size(deref_type) == 1 || type_size(deref_type) == 2)) {
+                /* Plain assignment converts a float rhs or narrows a long rhs
+                 * to the pointed-to integer type.  The general lvalue store
+                 * tail already performs both conversions, matching identifier,
+                 * member, and indexed lvalues. */
+                if (n->op == '=' &&
+                    (ast_value_is_long_word(n->b) ||
+                     ast_value_is_float_word(n->b)))
+                    return 1;
                 return ast_value_is_plain_int(n->b);
+            }
             if (n->op != '=') {
                 if (type_is_long(deref_type) &&
                     (n->op == TOK_SHLEQ || n->op == TOK_SHREQ))
@@ -703,15 +680,28 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
             !(n->op == '=' && type_size(s->type) == 1 &&
                             (s->storage == SC_GLOBAL || s->storage == SC_EXTERN)) &&
                         !(expr_result_dead && type_size(s->type) == 1 &&
-                            (n->op == TOK_ANDEQ || n->op == TOK_OREQ ||
-                             n->op == TOK_XOREQ))) {
+                            (s->storage == SC_GLOBAL || s->storage == SC_EXTERN) &&
+                            is_compound)) {
             if (n->op != '=') {
+                if ((n->op == TOK_SHLEQ || n->op == TOK_SHREQ) &&
+                    ast_is_plain_int_type(s->type) &&
+                    type_size(s->type) == 2)
+                    return ast_value_is_plain_int(n->b);
                 if ((n->op == TOK_ADDEQ || n->op == TOK_SUBEQ ||
                      n->op == TOK_ANDEQ || n->op == TOK_OREQ ||
                      n->op == TOK_XOREQ) &&
                     ast_is_plain_int_type(s->type) &&
                     (type_size(s->type) == 1 || type_size(s->type) == 2))
                     return ast_value_is_plain_int(n->b);
+                /* `ptr += n` / `ptr -= n` (dead result) with ptr itself out
+                 * of ix-direct range: mirrors the pointer-lhs case below
+                 * (search "Pointer lhs") - ast_gen_dead_expr always emits
+                 * this shape through the fully general ast_gen_expr(),
+                 * which does not need ptr to be ix-direct addressable, so
+                 * decline only when the rhs isn't a supported plain int. */
+                if ((n->op == TOK_ADDEQ || n->op == TOK_SUBEQ) &&
+                    expr_result_dead && type_ptr_depth(s->type) > 0)
+                    return ast_gen_supported(n->b) && ast_value_is_plain_int(n->b);
                 return 0;
             }
             if (type_ptr_depth(s->type) > 0)
@@ -739,6 +729,20 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
         if (expr_result_dead &&
             (n->op == TOK_ADDEQ || n->op == TOK_SUBEQ) &&
             !type_is_long(s->type) && !type_is_float(s->type)) {
+            /* Pointer lhs (`ptr += n` / `ptr -= n`) checked first, ahead of
+             * the per-rhs-kind fast-path checks below: those exist to admit
+             * only an ix-direct (or global-word) rhs into a compact codegen
+             * sequence, but the emitter for a dead-result compound pointer
+             * add (ast_gen_dead_expr) always falls through to the fully
+             * general ast_gen_expr() regardless of the rhs's addressing -
+             * there is no separate compact pointer-add sequence for this
+             * check to protect.  Requiring rhs ix-direct-ness here only
+             * rejected a plain-int rhs local once the frame grew past the
+             * (ix+d) +/-127 range (e.g. tests/twhcomma.c's 17th unrolled
+             * pointer, whose rhs 'inc16' local no longer fit), even though
+             * the general path handles any plain-int rhs. */
+            if (type_ptr_depth(s->type) > 0)
+                return ast_gen_supported(n->b) && ast_value_is_plain_int(n->b);
             if (n->b->kind == AST_INT_LIT)
                 return 1;
             if (n->b->kind == AST_IDENT) {
@@ -753,8 +757,6 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
                 return 1;
             if (n->b->kind == AST_MEMBER && ast_member_plain_int_read(n->b))
                 return 1;
-            if (type_ptr_depth(s->type) > 0)
-                return ast_gen_supported(n->b) && ast_value_is_plain_int(n->b);
         }
         if (type_ptr_depth(s->type) > 0) {
             if (n->op != '=' || type_size(s->type) != 2)
@@ -796,15 +798,30 @@ static int ast_assign_supported_uncached(const struct AstNode *n)
         if (type_size(s->type) == 1 && n->op == '=' &&
             n->b->kind == AST_CALL && ast_value_is_long_word(n->b))
             return 1;
+        /* A byte-sized ix-direct bitwise compound-assign with a constant
+         * integer literal rhs (e.g. `a |= 0xFFL;`) accepts the literal
+         * regardless of its own declared type - only its value matters
+         * since &/|/^ truncate the same way at 8, 16, or 32 bits, and
+         * gen_assign_ident_compound_ast loads the literal's value directly
+         * rather than through ast_gen_expr's normal (width-respecting)
+         * lowering.  An `L`-suffixed literal is TYPE_LONG, which
+         * ast_value_is_plain_int below always declines. */
+        if (sym_can_ix_direct(s) && type_size(s->type) == 1 &&
+            (n->op == TOK_ANDEQ || n->op == TOK_OREQ || n->op == TOK_XOREQ) &&
+            n->b->kind == AST_INT_LIT)
+            return 1;
         if (!ast_value_is_plain_int(n->b))
             return 0;
         if (type_size(s->type) == 1) {
             long fv;
             if (n->op != '=') {
+                /* The general direct-symbol compound emitter handles every
+                 * arithmetic/bitwise operator for a global byte and narrows
+                 * the promoted result on store.  This used to admit only
+                 * &=/|=/^= even though *=, /=, %=, += and -= use the same
+                 * load/combine/store tail. */
                 if (expr_result_dead &&
-                    (s->storage == SC_GLOBAL || s->storage == SC_EXTERN) &&
-                    (n->op == TOK_ANDEQ || n->op == TOK_OREQ ||
-                     n->op == TOK_XOREQ))
+                    (s->storage == SC_GLOBAL || s->storage == SC_EXTERN))
                     return ast_value_is_plain_int(n->b);
                 return sym_can_ix_direct(s);
             }
@@ -893,7 +910,14 @@ static int ast_other_supported_uncached(const struct AstNode *n)
         return 1;
     }
     case AST_POSTFIX:
-        return ast_postfix_plain_int(n);
+        {
+            int pointer_type;
+            int no_deref;
+
+            return ast_postfix_plain_int(n) ||
+                   (ast_pointer_expr_type(n, &pointer_type, &no_deref) &&
+                    !no_deref);
+        }
     case AST_MEMBER:
         {
             int elem_type;
@@ -1058,94 +1082,6 @@ int ast_call_struct_arg_supported(int want_type, const struct AstNode *arg)
     if (arg->kind == AST_CALL)
         return ast_struct_return_call_assign_supported(want_type, arg);
     return 0;
-}
-
-void gen_call_struct_arg_ast(const struct AstNode *arg, int want_type)
-{
-    int arg_type;
-
-    if (arg->kind == AST_CALL) {
-        gen_struct_return_call_arg_ast(arg, want_type);
-        return;
-    }
-    gen_struct_addr_expr_ast(arg, &arg_type);
-    (void)arg_type;
-    emit_push_struct_arg_from_hl(type_size(want_type));
-}
-
-void gen_struct_return_call_arg_ast(const struct AstNode *call,
-                                           int want_type)
-{
-    const char *name = call->a->sval;
-    struct Sym *fn_sym = find_global(name);
-    int struct_bytes = type_size(want_type);
-    int arg_bytes = 0;
-    int old_dead;
-    int i;
-
-    /* This emits its own `call` directly rather than going through
-     * gen_call_ast, so it needs its own deferred_body_needed marking too. */
-    if (fn_sym != NULL && fn_sym->is_static)
-        fn_sym->deferred_body_needed = 1;
-
-    fprintf(g_emit_sink.stream, "\tld hl,-%d\n", struct_bytes);
-    emit("\tadd hl,sp\n");
-    emit("\tld sp,hl\n");
-    emit("\tpush hl\n");
-
-    old_dead = expr_result_dead;
-    expr_result_dead = 0;
-    for (i = call->list_len - 1; i >= 0; --i) {
-        int actual_type;
-        int inner_want;
-        int have_want;
-        int ptr_type;
-        int no_deref;
-
-        have_want = expected_arg_type(fn_sym, i, &inner_want);
-        if (have_want && type_is_struct_object(inner_want)) {
-            gen_call_struct_arg_ast(call->list[i], inner_want);
-            arg_bytes += type_size(inner_want);
-            continue;
-        }
-
-        if (ast_pointer_expr_type(call->list[i], &ptr_type, &no_deref))
-            gen_pointer_expr_ast(call->list[i], &ptr_type, &no_deref);
-        else
-            ast_gen_expr(call->list[i]);
-        actual_type = g_expr.type;
-        if (have_want && type_is_float(inner_want)) {
-            if (!type_is_float(actual_type))
-                emit_convert_int_to_float(actual_type);
-            emit("\tpush de\n\tpush hl\n");
-            arg_bytes += 4;
-        } else if (have_want && type_is_long(inner_want)) {
-            if (!type_is_long(actual_type))
-                emit_promote_int_to_long(actual_type, inner_want);
-            emit("\tpush de\n\tpush hl\n");
-            arg_bytes += 4;
-        } else if (have_want && !type_is_long(inner_want) &&
-                   !type_is_float(inner_want)) {
-            emit("\tpush hl\n");
-            arg_bytes += 2;
-        } else if (type_is_long(actual_type) || type_is_float(actual_type)) {
-            emit("\tpush de\n\tpush hl\n");
-            arg_bytes += 4;
-        } else {
-            emit("\tpush hl\n");
-            arg_bytes += 2;
-        }
-    }
-    expr_result_dead = old_dead;
-
-    emit_load_hl_from_sp_offset(arg_bytes);
-    emit("\tpush hl\n");
-    emit_extrn_if_needed(fn_sym);
-    fprintf(g_emit_sink.stream, "\tcall %s\n", asm_name_for(name));
-    emit_cleanup_stack_bytes(arg_bytes + 2);
-    emit("\tpop bc\n");
-    g_expr.type = want_type;
-    g_expr.long_from16 = 0;
 }
 
 static int ast_update_lvalue_long_type(const struct AstNode *n, int *out_type)
@@ -1414,20 +1350,200 @@ const struct AstNode *ast_call_star_indirect_base(const struct AstNode *n)
     return saw_star ? callee : NULL;
 }
 
-struct Sym *ast_indirect_call_proto_sym(const struct AstNode *n)
+static int ast_callable_parameter_survives_default_promotion(int type)
 {
-    const struct AstNode *callee;
+    if (type_ptr_depth(type) > 0)
+        return 1;
+    return !type_is_float(type) && !type_is_struct_object(type) &&
+        type_size(type) >= 2;
+}
 
-    if (n == NULL || n->kind != AST_CALL || n->a == NULL)
+static int ast_callable_prototypes_compatible(
+    const struct Sym *left, const struct Sym *right, int depth)
+{
+    const struct Sym *prototype;
+    int parameter;
+    int left_return;
+    int right_return;
+
+    if (left == NULL || right == NULL || depth > 64 ||
+        left->is_fastcall != right->is_fastcall)
+        return 0;
+    left_return = left->storage == SC_FUNC
+        ? left->type
+        : (left->funcptr_return_type != 0
+           ? left->funcptr_return_type : type_decay_ptr(left->type));
+    right_return = right->storage == SC_FUNC
+        ? right->type
+        : (right->funcptr_return_type != 0
+           ? right->funcptr_return_type : type_decay_ptr(right->type));
+    if (left_return != right_return)
+        return 0;
+    if (left->funcptr_result_prototype !=
+        right->funcptr_result_prototype) {
+        if (left->funcptr_result_prototype == NULL ||
+            right->funcptr_result_prototype == NULL ||
+            !ast_callable_prototypes_compatible(
+                left->funcptr_result_prototype,
+                right->funcptr_result_prototype, depth + 1))
+            return 0;
+    }
+    if (left->has_proto != right->has_proto) {
+        prototype = left->has_proto ? left : right;
+        if (prototype->proto_variadic ||
+            prototype->proto_nargs < 0 ||
+            prototype->proto_nargs > MAX_PROTO_PARAMS)
+            return 0;
+        for (parameter = 0; parameter < prototype->proto_nargs; ++parameter)
+            if (!ast_callable_parameter_survives_default_promotion(
+                    prototype->proto_types[parameter]))
+                return 0;
+        return 1;
+    }
+    if (!left->has_proto)
+        return 1;
+    if (left->proto_nargs != right->proto_nargs ||
+        left->proto_variadic != right->proto_variadic ||
+        left->proto_nargs < 0 || left->proto_nargs > MAX_PROTO_PARAMS)
+        return 0;
+    for (parameter = 0; parameter < left->proto_nargs; ++parameter)
+        if (left->proto_types[parameter] != right->proto_types[parameter])
+            return 0;
+    return 1;
+}
+
+static struct Sym *ast_callable_composite_prototype(
+    struct Sym *left, struct Sym *right, int depth)
+{
+    struct Sym *prototype;
+
+    if (!ast_callable_prototypes_compatible(left, right, depth))
         return NULL;
-    callee = n->a;
+    prototype = left->has_proto ? left : right;
+    if (left->funcptr_result_prototype !=
+        right->funcptr_result_prototype) {
+        struct Sym *result = ast_callable_composite_prototype(
+            left->funcptr_result_prototype,
+            right->funcptr_result_prototype, depth + 1);
+
+        if (result == NULL)
+            return NULL;
+        if (left->has_proto != right->has_proto &&
+            ((prototype == left &&
+              result != left->funcptr_result_prototype) ||
+             (prototype == right &&
+              result != right->funcptr_result_prototype)))
+            return NULL;
+        prototype = result == left->funcptr_result_prototype ? left : right;
+    }
+    return prototype;
+}
+
+static int ast_callable_null_pointer(const struct AstNode *node)
+{
+    return ast_null_pointer_const(node) ||
+        (node != NULL && node->kind == AST_CAST &&
+         type_ptr_depth(node->type) == 1 &&
+         (type_decay_ptr(node->type) & 15) == TYPE_VOID &&
+         ast_null_pointer_const(node->a));
+}
+
+static int ast_callable_expr_prototype(
+    const struct AstNode *callee, int depth, struct Sym **prototype)
+{
+    *prototype = NULL;
+    if (callee == NULL || depth > 64)
+        return 0;
+    if (callee->kind == AST_UNARY && callee->op == '&') {
+        const struct AstNode *addressed = callee->a;
+        struct Sym *symbol;
+
+        if (addressed != NULL && addressed->kind == AST_UNARY &&
+            addressed->op == '*') {
+            callee = addressed->a;
+        } else if (addressed != NULL && addressed->kind == AST_IDENT) {
+            symbol = addressed->sym != NULL
+                ? addressed->sym : find_sym(addressed->sval);
+            if (symbol == NULL || symbol->storage != SC_FUNC)
+                return 0;
+            callee = addressed;
+        } else {
+            return 0;
+        }
+    }
     while (callee != NULL && callee->kind == AST_UNARY && callee->op == '*')
         callee = callee->a;
     while (callee != NULL && callee->kind == AST_INDEX)
         callee = callee->a;
-    if (callee != NULL && callee->kind == AST_IDENT)
-        return callee->sym != NULL ? callee->sym : find_sym(callee->sval);
-    return NULL;
+    if (callee != NULL && callee->kind == AST_CAST) {
+        *prototype = callee->sym;
+        return *prototype != NULL;
+    }
+    if (callee != NULL && callee->kind == AST_CALL) {
+        struct Sym *producer;
+        int status =
+            ast_callable_expr_prototype(callee->a, depth + 1, &producer);
+
+        if (status <= 0)
+            return status;
+        *prototype = producer->funcptr_result_prototype;
+        return *prototype != NULL;
+    }
+    if (callee != NULL && callee->kind == AST_COND) {
+        struct Sym *left;
+        struct Sym *right;
+        int left_status =
+            ast_callable_expr_prototype(callee->b, depth + 1, &left);
+        int right_status =
+            ast_callable_expr_prototype(callee->c, depth + 1, &right);
+
+        if (left_status < 0 || right_status < 0)
+            return -1;
+        if (left_status == 0 && ast_callable_null_pointer(callee->b)) {
+            *prototype = right;
+            return right_status;
+        }
+        if (right_status == 0 && ast_callable_null_pointer(callee->c)) {
+            *prototype = left;
+            return left_status;
+        }
+        if (left_status == 0 || right_status == 0)
+            return -1;
+        *prototype =
+            ast_callable_composite_prototype(left, right, depth + 1);
+        return *prototype != NULL ? 1 : -1;
+    }
+    if (callee != NULL && callee->kind == AST_MEMBER) {
+        int base_type = ast_expr_type_for_sizeof(callee->a);
+        struct FieldDef *field =
+            find_field_def(type_struct_id(base_type), callee->sval);
+
+        *prototype = field != NULL ? field->funcptr_prototype : NULL;
+        return *prototype != NULL;
+    }
+    if (callee != NULL && callee->kind == AST_IDENT) {
+        *prototype =
+            callee->sym != NULL ? callee->sym : find_sym(callee->sval);
+        return *prototype != NULL;
+    }
+    return 0;
+}
+
+static int ast_indirect_call_prototype(
+    const struct AstNode *n, struct Sym **prototype)
+{
+    *prototype = NULL;
+    if (n == NULL || n->kind != AST_CALL || n->a == NULL)
+        return 0;
+    return ast_callable_expr_prototype(n->a, 0, prototype);
+}
+
+struct Sym *ast_indirect_call_proto_sym(const struct AstNode *n)
+{
+    struct Sym *prototype;
+
+    return ast_indirect_call_prototype(n, &prototype) > 0
+        ? prototype : NULL;
 }
 
 int ast_call_star_indirect_supported(const struct AstNode *n)
@@ -1438,6 +1554,7 @@ int ast_call_star_indirect_supported(const struct AstNode *n)
     int no_deref;
     int i;
     struct Sym *proto;
+    int prototype_status;
 
     base = ast_call_star_indirect_base(n);
     if (base == NULL)
@@ -1460,7 +1577,11 @@ int ast_call_star_indirect_supported(const struct AstNode *n)
         if (type_ptr_depth(callee_type) <= 0 || type_size(callee_type) != 2)
             return 0;
     }
-    proto = ast_indirect_call_proto_sym(n);
+    prototype_status = ast_indirect_call_prototype(n, &proto);
+    if (prototype_status < 0)
+        return 0;
+    if (proto != NULL && proto->is_fastcall)
+        return 0;
     if (proto != NULL && proto->has_proto &&
         ((!proto->proto_variadic && n->list_len != proto->proto_nargs) ||
          (proto->proto_variadic && n->list_len < proto->proto_nargs)))
@@ -1479,6 +1600,7 @@ int ast_call_indirect_supported(const struct AstNode *n)
     int no_deref;
     int i;
     struct Sym *proto;
+    int prototype_status;
 
     if (n == NULL || n->kind != AST_CALL || n->a == NULL)
         return 0;
@@ -1494,7 +1616,11 @@ int ast_call_indirect_supported(const struct AstNode *n)
         return 0;
     if (type_is_struct_object(type_decay_ptr(callee_type)))
         return 0;
-    proto = ast_indirect_call_proto_sym(n);
+    prototype_status = ast_indirect_call_prototype(n, &proto);
+    if (prototype_status < 0)
+        return 0;
+    if (proto != NULL && proto->is_fastcall)
+        return 0;
     if (proto != NULL && proto->has_proto &&
         ((!proto->proto_variadic && n->list_len != proto->proto_nargs) ||
          (proto->proto_variadic && n->list_len < proto->proto_nargs)))
@@ -1611,6 +1737,13 @@ int ast_value_is_pointer_word(const struct AstNode *n)
                (ast_index_2d_array_elem_type(n, &elem_type) &&
                 type_ptr_depth(elem_type) > 0);
     }
+    case AST_ASSIGN:
+        /* A chained assignment `p = q = expr` yields the value just stored
+         * into its own lhs - mirrors ast_value_is_plain_int's AST_ASSIGN
+         * case, which already does this for the plain-int sibling. Without
+         * this, an inner pointer-valued chained assignment (`p.next = p.end
+         * = y;`) has no way to be recognised as a pointer-word rhs. */
+        return ast_gen_supported(n) && ast_value_is_pointer_word(n->a);
     default:
         return 0;
     }
@@ -1700,39 +1833,11 @@ int ast_unary_long_const_fold(const struct AstNode *n, long *out)
     return 0;
 }
 
-/* A unary +/- chain bottoming out in a float literal or a folded (`const
- * float x = <literal>;`) local folds to a single immediate with the sign bit
- * flipped at compile time, e.g. `-PI` from `const float PI = 3.14159265f;`.
- * Mirrors ast_unary_int_const_fold/ast_unary_long_const_fold above, but for
- * float: without this, gen_unary_ast emitted the constant's bit pattern via
- * the normal float load and then a runtime `ld a,d / xor 80h / ld d,a` to
- * flip its sign on every execution, even though the negated value is just as
- * knowable at compile time as the original. */
-int ast_unary_float_const_fold(const struct AstNode *n, unsigned long *out)
+static int ast_fold_integer_type(int type)
 {
-    unsigned long v;
-    struct Sym *s;
-
-    if (n == NULL)
-        return 0;
-    if (n->kind == AST_FLOAT_LIT) {
-        *out = n->uval;
-        return 1;
-    }
-    if (n->kind == AST_IDENT) {
-        s = find_sym(n->sval);
-        if (s != NULL && s->is_const_value && type_is_float(s->type)) {
-            *out = (unsigned long)s->const_value;
-            return 1;
-        }
-        return 0;
-    }
-    if (n->kind == AST_UNARY && (n->op == '-' || n->op == '+') &&
-        ast_unary_float_const_fold(n->a, &v)) {
-        *out = (n->op == '-') ? (v ^ 0x80000000UL) : v;
-        return 1;
-    }
-    return 0;
+    return ast_is_plain_int_type(type) ||
+           (type_ptr_depth(type) == 0 && !(type & TYPE_STRUCT) &&
+            type_is_long(type));
 }
 
 /* Fold one integer binary operator with TARGET semantics (16-bit int,
@@ -1749,8 +1854,9 @@ int ast_unary_float_const_fold(const struct AstNode *n, unsigned long *out)
  *
  * type_a / type_b are the operands' own (pre-promotion) source types.
  * Returns 1 with *out set (as a sign/zero-extended host long matching the
- * result type), or 0 to decline the fold (divide/modulo by zero, signed
- * minimum divided/modulo -1, or an out-of-range shift count). */
+ * result type), or 0 to decline the fold (a non-integer operand type,
+ * divide/modulo by zero, signed minimum divided/modulo -1, or an out-of-range
+ * shift count). */
 static int ast_fold_binary_target(int op, int type_a, int type_b,
                                   long a, long b, long *out)
 {
@@ -1759,11 +1865,12 @@ static int ast_fold_binary_target(int op, int type_a, int type_b,
     unsigned long ua, ub;
     unsigned long width_mask;
 
+    if (!ast_fold_integer_type(type_a) || !ast_fold_integer_type(type_b))
+        return 0;
+
     if (op == TOK_SHL || op == TOK_SHR) {
         int lt = promote_int_type(type_a);
         int lbits;
-        if (type_is_float(lt))
-            return 0;
         lbits = type_is_long(lt) ? 32 : 16;
         if (b < 0 || b >= lbits)
             return 0;
@@ -1839,6 +1946,9 @@ int ast_const_scalar_fold(const struct AstNode *n, long *out)
     case AST_INT_LIT:
         *out = n->ival;
         return 1;
+    case AST_SIZEOF_TYPE:
+        *out = n->ival;
+        return 1;
     case AST_IDENT:
         for (ei = 0; ei < nenum_consts; ++ei) {
             if (!strcmp(enum_const_names[ei], n->sval)) {
@@ -1897,6 +2007,8 @@ long ast_const_apply_int_cast(long v, int type)
 
     if (type_is_float(type) || type_ptr_depth(type) > 0)
         return v;
+    if (type_is_bool(type))
+        return v != 0;
     if (type_size(type) <= 1) {
         u = ((unsigned long)v) & 0xffUL;
         if (!(type & TYPE_UNSIGNED) && (u & 0x80UL))
@@ -1918,76 +2030,6 @@ long ast_const_apply_int_cast(long v, int type)
 int ast_const_condition_fold(const struct AstNode *n, long *out)
 {
     return ast_const_scalar_fold(n, out);
-}
-
-/*
- * Strict constant fold. Like ast_const_scalar_fold, it evaluates an integer
- * constant expression with exact target semantics (both walkers now share
- * ast_fold_binary_target, so a folded value equals what the target computes
- * at run time regardless of host long width or operand sign). The remaining
- * difference is caller intent: ast_const_fold_strict is the entry point used
- * where the whole node is about to be replaced by an emitted immediate
- * (gen_binary_ast / gen_long_arith_ast), and it declines (returns 0) the two
- * cases with no defined target value - divide/modulo by zero, signed minimum
- * divided/modulo -1, and an out-of-range shift count - so the caller falls
- * back to ordinary codegen rather than baking in a bogus constant. Callers
- * may emit the folded immediate (masked to the result width) directly
- * whenever it returns 1.
- */
-int ast_const_fold_strict(const struct AstNode *n, long *out)
-{
-    long a;
-    long b;
-
-    if (n == NULL)
-        return 0;
-    switch (n->kind) {
-    case AST_INT_LIT:
-        *out = n->ival;
-        return 1;
-    case AST_IDENT:
-        return ast_const_scalar_fold(n, out);   /* enum / const value: a leaf */
-    case AST_UNARY:
-        if (!ast_const_fold_strict(n->a, &a))
-            return 0;
-        switch (n->op) {
-        case '+': *out = a; return 1;
-        case '-': *out = -a; return 1;
-        case '~': *out = ~a; return 1;
-        case '!': *out = !a; return 1;
-        default: return 0;
-        }
-    case AST_CAST:
-        if (type_is_float(n->type) || type_ptr_depth(n->type) > 0)
-            return 0;
-        if (!ast_const_fold_strict(n->a, &a))
-            return 0;
-        *out = ast_const_apply_int_cast(a, n->type);
-        return 1;
-    case AST_LOGAND:
-    case AST_LOGOR:
-        if (!ast_const_fold_strict(n->a, &a) || !ast_const_fold_strict(n->b, &b))
-            return 0;
-        *out = (n->kind == AST_LOGAND) ? ((a != 0) && (b != 0))
-                                       : ((a != 0) || (b != 0));
-        return 1;
-    case AST_BINARY:
-        if (!ast_const_fold_strict(n->a, &a) || !ast_const_fold_strict(n->b, &b))
-            return 0;
-        /* Target-width fold via the shared helper: operands converted to the
-         * common type, wrapping arithmetic at the target width through
-         * unsigned host math, shifts typed from the promoted left operand.
-         * Declines only for operations with no defined target value; every
-         * other integer binary operator folds to its exact target value, so
-         * the emitted immediate matches the target's runtime result
-         * regardless of host long width or operand sign. */
-        return ast_fold_binary_target(n->op,
-                                      ast_expr_type_for_sizeof(n->a),
-                                      ast_expr_type_for_sizeof(n->b),
-                                      a, b, out);
-    default:
-        return 0;
-    }
 }
 
 int ast_global_byte_array_const_store(const struct AstNode *n,
@@ -2144,8 +2186,8 @@ int ast_for_mod_fill_supported(const struct AstNode *n, struct Sym **out_arr,
         return 0;
 
     /* The bound itself is never inspected below - the loop's own condition
-     * codegen (ast_gen_cond_branch) still owns it untouched, so any bound
-     * expression is fine so long as ivar is compared with '<'. */
+     * lowering still owns it untouched, so any bound expression is fine so
+     * long as ivar is compared with '<'. */
     if (n->b == NULL || n->b->kind != AST_BINARY || n->b->op != '<')
         return 0;
     if (n->b->a == NULL || n->b->a->kind != AST_IDENT ||
@@ -2269,146 +2311,6 @@ int ast_expr_has_side_effects(const struct AstNode *n)
         if (ast_expr_has_side_effects(n->list[i]))
             return 1;
     return 0;
-}
-
-/* Deliberately narrow structural-equality check for two expression subtrees:
- * true only when both are built entirely from AST_IDENT (same resolved
- * symbol, and not volatile - a volatile read must happen exactly as many
- * times as the source specifies, so treating two syntactic occurrences as
- * "the same value, compute/read once" would silently drop a required
- * access), AST_INT_LIT (same value), and AST_BINARY '+'/'-'/'*' (same
- * operator, recursively equal operands). Declines (0) on anything else -
- * casts, calls, member/index access, ?: - matching this file's usual
- * "no general expression-equality checker; extend narrowly on the next
- * real case" discipline (see ast_find_unconditional_divmod_op above).
- * Motivated by mem_get_word/mem_set_word-shaped code (adaint.c/cint.c/
- * fint.c's byte-memory word packing): `m[base+idx*INTB]` and
- * `m[base+idx*INTB+1]` recompute the identical `base+idx*INTB` address
- * expression twice; proving the two occurrences are really the same
- * computation is what lets the caller compute it once and just `inc hl`
- * for the second byte instead. */
-int ast_index_exprs_structurally_equal(const struct AstNode *a, const struct AstNode *b)
-{
-    if (a == NULL || b == NULL)
-        return a == b;
-    if (a->kind != b->kind)
-        return 0;
-    switch (a->kind) {
-    case AST_IDENT: {
-        /* Cloned inline-substitution identifiers (see try_gen_inline_call_ast/
-         * clone_inline_expr) carry sval but not a pre-resolved sym - it is
-         * looked up lazily during codegen, same as ast_expr_type_for_sizeof's
-         * own AST_IDENT case does via find_sym rather than trusting n->sym,
-         * so this must resolve the same way instead of trusting a stale/unset
-         * ->sym field directly. */
-        struct Sym *sa = a->sym != NULL ? a->sym : find_sym(a->sval);
-        struct Sym *sb = b->sym != NULL ? b->sym : find_sym(b->sval);
-        return sa != NULL && sa == sb && !sa->is_volatile;
-    }
-    case AST_INT_LIT:
-        return a->ival == b->ival;
-    case AST_BINARY:
-        return (a->op == '+' || a->op == '-' || a->op == '*') && a->op == b->op &&
-               ast_index_exprs_structurally_equal(a->a, b->a) &&
-               ast_index_exprs_structurally_equal(a->b, b->b);
-    default:
-        return 0;
-    }
-}
-
-/* True when `plus_one` is structurally `base + 1` (either operand order),
- * using ast_index_exprs_structurally_equal to prove `base` really is the
- * same computation as `base_expr`. Companion to that check - together they
- * prove `arr[base_expr]` and `arr[plus_one]` address adjacent elements of
- * the same array/pointer with no runtime dependency, so their shared
- * address prefix can be computed once. */
-int ast_index_expr_is_plus_one(const struct AstNode *base_expr, const struct AstNode *plus_one)
-{
-    if (plus_one == NULL || plus_one->kind != AST_BINARY || plus_one->op != '+')
-        return 0;
-    if (plus_one->b != NULL && plus_one->b->kind == AST_INT_LIT && plus_one->b->ival == 1 &&
-        ast_index_exprs_structurally_equal(base_expr, plus_one->a))
-        return 1;
-    if (plus_one->a != NULL && plus_one->a->kind == AST_INT_LIT && plus_one->a->ival == 1 &&
-        ast_index_exprs_structurally_equal(base_expr, plus_one->b))
-        return 1;
-    return 0;
-}
-
-/* Recognizes `arr[E] | (arr[E+1] << 8)` - the byte-memory word-read idiom
- * mem_get_word-shaped code uses - where `arr` (or the same pointer
- * expression) is indexed by E for the low byte and by a provably-E+1
- * expression for the high byte. Returns the low-byte AST_INDEX node (whose
- * address computation the caller runs exactly once, for both bytes) or
- * NULL. Requires a single-byte (char/uchar) element type: the point of the
- * idiom is packing two byte reads into one 16-bit value, so anything wider
- * isn't this shape at all. */
-const struct AstNode *ast_byte_pair_word_read_match(const struct AstNode *n)
-{
-    const struct AstNode *lo;
-    const struct AstNode *shift;
-    const struct AstNode *hi;
-
-    if (n == NULL || n->kind != AST_BINARY || n->op != '|')
-        return NULL;
-    lo = n->a;
-    shift = n->b;
-    if (lo == NULL || lo->kind != AST_INDEX)
-        return NULL;
-    if (shift == NULL || shift->kind != AST_BINARY || shift->op != TOK_SHL)
-        return NULL;
-    if (shift->b == NULL || shift->b->kind != AST_INT_LIT || shift->b->ival != 8)
-        return NULL;
-    hi = shift->a;
-    if (hi == NULL || hi->kind != AST_INDEX)
-        return NULL;
-    if (!ast_index_exprs_structurally_equal(lo->a, hi->a))
-        return NULL;
-    if (!ast_index_expr_is_plus_one(lo->b, hi->b))
-        return NULL;
-    if (type_size(ast_expr_type_for_sizeof(lo)) != 1)
-        return NULL;
-    return lo;
-}
-
-/* Write-side counterpart of ast_byte_pair_word_read_match: recognizes two
- * adjacent statements `arr[E] = lo; arr[E+1] = hi;` (mem_set_word-shaped
- * code) - same array/pointer, provably-adjacent byte indices, neither
- * statement's rhs carrying any side effect that could invalidate reusing
- * one address computation for both stores (mirrors ast_divmod_fuse_
- * compound's identical "neither statement's rhs may have any other side
- * effect" rule). Returns the low-byte AST_INDEX lvalue node (out_lo) and
- * the high-byte statement's rhs AST_ASSIGN node (out_s2_assign) on match,
- * leaving both untouched otherwise. */
-int ast_byte_pair_word_write_match(const struct AstNode *s1, const struct AstNode *s2,
-                                   const struct AstNode **out_lo, const struct AstNode **out_s2_assign)
-{
-    const struct AstNode *lo;
-    const struct AstNode *hi;
-
-    if (s1 == NULL || s1->kind != AST_EXPR_STMT || s1->a == NULL ||
-        s1->a->kind != AST_ASSIGN || s1->a->op != '=' || s1->a->a == NULL)
-        return 0;
-    if (s2 == NULL || s2->kind != AST_EXPR_STMT || s2->a == NULL ||
-        s2->a->kind != AST_ASSIGN || s2->a->op != '=' || s2->a->a == NULL)
-        return 0;
-
-    lo = s1->a->a;
-    hi = s2->a->a;
-    if (lo->kind != AST_INDEX || hi->kind != AST_INDEX)
-        return 0;
-    if (!ast_index_exprs_structurally_equal(lo->a, hi->a))
-        return 0;
-    if (!ast_index_expr_is_plus_one(lo->b, hi->b))
-        return 0;
-    if (type_size(ast_expr_type_for_sizeof(lo)) != 1)
-        return 0;
-    if (ast_expr_has_side_effects(s1->a->b) || ast_expr_has_side_effects(s2->a->b))
-        return 0;
-
-    *out_lo = lo;
-    *out_s2_assign = s2->a;
-    return 1;
 }
 
 /* Finds a '%' or '/' AST_BINARY node reachable UNCONDITIONALLY from `n` -
@@ -2558,6 +2460,8 @@ struct AstNode *ast_divmod_fuse_compound(const struct AstNode *n)
         struct Sym *quot_sym;
         struct Sym *rem_sym;
         struct AstNode *call_node;
+        struct AstNode *call_x;
+        struct AstNode *call_y;
         struct AstNode *quot_ident;
         struct AstNode *rem_ident;
         struct AstNode *new_s1_rhs;
@@ -2629,8 +2533,20 @@ struct AstNode *ast_divmod_fuse_compound(const struct AstNode *n)
         rem_sym = add_local_alloc(rname, is_signed ? TYPE_INT : (TYPE_INT | TYPE_UNSIGNED), 2);
 
         call_node = ast_new(&g_ast_arena, AST_DIVMOD_CALL);
-        call_node->a = (struct AstNode *)mod_node->a;
-        call_node->b = (struct AstNode *)mod_node->b;
+        /* The original identifier nodes retain source spelling and may point
+         * into a locals[] slot reused after their block closes.  Freeze the
+         * resolved internal names now so sibling blocks that reuse x/y do not
+         * make the synthesized divmod call bind to another declaration. */
+        call_x = ast_new(&g_ast_arena, AST_IDENT);
+        *call_x = *mod_node->a;
+        call_x->sval = ast_arena_strdup(&g_ast_arena, x_sym->name);
+        call_x->type = x_sym->type;
+        call_y = ast_new(&g_ast_arena, AST_IDENT);
+        *call_y = *mod_node->b;
+        call_y->sval = ast_arena_strdup(&g_ast_arena, y_sym->name);
+        call_y->type = y_sym->type;
+        call_node->a = call_x;
+        call_node->b = call_y;
         call_node->sym = quot_sym;
         call_node->sval = ast_arena_strdup(&g_ast_arena, rem_sym->name);
         call_node->ival = is_signed;
