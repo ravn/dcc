@@ -541,7 +541,7 @@ static int mir_emit_homed_condition_jump(
             mir_stream_puts("\tpush hl\n", out);
         if (!mir_emit_home_to_hl(out, value))
             return 0;
-        mir_stream_puts("\tld a,h\n\tor l\n", out);
+        mir_emit_scalar_truth_test(out, value);
         if (preserve_hl)
             mir_stream_puts("\tpop hl\n", out);
     }
@@ -1415,10 +1415,8 @@ static int mir_only_value_homed_across(
     for (value = 0; value < mir.next_value; ++value)
         if (value != allowed_value &&
             mir.allocation_colors[value] >= 0 &&
-            mir.live_in[(size_t)instruction *
-                        mir.next_value + value] &&
-            mir.live_out[(size_t)instruction *
-                         mir.next_value + value])
+            MIR_LIVE_TEST(mir.live_in, instruction, value) &&
+            MIR_LIVE_TEST(mir.live_out, instruction, value))
             return 0;
     return 1;
 }

@@ -259,7 +259,8 @@ int mir_value_only_used_by_absolute_access(
     int instruction;
     int found_use = 0;
 
-    for (instruction = 0; instruction < mir.count; ++instruction) {
+    for (instruction = mir_next_use(value, -1); instruction >= 0;
+         instruction = mir_next_use(value, instruction)) {
         const struct MirInsn *insn = &mir.insns[instruction];
 
         if (insn->src2 == value || mir_call_uses_value(insn, value))
@@ -455,6 +456,87 @@ int mir_affine_value(int value, const struct MirInsn **parameter,
 void mir_emit_signed_byte_extend(MirStream *out)
 {
     mir_stream_puts("\tld a,l\n\trlca\n\tsbc a,a\n\tld h,a\n", out);
+}
+
+/* Test a scalar already loaded into HL. Byte arithmetic can leave carry or
+ * sign debris in H; a truth test must use the stored byte value without
+ * inserting a conversion into the MIR increment/store pattern. */
+void mir_emit_scalar_truth_test(MirStream *out, int value)
+{
+    const struct MirInsn *definition = mir_definition(value);
+
+    /* Keep the established word-test pattern for canonical byte values:
+     * the peephole optimizer folds their sign extension and test together. */
+    if (definition != NULL && type_size(definition->type) == 1 &&
+        !mir_value_is_normalized_byte(value, definition->type, 0))
+        mir_stream_puts("\tld a,l\n\tor a\n", out);
+    else
+        mir_stream_puts("\tld a,h\n\tor l\n", out);
+}
+
+static int mir_byte_arithmetic_result_needs_normalization(
+    const struct MirInsn *insn)
+{
+    int i;
+
+    if (type_size(insn->type) != 1 ||
+        (insn->immediate != '+' && insn->immediate != '-') ||
+        insn->narrowed_for_counter_update)
+        return 0;
+    for (i = mir_next_use(insn->dst, -1); i >= 0;
+         i = mir_next_use(insn->dst, i)) {
+        const struct MirInsn *use = &mir.insns[i];
+        if (use->opcode == MIR_BRANCH_FALSE ||
+            (use->opcode == MIR_STORE && type_size(use->type) == 1) ||
+            (use->opcode == MIR_STORE_INDIRECT &&
+             use->src1 != insn->dst && type_size(use->type) == 1))
+            continue;
+        /* A real integer conversion establishes the byte representation
+         * itself. Same-type casts may be elided; bool/float conversions
+         * require a canonical input before testing or converting it. */
+        if (use->opcode == MIR_UNARY && use->immediate == 0 &&
+            use->type != 0 && use->type != insn->type &&
+            !type_is_bool(use->type) && !type_is_float(use->type))
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+int mir_binary_is_byte_unit_update(const struct MirInsn *insn)
+{
+    const struct MirInsn *right;
+    int instruction;
+
+    if (insn == NULL || type_size(insn->type) != 1 ||
+        (insn->immediate != '+' && insn->immediate != '-'))
+        return 0;
+    /* The low-byte update is destructive. Keep the generic path when a
+     * postfix expression still needs the original value afterward. */
+    instruction = (int)(insn - mir.insns);
+    if (mir_value_live_out_of_instruction(insn->src1, instruction))
+        return 0;
+    right = mir_definition(insn->src2);
+    return right != NULL && right->opcode == MIR_CONST &&
+           (right->immediate & 0xffffL) == 1 &&
+           mir_byte_arithmetic_result_needs_normalization(insn);
+}
+
+/* Preserve increment/store fusion and avoid extending a byte whose only
+ * consumers already discard the high byte. Other uses (including PHIs and
+ * register homes) need the canonical value before it is forwarded. A direct
+ * inc/dec of L preserves an already-normalized unsigned high byte, so that
+ * case needs no repair either. */
+void mir_emit_byte_arithmetic_result(MirStream *out,
+                                     const struct MirInsn *insn,
+                                     int high_byte_preserved)
+{
+    if (!mir_byte_arithmetic_result_needs_normalization(insn))
+        return;
+    if (high_byte_preserved && (insn->type & TYPE_UNSIGNED) != 0 &&
+        mir_value_is_normalized_byte(insn->src1, insn->type, 0))
+        return;
+    mir_emit_cast(out, TYPE_INT, insn->type);
 }
 
 void mir_emit_scalar_compare(MirStream *out, int operation, int is_unsigned)
@@ -773,12 +855,9 @@ static int mir_emit_scalar_value(MirStream *out, int value, int depth)
             return 1;
         case '/':
             {
-                /* Item T49 (mir-text-size-plan.md): unsigned `int_expr /
-                 * <compile-time power-of-2 constant>` mirrors legacy's
-                 * fast path in ast_gen_binary_ast (dcc_ast_gen_expr.c
-                 * ~1551) - `emit_logical_shift_right_hl_const` instead of
-                 * a __divu runtime call. Signed division is intentionally
-                 * left alone (matches legacy's exact scope): a plain
+                /* Unsigned division by a compile-time power of two uses a
+                 * logical shift instead of __divu. Signed division is
+                 * intentionally left alone: a plain
                  * right-shift is not equivalent to signed division's
                  * round-toward-zero for negative dividends. */
                 const struct MirInsn *right_definition =
@@ -2413,6 +2492,10 @@ int mir_emit_homed_unary_instruction(MirStream *out,
         } else if (type_size(insn->type) == 1 &&
                    !mir_value_is_normalized_byte(insn->src1, insn->type, 0)) {
             mir_emit_byte_extension(out, MIR_COLOR_HL, insn->type);
+        } else if (type_size(source_type) == 1 &&
+                   type_size(insn->type) == 2 &&
+                   !mir_value_is_normalized_byte(insn->src1, source_type, 0)) {
+            mir_emit_byte_extension(out, MIR_COLOR_HL, source_type);
         }
     } else if (insn->immediate == '+') {
         /* Unary plus: no-op. */
@@ -2459,12 +2542,17 @@ int mir_emit_homed_binary_instruction(MirStream *out,
     const struct MirInsn *right_definition;
     int comparison_unsigned;
     int biased_right_constant;
+    int byte_unit_update = mir_binary_is_byte_unit_update(insn);
 
     if (mir.allocation_colors[right] == MIR_COLOR_HL) {
         int temporary;
         if (!commutative && runtime_helper == NULL)
             return 0;
         if (commutative) {
+            /* The direct byte update is valid only while the original lhs
+             * remains in HL. Swapping a constant RHS into HL requires the
+             * ordinary 16-bit operation. */
+            byte_unit_update = 0;
             temporary = left;
             left = right;
             right = temporary;
@@ -2509,7 +2597,11 @@ int mir_emit_homed_binary_instruction(MirStream *out,
     } else if (!mir_emit_home_to_de(out, right)) {
         return 0;
     }
-    if (runtime_helper != NULL)
+    if (byte_unit_update)
+        mir_stream_puts(insn->immediate == '+'
+            ? "\tinc l ;@dcc.mir byte-unit-update\n"
+            : "\tdec l ;@dcc.mir byte-unit-update\n", out);
+    else if (runtime_helper != NULL)
         mir_emit_runtime_call(out, runtime_helper);
     else if (insn->immediate == '+')
         mir_stream_puts("\tadd hl,de\n", out);
@@ -2551,6 +2643,7 @@ int mir_emit_homed_binary_instruction(MirStream *out,
     } else {
         return 0;
     }
+    mir_emit_byte_arithmetic_result(out, insn, byte_unit_update);
     if (!mir_emit_hl_to_home(out, insn->dst))
         return 0;
     if (preserve_de)

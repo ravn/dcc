@@ -28,9 +28,7 @@ $tempRoot = Join-Path $repoRoot (
 $environmentNames = @(
     "DCC_MIR_COST_REPORT",
     "DCC_MIR_CACHE_VERIFY",
-    "DCC_MIR_CANDIDATES",
     "DCC_MIR_EMIT_FUNCTION",
-    "DCC_MIR_GENERAL_CANDIDATES",
     "DCC_MIR_MACHINE_REPORT",
     "DCC_MIR_MACHINE_FUNCTION",
     "DCC_MIR_MACHINE_TEMPLATE",
@@ -187,7 +185,8 @@ function Assert-RunCase(
     [int]$StackBytes = 512,
     [string]$MachineMutation = "",
     [string]$MachineMutationFunction = "",
-    [string]$DebugMode = ""
+    [string]$DebugMode = "",
+    [array]$MirExpectations = @()
 ) {
     $configuration = @(
         if ($StackCheck) { "stack" } else { "nostack" }
@@ -269,15 +268,9 @@ __ctu:
     $savedSelectReportFunction =
         [Environment]::GetEnvironmentVariable(
             "DCC_MIR_SELECT_REPORT_FUNCTION", "Process")
-    $savedCandidates =
-        [Environment]::GetEnvironmentVariable(
-            "DCC_MIR_CANDIDATES", "Process")
     $savedEmitFunction =
         [Environment]::GetEnvironmentVariable(
             "DCC_MIR_EMIT_FUNCTION", "Process")
-    $savedGeneralCandidates =
-        [Environment]::GetEnvironmentVariable(
-            "DCC_MIR_GENERAL_CANDIDATES", "Process")
     $savedGeneralFunction =
         [Environment]::GetEnvironmentVariable(
             "DCC_MIR_GENERAL_FUNCTION", "Process")
@@ -313,10 +306,9 @@ __ctu:
         } else {
             $null
         })
-    Set-ProcessEnvironment "DCC_MIR_REPORT" $null
+    Set-ProcessEnvironment "DCC_MIR_REPORT" `
+        $(if ($MirExpectations.Count) { "1" } else { $null })
     Set-ProcessEnvironment "DCC_MIR_FUNCTION" $null
-    Set-ProcessEnvironment "DCC_MIR_CANDIDATES" $null
-    Set-ProcessEnvironment "DCC_MIR_GENERAL_CANDIDATES" $null
     if ($RequiredSelector -ne "specialized") {
         Set-ProcessEnvironment "DCC_MIR_EMIT_FUNCTION" $null
     }
@@ -338,10 +330,7 @@ __ctu:
         Set-ProcessEnvironment "DCC_MIR_COST_REPORT" $savedCostReport
         Set-ProcessEnvironment "DCC_MIR_REPORT" $savedMirReport
         Set-ProcessEnvironment "DCC_MIR_FUNCTION" $savedMirFunction
-        Set-ProcessEnvironment "DCC_MIR_CANDIDATES" $savedCandidates
         Set-ProcessEnvironment "DCC_MIR_EMIT_FUNCTION" $savedEmitFunction
-        Set-ProcessEnvironment "DCC_MIR_GENERAL_CANDIDATES" `
-            $savedGeneralCandidates
         Set-ProcessEnvironment "DCC_MIR_GENERAL_FUNCTION" `
             $savedGeneralFunction
         Set-ProcessEnvironment "DCC_MIR_SELECT_FUNCTION" $savedSelectFunction
@@ -357,6 +346,9 @@ __ctu:
     }
     if ($build.TimedOut -or $build.ExitCode -ne 0) {
         throw "$Name failed to build ($configuration):`n$($build.Output)"
+    }
+    if ($MirExpectations.Count) {
+        Assert-MirAccessEvidence $build.Output $MirExpectations $DebugMode
     }
     if (-not (Test-Path -LiteralPath $buildDir -PathType Container)) {
         throw "$Name build did not create $buildDir ($configuration):`n" +
@@ -451,16 +443,7 @@ __ctu:
     if ($run.TimedOut) {
         throw "$Name timed out ($configuration)"
     }
-    if ($run.ExitCode -ne $ExpectedExit) {
-        throw "$Name exited $($run.ExitCode), expected $ExpectedExit " +
-            "($configuration):`n$($run.Output)"
-    }
-    foreach ($text in $Expected) {
-        if (-not $run.Output.Contains($text)) {
-            throw "$Name did not emit '$text' ($configuration):`n" +
-                $run.Output
-        }
-    }
+    Assert-MirTargetResult $run $Name $configuration $ExpectedExit $Expected
     $executionKey = "$Name|$configuration"
     if (-not $executedConfigurations.Add($executionKey)) {
         throw "duplicate MIR clobber execution: $executionKey"
@@ -2490,37 +2473,7 @@ try {
         if ($proof.TimedOut -or $proof.ExitCode -ne 0) {
             throw "MIR $($proofCase.Name) proof failed:`n$($proof.Output)"
         }
-        foreach ($expectation in $proofCase.Expectations) {
-            $function = $expectation.Function
-            $opcode = if ($expectation.Opcode) { $expectation.Opcode } else { "loadind" }
-            $body = [regex]::Match($proof.Output,
-                "(?s); MIR function=$function .*?; MIR summary function=$function ")
-            $loads = [regex]::Matches($body.Value, "\b$opcode\b").Count
-            if (-not $body.Success -or $loads -ne $expectation.Loads) {
-                throw "$function has $loads MIR loads, expected " +
-                    "$($expectation.Loads):`n$($body.Value)"
-            }
-            $volatileLoads = [regex]::Matches(
-                $body.Value, "\b$opcode\b[^\r\n]*\bmem=\d+v\b").Count
-            if ($volatileLoads -ne $expectation.Volatile) {
-                throw "$function has $volatileLoads volatile MIR loads, " +
-                    "expected $($expectation.Volatile):`n$($body.Value)"
-            }
-            if ($expectation.Width) {
-                $correctWidth = [regex]::Matches($body.Value,
-                    "\b$opcode\b[^\r\n]*\bmem=$($expectation.Width)v?\b").Count
-                if ($correctWidth -ne $loads) {
-                    throw "$function has an incorrect memory access width:`n$($body.Value)"
-                }
-            }
-            if ($expectation.ContainsKey("ByteVolatile")) {
-                $volatileBytes = [regex]::Matches($body.Value,
-                    "\b$opcode\b[^\r\n]*\bmem=1v\b").Count
-                if ($volatileBytes -ne $expectation.ByteVolatile) {
-                    throw "$function has incorrect pointer-level volatility:`n$($body.Value)"
-                }
-            }
-        }
+        Assert-MirAccessEvidence $proof.Output $proofCase.Expectations
     }
 
     }
@@ -2549,7 +2502,7 @@ try {
                     "RequiredGenericFunction", "RequiredSelectorFunction", "RequiredSelector",
                     "RequiredCandidate", "FixturePaths", "AssemblyPatterns",
                     "ForbiddenAssemblyPatterns", "OddUpperRuntime", "StackBytes",
-                    "MachineMutation", "MachineMutationFunction"
+                    "MachineMutation", "MachineMutationFunction", "MirExpectations"
                 )) {
                     if ($case.PSObject.Properties.Name -contains $property) {
                         $parameters[$property] = $case.$property

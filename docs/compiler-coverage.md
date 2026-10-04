@@ -1,5 +1,298 @@
 # Compiler source coverage
 
+## October 2 whole-compiler source-function contract
+
+Normal `compiler-coverage.sh` reporting now requires a nonempty whole-compiler
+LLVM **source-function** denominator under `src/dcc/*.c`, exact integer
+`covered == count`, and `missed == 0`. Rounded `100.00%` text is insufficient.
+The existing selected production AST/MIR scope and classifications are unchanged;
+`DCC_COVERAGE_REQUIRE_COMPLETE` / `-RequireComplete` retains its separate
+all-metric selected AST/MIR meaning. The new function-only gate runs normally,
+including through the proof suite's `-All` workflow.
+
+`scripts/compiler-function-coverage.py` establishes its expected inventory
+independently from the checkpoint's `compile_commands.json`, using each target's
+compiler, active defines, and include options. It requires the complete current
+source set across the compiler and five existing host targets, unions function
+body source ranges across configurations, and retains data-only files with zero
+functions. LLVM per-file function summaries, independent inventory counts, and
+native totals must agree; missing, empty, partial, extra, or inconsistent data
+fails closed. Each body also requires exact expected/exported canonical-name
+equality, so unknown aliases cannot disguise partial or extraneous exports.
+
+Production `main` and the host's `dcc_driver_main` alias share one source body.
+Executing `main` covers that source function even if the alias remains
+unexecuted. Both raw identities/counts stay visible; the alias is not called
+merely to inflate instantiation coverage.
+
+Before the collection success stamp, `scripts/test-compiler-entrypoints.py`
+asserts exact CLI status/stdout/stderr and no early-exit assembly, unique
+`-I`-only include paths/values/order/separators/spaces, and structured shadow
+schedule/target reports and filters. Private environments, unique paths, and
+timeouts preserve `LLVM_PROFILE_FILE`. Diagnostics off/on must leave assembly
+and embedded debug metadata byte-identical for release, `-g`, and `-gline`,
+with/without stack checks. The existing verifier's
+`--shadow-schedule-require-invalid` mode isolates invalid REPORT-only status and
+REQUIRE fatal failure. Host assertions additionally use the real lexer,
+type-name suffix parser, and global-write ownership/value-numbering consumers,
+plus verified straight-line, diamond/PHI, loop/PHI, and narrow/wide call-pressure
+fixtures with production-state snapshots.
+
+The branch-proof pilot manifest, `scripts/compiler-branch-proof.json`, freezes
+22 character-literal oracles across direct `#if`, `#elif`, and conditional
+include routes, plus eight bitset word-boundary cases. Entry-point collection
+requires exact named evidence (74 cases when the host is supplied), rejecting
+missing, duplicate, failed, unexpected or changed inventories before writing
+`proof-evidence.json`. This is a bounded pilot contract, not a claim that the
+70% portfolio is complete.
+
+Character preprocessing now reuses the literal decoder, including standard
+simple escapes, up to three octal digits, and hexadecimal escapes with the
+existing target byte-value convention. The preserved original compiler failed
+39 of the 66 preprocessing contracts; independent preprocessing confirmed the
+expected values. `tppreg` also rejects incorrect decoding at compile time without
+changing its runtime workload or baselines. Two new compiler restoration
+controls challenge this fix; all 41 prior mutants remain required.
+
+When auditing the retained memory proof against a campaign containing the
+additional controls, pass
+`--additional-proof scripts/compiler-branch-proof.json` to
+`audit-mir-memory-proof.py`. Its exact inventory becomes the prior controls,
+the original memory controls, and these explicitly declared additional
+controls. Unknown, missing, surviving or invalid controls still fail; no
+campaign results are silently filtered.
+
+All unfiltered exports/native reports/HTML use the same compiler and five host
+objects. New artifacts under the checkpoint's `compiler-coverage/report/` are:
+
+| Artifact | Evidence |
+| --- | --- |
+| `compiler-coverage.json` | Unfiltered LLVM export |
+| `compiler-function-detail.txt` | Native function/instantiation detail |
+| `compiler-function-inventory.json` | Independent body/name inventory, including zero-function files |
+| `compiler-function-coverage.json`, `compiler-function-summary.txt` | Exact source totals and identity counts |
+| `compiler-function-gaps.json`, `compiler-function-aliases.json` | Missed source bodies and transparent alias detail |
+
+Existing `summary.txt`, `ast-mir-*`, and HTML artifacts remain intact. Collection
+failure removes/prevents a success stamp; completed collection is not itself a
+successful function-coverage proof. Report-only provenance is checked before
+export against unchanged inputs/tools/binaries, execution manifest, and raw
+profiles. Coverage gaps return nonzero after writing diagnostic artifacts.
+Do not alter, resume, or mix the historical
+`build/mir-proof-suite-20261002-{130430-410603,175420-1564947}` checkpoints.
+
+### Exact whole-source branch accounting
+
+`scripts/compiler-branch-coverage.py` reconciles the independently compiled
+function-body inventory, unfiltered LLVM function/file records, macro expansion
+paths, and native `summary.txt`. Its standalone gate requires
+`10 * covered >= 7 * count`; rounded percentages cannot pass it.
+The historical 115,898/170,672 checkpoint therefore needs 119,471 covered
+outcomes, not 119,470. The gate is not yet wired into normal reporting:
+correctness-backed branch proofs must establish readiness first.
+
+```sh
+python3 scripts/compiler-branch-coverage.py \
+  --inventory build/compiler-coverage/report/compiler-function-inventory.json \
+  --coverage build/compiler-coverage/report/compiler-coverage.json \
+  --native-report build/compiler-coverage/report/summary.txt \
+  --output-dir build/compiler-coverage/report
+```
+
+Use `--allow-below-target` only for development diagnostics. Both modes write
+`compiler-branch-coverage.json`, including exact totals, deficit, per-source
+counts, aliases, excluded folded file regions, and individually identified
+true/false outcomes. `--baseline` compares compatible source mappings and
+reports new and lost outcomes separately; changed mappings fail instead of
+masquerading as execution gains. Existing checkpoint validation still owns
+input/tool/binary/profile and workload-completion identity; an offline branch
+report alone does not certify those contracts.
+
+LLVM file arrays contain alias duplicates and folded conditions. Function
+arrays exclude folded conditions and include header/nested macro branches.
+Repeated invocations need their complete expansion path, not just a header
+line. Native alias-group branch coverage takes the maximum instantiation
+coverage, not the union of complementary outcomes. Unattributable alias maxima
+and file/function/native disagreements fail closed; host code is excluded.
+
+The October 3 upstream merge adds 25 source functions and changes compiler
+branch mappings. Historical complete function coverage remains historical:
+the merged compiler needs fresh profiles and complete coverage of its expanded
+inventory. Never merge the old checkpoint's profiles into new objects.
+
+Normal entrypoint collection additionally checks all seven cache/liveness
+verification controls individually and together, exact oversized-function
+diagnostics, and the verifier's eight named bitset-layout cases. The packed
+reference is exercised through the existing liveness diagnostic on verified
+graphs, not a private-helper or preflight-bypass test. These controls restore
+proofs for new upstream diagnostic bodies without deleting uncovered code.
+Broad cache/reference corpus runs can be much slower than ordinary compilation:
+timeouts are invalid evidence, not compiler defects or mutation kills. Keep
+their profiles separate from assertion-passing batches.
+
+### Completed checkpoint: 2026-10-02
+
+The fresh integrated proof at `build/mir-proof-suite-20261002-195051-1893381/`
+passed all 11 phases with:
+
+```sh
+pwsh ./scripts/run-mir-proof-suite.ps1 -All -MutationJobs 0 -MutationBuildJobs 4 -RunTimeout 60
+```
+
+Native and HTML evidence under its `compiler-coverage/report/` agrees:
+
+| Metric | Whole compiler | Selected production AST/MIR |
+| --- | ---: | ---: |
+| Source functions covered/count | **5,168/5,168** | **4,638/4,638** |
+| Missed source functions | **0** | **0** |
+| Lines / regions / branches | 93.92% / 94.26% / 67.88% | 94.25% / 94.69% / 67.33% |
+
+All 35 historical gap targets executed; the 179 mixed-module classifications
+remained unchanged. Production `main=419391` and alias `dcc_driver_main=0`
+remain distinct raw identities of one covered source function. Report-only
+regeneration matched all 676 provenance/profile/report hashes, including 655 raw
+profiles; compiler sources and checked baseline hashes were unchanged. This
+proves the stated source-function objective for this checkpoint, not exhaustive
+branch/path or cross-platform coverage.
+
+## Live memory rewrite proof tranche
+
+This bounded proof layer keeps the completed function-coverage scopes and
+accounting unchanged. `mir_verify_and_dump` exercises the live dominated-load
+and little-endian rewrites with 71 named healthy host cases, independent
+original dominance checks, exact access/retirement/use assertions and repeated
+fresh-function cache checks. Thirteen dedicated compiler guard mutants extend
+the existing 28, with healthy-baseline gating and exact intended assertions.
+Profitability-only boundaries remain separate from semantic legality.
+
+The `memory-rewrite` clobber group adds 12 release/debug/stack/peep leaves with
+33 defined arithmetic/alias/qualifier checks per target execution and exact
+function-scoped MIR evidence. Full `-g` retains its intentionally unpromoted
+parameter loads; release/`-gline` must still optimize positive controls. The
+shared evidence checker also preserves the existing alias/qualifier assertions
+while rejecting missing, duplicate or wrong-function reports.
+
+Freeze the finite case/guard inventory before collection under a separate
+`build/memory-rewrite-proof/` workspace. After the fresh integrated checkpoint,
+validate its healthy unfiltered export, CTest host log, and compiler mutation
+logs against that inventory:
+
+```sh
+python3 scripts/audit-mir-memory-proof.py \
+  --inventory build/memory-rewrite-proof/inventory.json \
+  --coverage build/NEW-CHECKPOINT/compiler-coverage/report/compiler-coverage.json \
+  --host-log build/NEW-CHECKPOINT/mir-host/Testing/Temporary/LastTest.log \
+  --mutations build/NEW-CHECKPOINT/compiler-mutations/results.json \
+  --previous-mutations build/mir-proof-suite-20261002-195051-1893381/compiler-mutations/results.json \
+  --output build/memory-rewrite-proof/final-evidence.json
+```
+
+Every frozen feasible guard requires both positive outcome counts; excluded
+defensive or structurally unreachable paths remain explicitly classified.
+Pass-tail cache invalidation removed alone is masked by subsequent pipeline
+invalidation and is not claimed as a killed mutant. Do not merge compiler-mutant
+profiles into healthy coverage or alter historical checkpoint evidence.
+
+### Completed memory checkpoint: 2026-10-03
+
+`build/mir-proof-suite-20261003-030338-2930764/` completed all 11 integrated
+phases in 3h 53m 36s. The frozen audit confirms 71 cases, both outcomes of all
+30 mandatory feasible guards, one passing compiler baseline, and 41 killed
+mutants (28 retained plus 13 new), with no survivors or invalid results. Normal
+and sanitized host tests, debugger-host tests, 180 script tests, both strict
+release modes, and all prior proof workloads passed. All 10,080 previous
+clobber leaves remain present; only the 12 memory-rewrite leaves were added.
+
+| Scope | Source functions | Branch outcomes before / after |
+| --- | ---: | ---: |
+| Whole compiler | **5,168/5,168** | 115,848 / 115,898 of 170,672 |
+| Selected production AST/MIR | **4,638/4,638** | 107,287 / 107,337 of 159,346 |
+
+All 179 classifications and the independent source-function inventory are
+unchanged. Compiler sources and checked baselines matched all 585 protected
+hashes; both stack/no-stack migration censuses had zero changed apps/selections.
+No production compiler defect reproduced, so no production compiler changes
+were made. Dominated-load coverage advanced from 78/96 to 86/96 outcomes, endian
+combining from 31/42 to 39/42, and byte recognition from 18/42 to 38/42. These
+are bounded proof improvements, not claims of exhaustive semantic coverage.
+
+Report-only regeneration preserved profiles, provenance, JSON/native evidence
+and inventories. Of 835 captured hashes, 782 matched byte-for-byte and the
+remaining 53 HTML files differed only in LLVM's `Created:` timestamp, verified
+against the original hashes after normalizing that one header.
+
+Final review corrected one harness-only validation gap: `MirExpectations` now
+validates even when `DebugModes` is absent. Supplemental loader regressions,
+all 12 memory target modes and the identical full 10,092-leaf inventory passed.
+The original two affected harness files are retained under
+`build/memory-rewrite-proof/final-campaign-inputs/`; the completed checkpoint
+was not repinned or recollected. Current-checkout reuse of that frozen profile
+correctly rejects these two input changes. Its compiler/host graph sources,
+binaries, manifests and profiles remain unchanged. See
+`final-evidence.json`, `branch-delta.json`, `report-identity.json` and
+`supplemental-loader-validation.json` in the proof workspace.
+
+## October 1 bounded structural-proof checkpoint
+
+Merged-main base: `1dc57abd`; final integrated compiler: `548964f9`.
+The local regression runner is now `python3 scripts/runall.py`. Four new
+campaigns are registered in `compiler-coverage-campaigns.py`, raising its
+unique audit inventory from 103 to 107 without altering coverage denominators.
+
+| Matcher | Representative mutations | Rejected | Inactive/equivalent survivors | Target controls |
+| --- | ---: | ---: | ---: | ---: |
+| Status pack, Wave 10100 | 1,897 | 594 | 1,303 | 42 |
+| Recursive wide product, Wave 10200 | 462 | 107 | 355 | 88 |
+| Recursive frame fill, Wave 10300 | 1,222 | 599 | 623 | 42 |
+| Byte rotate flags, Wave 10400 | 3,357 | 1,914 | 1,443 | 48 |
+
+These opcode-aware structural/type/value/CFG checks do not introduce raw
+fingerprints as legality gates. Accepted inactive/equivalent mutations retain
+the valid schedule; they are not counted as defects or hidden by changing the
+mutation inventory. No active semantic survivor remained in these sampled
+campaigns. K&R and renamed positive controls preserve valid existing output.
+
+Independent parent reproductions are retained under
+`build/october-phase-{status,product,frame,rotate}-parent`:
+status-pack conversion `10:type:6` produced 32/64 failures versus zero in a
+same-MIR generic oracle; product comparison width `5:secondary_offset:2`
+incorrectly retained the wide schedule (its oracle is a narrow source form,
+not same-MIR generic execution); frame-fill STORE 35 displacement `+2`
+incorrectly retained a sink `+0` write; rotate dead-local STORE 42/95
+displacement `+7` ignored observable parameter writes. The latter persistent
+same-MIR witness changes from exact `(0,144,3592415270)` to generic and corrected
+fallback `(24,144,4253289564)`. Its nonzero fixture failures deliberately witness
+the mutated program's changed semantics, not a failing release control.
+These are active-MIR proof defects; natural-C reachability is not asserted.
+The signed-char/128 frame-fill experiment eventually accesses out of bounds
+and is not used as a defined-behavior correctness oracle.
+
+The restored rotate-overwrite near-match independently reproduced a defined-C
+generic-emitter defect on merged main and the pre-fix proof tree: 24/144
+failures, checksum 2137218272 rather than the masked target/Python oracle's
+1692113144. Forwarding the promoted boolean at MIR99 into cast101 skipped
+writing its named home; branch118 subsequently read the unwritten byte.
+`548964f9` materializes that home when additional uses exist while preserving
+HL forwarding and unchanged cast-only output. The permanent control tests
+normal and forced generic selection, renamed source, both stack modes, and
+peep/nopeep execution. It now passes; no failing control was discarded.
+Evidence is retained under `build/october-phase-fallback-parent/` and
+`build/october-phase-published/byte-rotate-flags-wave10400-audit/`.
+
+On the final compiler tree both strict Python full+extended release modes passed:
+483/507 apps, 24 documented skips, diagnostics/peephole/extended checks clean,
+zero checked stack-mode performance regressions. Both 3,063-function censuses
+match merged main without changed selections/output. Normal and ASan/UBSan
+host tests pass 5/5 each; debugger-host tests pass 10/10. The 136 Python tests
+and six registry tests pass. Final registered campaign artifacts are under
+`build/october-phase-published/`; raw faulty-compiler profiles are not coverage.
+
+The four-matcher phase, including its discovered generic-fallback regression,
+is complete. Aggregate line/branch/region metrics remain stale. This checkpoint
+claims no percentage gain, no exhaustive proof over mutation combinations, and
+no completion of the broader 100% goal. Fresh aggregate coverage and ranked
+gap review belong to a later authorized phase.
+
 ## Batched, parallel execution
 
 Run focused new cases during development; collect the full corpus once for an
@@ -48,6 +341,12 @@ cannot reuse a previous success stamp. Editing inputs requires a new build
 checkpoint and collection; profiles from separate worker revisions or faulty
 compiler mutants must not be combined. Initialized test-submodule files are
 included in the input identity.
+
+Input identity describes the working tree, including new untracked sources and
+excluding tracked files already deleted before `build`. Unstaged deletions and
+renames do not require a commit or staging first. Adding, removing, renaming,
+or modifying an input after the build snapshot still invalidates the checkpoint
+and requires rebuilding and recollecting.
 
 `inputs.json`, `build.json` and `collection.json` are generated provenance
 artifacts, not coverage exclusions. A build-directory lock prevents overlapping
@@ -2120,7 +2419,7 @@ The scoped report includes:
 - MIR lowering, verification, allocation, selection, streams, and production
    emitters, including the active `dcc_mir_machine_*.c` schedules.
 
-It excludes the legacy direct-codegen modules, all mixed `dcc_ast_gen*.c`
+It excludes the legacy direct-codegen modules, all mixed `dcc_ast_*.c`
 modules, and the optional `dcc_mir_schedule.c` / `dcc_mir_target.c` shadow
 models. The separate function-scoped report adds classified active AST helpers.
 This historical baseline is
@@ -2194,10 +2493,10 @@ validation. CI runs this check independently of expensive coverage collection.
 
 | Mixed module | Production | Legacy-only |
 | --- | ---: | ---: |
-| `dcc_ast_gen.c` | 87 | 7 |
-| `dcc_ast_gen_cond.c` | 29 | 27 |
-| `dcc_ast_gen_expr.c` | 14 | 73 |
-| `dcc_ast_gen_support.c` | 41 | 8 |
+| `dcc_ast_classify.c` | 87 | 7 |
+| `dcc_ast_stmt_classify.c` | 29 | 27 |
+| `dcc_ast_capture.c` | 14 | 73 |
+| `dcc_ast_support.c` | 41 | 8 |
 | Total | 171 | 115 |
 
 Production roots were traced from `dcc_ast_metadata.c`, `dcc_ast_stmt_meta.c`,
@@ -2212,7 +2511,7 @@ Seven mixed-module references cross from included functions to excluded
 emitters. The manifest records each guard: initializer capture returns when
 MIR is active; discarded expressions use MIR instead of dead-expression
 emission; inline metadata passes `emit_values=0`. The analogous external
-`emit_init_auto_struct_type` reference to `ast_gen_expr` also follows a MIR
+`parse_auto_struct_initializer` reference to `ast_gen_expr` also follows a MIR
 capture path that bypasses emission. These are reviewed control-flow arguments,
 not a whole-program reachability proof. The validator detects changed reference
 sets, not edits to the guards themselves. Positive execution of an excluded

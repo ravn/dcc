@@ -534,11 +534,10 @@ static int mir_debug_value_is_live(int value, int point)
         mir.live_out == NULL || mir.count <= 0)
         return 0;
     if (point >= mir.count)
-        return mir.live_out[
-            (size_t)(mir.count - 1) * mir.next_value + value] != 0;
+        return MIR_LIVE_TEST(mir.live_out, mir.count - 1, value);
     if (point < 0)
         return 0;
-    return mir.live_in[(size_t)point * mir.next_value + value] != 0;
+    return MIR_LIVE_TEST(mir.live_in, point, value);
 }
 
 static void mir_debug_declared_name(int declaration, char *name,
@@ -1091,7 +1090,7 @@ static int mir_get_object(const struct Sym *sym, const char *name)
         }
     }
     if (index >= 0) {
-        /* #itmpN inline-call-argument slots (dcc_ast_gen_expr.c's
+        /* #itmpN inline-call-argument slots (dcc_ast_capture.c's
          * prepare_inline_arg_temps) are a fixed pool of names reused, with a
          * fresh type/offset stamped per call, across every unrelated
          * static-inline call site in the function. A real C identifier's
@@ -2458,6 +2457,7 @@ static int mir_lower_incdec(const struct AstNode *operand, int operation,
     int one;
     int new_value;
     int operand_type;
+    int lvalue_type;
     long step = 1;
 
     if (operand == NULL)
@@ -2465,6 +2465,11 @@ static int mir_lower_incdec(const struct AstNode *operand, int operation,
     if (operand->kind != AST_IDENT)
         mir.has_indirect_incdec = 1;
     operand_type = operand->type;
+    /* Recover the stored byte type without changing the established MIR
+     * types and matcher shapes for word and pointer increments. */
+    lvalue_type = mir_lvalue_type(operand);
+    if (type_size(lvalue_type) == 1)
+        operand_type = lvalue_type;
     if (operand->kind == AST_IDENT) {
         struct Sym *symbol = mir_ident_symbol(operand);
         if (symbol != NULL)
@@ -2507,6 +2512,11 @@ static int mir_lower_incdec(const struct AstNode *operand, int operation,
     insn->type = operand_type;
     insn->secondary_offset = operand_type;
     insn->immediate = operation == TOK_INC ? '+' : '-';
+    if (operand->kind == AST_IDENT) {
+        struct Sym *symbol = mir_ident_symbol(operand);
+        insn->narrowed_for_counter_update =
+            symbol != NULL && symbol->is_narrowed_for_counter;
+    }
     if (operand->kind == AST_IDENT) {
         mir_emit_ident_store(operand, new_value);
     } else {
@@ -4344,11 +4354,8 @@ void mir_begin_function(const char *name, const char *assembly_name,
     mir.init_expression_target = NULL;
     mir.vla_target = NULL;
     mir.sink_purpose = sink_purpose;
-    mir.emit_mode = 1;
     mir.report_mode = getenv("DCC_MIR_REPORT") != NULL ||
                       getenv("DCC_MIR_FUNCTION") != NULL ||
-                      getenv("DCC_MIR_CANDIDATES") != NULL ||
-                      getenv("DCC_MIR_GENERAL_CANDIDATES") != NULL ||
                       getenv("DCC_MIR_EMIT_FUNCTION") != NULL ||
                       getenv("DCC_MIR_GENERAL_FUNCTION") != NULL;
     mir.return_type = current_return_type != 0 ? current_return_type
@@ -4446,7 +4453,7 @@ void mir_note_declared_symbol(struct Sym *symbol)
         /* Most re-declarations of an existing name are the same variable
          * seen again (e.g. every AST_IDENT for it) and keep the same type,
          * so this rarely trips - but #itmpN inline-call-argument slots
-         * (dcc_ast_gen_expr.c's prepare_inline_arg_temps) are a small pool
+         * (dcc_ast_capture.c's prepare_inline_arg_temps) are a small pool
          * of names *reused with a fresh type per call* across unrelated
          * static-inline call sites, and mir.declared_types[] only has room
          * for one type per name. Once a name is seen with more than one
@@ -5288,12 +5295,12 @@ static int mir_value_use_count_after(int value, int instruction)
     return count;
 }
 
-static int mir_value_live_out_of_instruction(int value, int instruction)
+int mir_value_live_out_of_instruction(int value, int instruction)
 {
     if (instruction >= 0 && instruction < mir.count &&
         value >= 0 && value < mir.next_value &&
         mir.live_out != NULL)
-        return mir.live_out[(size_t)instruction * mir.next_value + value] != 0;
+        return MIR_LIVE_TEST(mir.live_out, instruction, value);
     return mir_value_has_use_after(value, instruction);
 }
 
@@ -5596,6 +5603,8 @@ static int mir_common_expressions_equal(const struct MirInsn *left,
            left->bit_width == right->bit_width &&
            left->bit_shift == right->bit_shift &&
            left->bit_mask == right->bit_mask &&
+           left->narrowed_for_counter_update ==
+               right->narrowed_for_counter_update &&
            (strcmp(left->name, right->name) == 0 ||
             (left->opcode == MIR_LOAD && left->object >= 0 &&
              left->object == right->object)) &&
@@ -5814,7 +5823,9 @@ static int mir_dominated_load_pure_value_equal(
                left->memory_flags == right->memory_flags &&
                left->bit_width == right->bit_width &&
                left->bit_shift == right->bit_shift &&
-               left->bit_mask == right->bit_mask;
+               left->bit_mask == right->bit_mask &&
+               left->narrowed_for_counter_update ==
+                   right->narrowed_for_counter_update;
     case MIR_MEMBER_ADDRESS:
         return mir_dominated_load_pure_value_equal(
                    left->src1, right->src1, depth + 1) &&
@@ -7672,7 +7683,7 @@ void mir_resolve_deferred_metadata(void)
         int named_type;
         if (insn->name[0] == 0)
             continue;
-        /* #itmpN inline-call-argument slots (dcc_ast_gen_expr.c's
+        /* #itmpN inline-call-argument slots (dcc_ast_capture.c's
          * prepare_inline_arg_temps) are a fixed pool of 16 names reused,
          * with a fresh type stamped per call, across every unrelated
          * static-inline call site in the function - unlike a real C99
@@ -8675,7 +8686,7 @@ int mir_extended_integer_constant_conversion_folds(void)
     return mir_extended_integer_constant_conversion_fold_count;
 }
 
-int mir_find_label(int label)
+static int mir_find_label_uncached(int label)
 {
     int i;
 
@@ -8683,6 +8694,104 @@ int mir_find_label(int label)
         if (mir.insns[i].opcode == MIR_LABEL && mir.insns[i].label == label)
             return i;
     return -1;
+}
+
+static int mir_label_cache_verify_enabled(void)
+{
+    static int flag = -1;
+    if (flag < 0)
+        flag = getenv("DCC_MIR_LABEL_CACHE_VERIFY") != NULL;
+    return flag;
+}
+
+struct MirLabelIndex {
+    int label;
+    int instruction;
+};
+
+static int mir_label_index_compare(const void *left, const void *right)
+{
+    const struct MirLabelIndex *a = (const struct MirLabelIndex *)left;
+    const struct MirLabelIndex *b = (const struct MirLabelIndex *)right;
+
+    if (a->label != b->label)
+        return a->label < b->label ? -1 : 1;
+    return a->instruction < b->instruction ? -1 :
+           a->instruction > b->instruction;
+}
+
+/* Called per jump/branch target from selection, slot preparation, and CFG
+ * walks for every cost candidate (~190K calls on tbytepre.c), each an
+ * O(mir.count) rescan. Caches a label-sorted (label, instruction) table,
+ * rebuilt when mir_use_cache_generation_id() changes. A cached hit is only
+ * returned after re-checking that the instruction is still that MIR_LABEL
+ * (label fields are rewritten by a few CFG passes); anything else falls
+ * back to the plain scan, so a stale table can cost time but not change the
+ * answer. DCC_MIR_LABEL_CACHE_VERIFY=1 also compares every answer with the
+ * plain scan and fatals on a mismatch. */
+int mir_find_label(int label)
+{
+    static unsigned cached_generation;
+    static int cache_valid;
+    static struct MirLabelIndex *table;
+    static int table_capacity;
+    static int table_count;
+    unsigned generation = mir_use_cache_generation_id();
+    int low;
+    int high;
+    int result = -1;
+    int i;
+
+    if (!cache_valid || generation != cached_generation) {
+        table_count = 0;
+        for (i = 0; i < mir.count; ++i) {
+            if (mir.insns[i].opcode != MIR_LABEL)
+                continue;
+            if (table_count == table_capacity) {
+                int capacity = table_capacity ? table_capacity * 2 : 64;
+                struct MirLabelIndex *grown = (struct MirLabelIndex *)realloc(
+                    table, (size_t)capacity * sizeof(*grown));
+                if (grown == NULL)
+                    fatal("out of memory building MIR label cache");
+                table = grown;
+                table_capacity = capacity;
+            }
+            table[table_count].label = mir.insns[i].label;
+            table[table_count].instruction = i;
+            ++table_count;
+        }
+        qsort(table, (size_t)table_count, sizeof(*table),
+              mir_label_index_compare);
+        cached_generation = generation;
+        cache_valid = 1;
+    }
+    low = 0;
+    high = table_count;
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+        if (table[middle].label < label)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    if (low < table_count && table[low].label == label) {
+        int instruction = table[low].instruction;
+        if (instruction < mir.count &&
+            mir.insns[instruction].opcode == MIR_LABEL &&
+            mir.insns[instruction].label == label)
+            result = instruction;
+    }
+    if (result < 0)
+        result = mir_find_label_uncached(label);
+    if (mir_label_cache_verify_enabled() &&
+        result != mir_find_label_uncached(label)) {
+        fprintf(stderr,
+                "; MIR CACHE MISMATCH mir_find_label function=%s label=%d "
+                "cached=%d uncached=%d\n",
+                mir.name, label, result, mir_find_label_uncached(label));
+        fatal("MIR use-cache mismatch");
+    }
+    return result;
 }
 
 /* Item T61 (mir-text-size-plan.md): every scalar-cfg backend emits one
@@ -8877,7 +8986,7 @@ static int mir_first_phi_or_block_end_uncached(int successor)
  * mir_eliminate_common_block_expressions,
  * mir_eliminate_common_region_expressions,
  * mir_simplify_boolean_phi_branches, and mir_forward_immediate_phi_returns
- * all look like early/construction helpers by file position but are invoked
+ * all look like early/construction helpers by file position but were invoked
  * from dcc_mir_select.c during selection (the last one only found after the
  * first four already fixed the listed failures, by tracing every caller of
  * the mutator primitives mir_make_nop/mir_replace_value_uses/
@@ -8889,11 +8998,14 @@ static int mir_first_phi_or_block_end_uncached(int successor)
  * even invalidating at their return wouldn't have been enough. Each now
  * suspends mir_use_cache_scope_active for its own duration and invalidates
  * on the way out (see each one's own
- * comment). With those four isolated, the "immutable after promotion"
- * argument below is what actually holds, and this scope has a clean,
+ * comment). With those mutation scopes isolated, the "immutable after
+ * promotion" argument below is what actually holds, and this scope has a clean,
  * full-suite-verified pass (0 failures, 0 codegen regressions) to show for
  * it at each of the last two states - the narrow one first, standing alone,
- * and this wider one after. If a future change reintroduces a
+ * and this wider one after. In the current checkout only the Boolean PHI
+ * pass retains a production selection caller; the field-VN, common-expression
+ * and immediate-PHI passes remain host proof contracts. If a future change
+ * reintroduces a
  * miscompilation shaped like the ones above, suspect a fifth function with
  * this same shape before suspecting this cache's core logic, which hasn't
  * changed since the narrow scope's clean run.
@@ -8938,6 +9050,17 @@ static int *mir_use_cache_def_index;
 static int mir_use_cache_count_capacity;
 static int *mir_use_cache_phi_or_end;
 static int mir_use_cache_insn_capacity;
+/* Per-value use lists backing mir_next_use: the instructions using value v
+ * (as src1, src2, or - for a call - as one of its MIR_ARGs, exactly the
+ * mir_call_uses_value test) are mir_use_cache_use_list[use_start[v] ..
+ * use_start[v + 1] - 1], ascending, each instruction listed once.
+ * use_stamp is build-time scratch for that once-per-instruction dedup. */
+static int *mir_use_cache_use_start;
+static int *mir_use_cache_use_stamp;
+static int mir_use_cache_use_start_capacity;
+static int *mir_use_cache_use_list;
+static int mir_use_cache_use_list_capacity;
+static int mir_use_cache_use_value_count;
 
 void mir_invalidate_use_cache(void)
 {
@@ -8948,6 +9071,96 @@ void mir_invalidate_use_cache(void)
 unsigned mir_use_cache_generation_id(void)
 {
     return mir_use_cache_generation;
+}
+
+/* Records instruction `instruction` as a user of `value` - counting on the
+ * first pass (fill == NULL), filling on the second. Instructions are
+ * visited in ascending order, so the stamp alone dedups repeat operands. */
+static void mir_note_use(int value, int instruction, int *fill)
+{
+    if (value < 0 || value >= mir.next_value ||
+        mir_use_cache_use_stamp[value] == instruction)
+        return;
+    mir_use_cache_use_stamp[value] = instruction;
+    if (fill == NULL)
+        ++mir_use_cache_use_start[value + 1];
+    else
+        mir_use_cache_use_list[fill[value]++] = instruction;
+}
+
+/* Notes every value instruction i uses - the same test as
+ * (src1 == v || src2 == v || mir_call_uses_value(insn, v)) with the cache
+ * active, including mir_call_uses_value's uncached fallback for a call
+ * with a negative id (and its "no uses" answer for an id past
+ * next_call_id). */
+static void mir_note_instruction_uses(int i, int *fill)
+{
+    const struct MirInsn *insn = &mir.insns[i];
+    int arg;
+
+    mir_note_use(insn->src1, i, fill);
+    mir_note_use(insn->src2, i, fill);
+    if (insn->opcode != MIR_CALL && insn->opcode != MIR_CALL_AGGREGATE)
+        return;
+    if (insn->secondary_offset >= 0) {
+        if (insn->secondary_offset >= mir.next_call_id)
+            return;
+        for (arg = mir_use_cache_arg_head[insn->secondary_offset]; arg >= 0;
+             arg = mir_use_cache_arg_next[arg])
+            mir_note_use(mir.insns[arg].src1, i, fill);
+        return;
+    }
+    for (arg = 0; arg < mir.count; ++arg)
+        if (mir.insns[arg].opcode == MIR_ARG &&
+            mir.insns[arg].secondary_offset == insn->secondary_offset)
+            mir_note_use(mir.insns[arg].src1, i, fill);
+}
+
+static void mir_build_use_lists(void)
+{
+    int *fill;
+    int total;
+    int value;
+    int i;
+
+    if (mir.next_value + 1 > mir_use_cache_use_start_capacity) {
+        mir_use_cache_use_start_capacity = mir.next_value + 1;
+        mir_use_cache_use_start = (int *)realloc(mir_use_cache_use_start,
+            (size_t)mir_use_cache_use_start_capacity *
+                sizeof(*mir_use_cache_use_start));
+        mir_use_cache_use_stamp = (int *)realloc(mir_use_cache_use_stamp,
+            (size_t)mir_use_cache_use_start_capacity *
+                sizeof(*mir_use_cache_use_stamp));
+        if (mir_use_cache_use_start == NULL || mir_use_cache_use_stamp == NULL)
+            fatal("out of memory building MIR use lists");
+    }
+    for (value = 0; value <= mir.next_value; ++value) {
+        mir_use_cache_use_start[value] = 0;
+        mir_use_cache_use_stamp[value] = -1;
+    }
+    for (i = 0; i < mir.count; ++i)
+        mir_note_instruction_uses(i, NULL);
+    for (value = 0; value < mir.next_value; ++value)
+        mir_use_cache_use_start[value + 1] += mir_use_cache_use_start[value];
+    mir_use_cache_use_value_count = mir.next_value;
+    total = mir_use_cache_use_start[mir.next_value];
+    if (total > mir_use_cache_use_list_capacity) {
+        mir_use_cache_use_list_capacity = total;
+        mir_use_cache_use_list = (int *)realloc(mir_use_cache_use_list,
+            (size_t)total * sizeof(*mir_use_cache_use_list));
+        if (mir_use_cache_use_list == NULL)
+            fatal("out of memory building MIR use lists");
+    }
+    fill = (int *)malloc((size_t)(mir.next_value + 1) * sizeof(*fill));
+    if (fill == NULL)
+        fatal("out of memory building MIR use lists");
+    for (value = 0; value <= mir.next_value; ++value) {
+        fill[value] = mir_use_cache_use_start[value];
+        mir_use_cache_use_stamp[value] = -1;
+    }
+    for (i = 0; i < mir.count; ++i)
+        mir_note_instruction_uses(i, fill);
+    free(fill);
 }
 
 static void mir_ensure_use_cache(void)
@@ -9051,6 +9264,7 @@ static void mir_ensure_use_cache(void)
                 ++mir_use_cache_count[value];
         }
     }
+    mir_build_use_lists();
     mir_use_cache_dirty = 0;
 }
 
@@ -9160,29 +9374,111 @@ int mir_call_uses_value(const struct MirInsn *call, int value)
     return result;
 }
 
-int mir_value_has_use(int value)
+static int mir_next_use_uncached(int value, int after)
 {
-    int instruction;
-    for (instruction = 0; instruction < mir.count; ++instruction) {
-        const struct MirInsn *insn = &mir.insns[instruction];
+    int i;
+
+    for (i = after < 0 ? 0 : after + 1; i < mir.count; ++i) {
+        const struct MirInsn *insn = &mir.insns[i];
         if (insn->src1 == value || insn->src2 == value ||
             mir_call_uses_value(insn, value))
-            return 1;
+            return i;
     }
-    return 0;
+    return -1;
+}
+
+/* Smallest instruction index > after that uses value - as src1, src2, or
+ * a call argument (mir_call_uses_value) - or -1 if none. Lets "every use of
+ * v is shaped like X" predicates walk just v's uses,
+ *     for (i = mir_next_use(v, -1); i >= 0; i = mir_next_use(v, i))
+ * in the same ascending order a full-function scan for those same uses
+ * visits them, instead of testing every instruction - one such scan per
+ * value is the O(values * instructions) pattern that dominated backend
+ * slot preparation and selection under the per-candidate cost policy.
+ * Backed by the def-use cache's per-value use lists while its scope is
+ * active (DCC_MIR_CACHE_VERIFY covers it); a plain scan otherwise. */
+int mir_next_use(int value, int after)
+{
+    const int *list;
+    int low;
+    int high;
+    int result;
+
+    if (!mir_use_cache_scope_active || value < 0)
+        return mir_next_use_uncached(value, after);
+    mir_ensure_use_cache();
+    result = -1;
+    if (value < mir_use_cache_use_value_count) {
+        list = mir_use_cache_use_list;
+        low = mir_use_cache_use_start[value];
+        high = mir_use_cache_use_start[value + 1];
+        while (low < high) {
+            int middle = low + (high - low) / 2;
+            if (list[middle] <= after)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        if (low < mir_use_cache_use_start[value + 1])
+            result = list[low];
+    }
+    if (mir_use_cache_verify_enabled() &&
+        result != mir_next_use_uncached(value, after)) {
+        fprintf(stderr,
+                "; MIR CACHE MISMATCH mir_next_use function=%s value=%d "
+                "after=%d cached=%d uncached=%d\n",
+                mir.name, value, after, result,
+                mir_next_use_uncached(value, after));
+        fatal("MIR use-cache mismatch");
+    }
+    return result;
+}
+
+static int mir_last_use_uncached(int value)
+{
+    int i;
+
+    for (i = mir.count - 1; i >= 0; --i) {
+        const struct MirInsn *insn = &mir.insns[i];
+        if (insn->src1 == value || insn->src2 == value ||
+            mir_call_uses_value(insn, value))
+            return i;
+    }
+    return -1;
+}
+
+/* Largest instruction index using value (same use test as mir_next_use),
+ * or -1 if none. */
+int mir_last_use(int value)
+{
+    int result;
+
+    if (!mir_use_cache_scope_active || value < 0)
+        return mir_last_use_uncached(value);
+    mir_ensure_use_cache();
+    result = -1;
+    if (value < mir_use_cache_use_value_count &&
+        mir_use_cache_use_start[value + 1] > mir_use_cache_use_start[value])
+        result = mir_use_cache_use_list[mir_use_cache_use_start[value + 1] - 1];
+    if (mir_use_cache_verify_enabled() &&
+        result != mir_last_use_uncached(value)) {
+        fprintf(stderr,
+                "; MIR CACHE MISMATCH mir_last_use function=%s value=%d "
+                "cached=%d uncached=%d\n",
+                mir.name, value, result, mir_last_use_uncached(value));
+        fatal("MIR use-cache mismatch");
+    }
+    return result;
+}
+
+int mir_value_has_use(int value)
+{
+    return mir_next_use(value, -1) >= 0;
 }
 
 int mir_value_has_use_after(int value, int instruction)
 {
-    int i;
-
-    for (i = instruction + 1; i < mir.count; ++i) {
-        const struct MirInsn *insn = &mir.insns[i];
-        if (insn->src1 == value || insn->src2 == value ||
-            mir_call_uses_value(insn, value))
-            return 1;
-    }
-    return 0;
+    return mir_next_use(value, instruction) >= 0;
 }
 
 /* True if a value occupies `color` on both sides of this instruction.
@@ -9195,12 +9491,10 @@ int mir_home_color_live_across(int instruction, int color)
 
     if (instruction >= 0 && instruction < mir.count &&
         mir.live_in != NULL && mir.live_out != NULL) {
-        size_t row = (size_t)instruction * mir.next_value;
-
         for (value = 0; value < mir.next_value; ++value)
             if (mir.allocation_colors[value] == color &&
-                mir.live_in[row + value] != 0 &&
-                mir.live_out[row + value] != 0)
+                MIR_LIVE_TEST(mir.live_in, instruction, value) &&
+                MIR_LIVE_TEST(mir.live_out, instruction, value))
                 return 1;
         return 0;
     }
@@ -9226,16 +9520,14 @@ int mir_home_color_live_across(int instruction, int color)
 int mir_de_home_live_in(int instruction)
 {
     int value;
-    size_t row;
 
     if (instruction < 0 || instruction >= mir.count ||
         mir.live_in == NULL)
         return 0;
-    row = (size_t)instruction * mir.next_value;
     for (value = 0; value < mir.next_value; ++value)
         if ((mir.allocation_colors[value] == MIR_COLOR_DE ||
              mir.allocation_colors[value] == MIR_COLOR_HL_DE) &&
-            mir.live_in[row + value] != 0)
+            MIR_LIVE_TEST(mir.live_in, instruction, value))
             return 1;
     return 0;
 }
@@ -9759,15 +10051,21 @@ static void mir_add_interference_edge(struct MirInterferenceGraph *graph,
  * value indices, returning how many are live. Liveness sets are typically
  * sparse relative to value_count, so every consumer below walks this list
  * instead of re-scanning the full bitmap. */
-static int mir_compact_live_set(const unsigned char *live, int value_count,
+static int mir_compact_live_set(const MirLiveWord *live, int value_count,
                                 int *live_list)
 {
-    int i;
+    size_t words = MIR_LIVE_ROW_WORDS(value_count);
+    size_t word;
     int count = 0;
 
-    for (i = 0; i < value_count; ++i)
-        if (live[i])
-            live_list[count++] = i;
+    for (word = 0; word < words; ++word) {
+        MirLiveWord bits = live[word];
+        int value = (int)(word * 64);
+
+        for (; bits != 0; bits >>= 1, ++value)
+            if (bits & 1)
+                live_list[count++] = value;
+    }
     return count;
 }
 
@@ -9930,8 +10228,8 @@ int mir_iy_home_live_across_caller_clobber(void)
 }
 
 static void mir_allocate_registers_stable(
-    const unsigned char *live_in,
-    const unsigned char *live_out,
+    const MirLiveWord *live_in,
+    const MirLiveWord *live_out,
     struct MirAllocationSummary *summary,
     int allow_wide_colors,
     const unsigned char *rematerializable,
@@ -10009,8 +10307,8 @@ static void mir_allocate_registers_stable(
             mir_value_backs_declared_register_object(i);
 
     for (i = 0; i < mir.count; ++i) {
-        const unsigned char *in = &live_in[(size_t)i * value_count];
-        const unsigned char *out = &live_out[(size_t)i * value_count];
+        const MirLiveWord *in = MIR_LIVE_ROW(live_in, i);
+        const MirLiveWord *out = MIR_LIVE_ROW(live_out, i);
         int in_count = mir_compact_live_set(in, value_count, live_in_list);
         int out_count =
             mir_compact_live_set(out, value_count, live_out_list);
@@ -10026,7 +10324,8 @@ static void mir_allocate_registers_stable(
         if (mir_instruction_clobbers_caller_registers(&mir.insns[i]) ||
             mir.insns[i].opcode == MIR_OPAQUE) {
             for (value = 0; value < value_count; ++value) {
-                if (!in[value] || !out[value])
+                if (!MIR_LIVE_ROW_TEST(in, value) ||
+                    !MIR_LIVE_ROW_TEST(out, value))
                     continue;
                 if (mir.insns[i].opcode == MIR_OPAQUE) {
                     cross_opaque[value] = 1;
@@ -10292,8 +10591,8 @@ static void mir_allocate_registers_stable(
 }
 
 static void mir_allocate_registers(
-    const unsigned char *live_in,
-    const unsigned char *live_out,
+    const MirLiveWord *live_in,
+    const MirLiveWord *live_out,
     struct MirAllocationSummary *summary,
     int allow_wide_colors,
     const unsigned char *rematerializable,
@@ -10644,8 +10943,8 @@ static int mir_regional_value_call_crossings(int value)
     for (instruction = 0; instruction < mir.count; ++instruction)
         if (mir_instruction_clobbers_caller_registers(
                 &mir.insns[instruction]) &&
-            mir.live_in[(size_t)instruction * mir.next_value + value] &&
-            mir.live_out[(size_t)instruction * mir.next_value + value])
+            MIR_LIVE_TEST(mir.live_in, instruction, value) &&
+            MIR_LIVE_TEST(mir.live_out, instruction, value))
             ++count;
     return count;
 }
@@ -10677,8 +10976,7 @@ static int mir_regional_value_crosses_region(int value)
     int region;
 
     for (region = 0; region < mir.region_count; ++region)
-        if (mir.live_out[(size_t)mir.regions[region].last *
-                         mir.next_value + value])
+        if (MIR_LIVE_TEST(mir.live_out, mir.regions[region].last, value))
             return 1;
     return 0;
 }
@@ -10849,11 +11147,9 @@ static int mir_regional_add_segment(int value, int region)
     segment->next_for_value =
         mir.regional_segment_heads[value];
     mir.regional_segment_heads[value] = index;
-    if (mir.live_in[(size_t)mir.regions[region].first *
-                    mir.next_value + value])
+    if (MIR_LIVE_TEST(mir.live_in, mir.regions[region].first, value))
         segment->flags |= MIR_REGIONAL_LIVE_IN;
-    if (mir.live_out[(size_t)mir.regions[region].last *
-                     mir.next_value + value])
+    if (MIR_LIVE_TEST(mir.live_out, mir.regions[region].last, value))
         segment->flags |= MIR_REGIONAL_LIVE_OUT;
     if (definition >= mir.regions[region].first &&
         definition <= mir.regions[region].last) {
@@ -10905,10 +11201,8 @@ static int mir_regional_available_colors(
 
             if (other == value ||
                 (candidate != NULL && candidate[other]) ||
-                (!mir.live_in[(size_t)instruction *
-                              mir.next_value + other] &&
-                 !mir.live_out[(size_t)instruction *
-                               mir.next_value + other] &&
+                (!MIR_LIVE_TEST(mir.live_in, instruction, other) &&
+                 !MIR_LIVE_TEST(mir.live_out, instruction, other) &&
                  mir.insns[instruction].dst != other))
                 continue;
             color = mir_regional_base_colors[other];
@@ -11055,10 +11349,8 @@ static void mir_regional_mark_value_occupancy(
     int instruction;
 
     for (instruction = 0; instruction < mir.count; ++instruction)
-        if (mir.live_in[(size_t)instruction *
-                        mir.next_value + value] ||
-            mir.live_out[(size_t)instruction *
-                         mir.next_value + value] ||
+        if (MIR_LIVE_TEST(mir.live_in, instruction, value) ||
+            MIR_LIVE_TEST(mir.live_out, instruction, value) ||
             mir.insns[instruction].dst == value ||
             mir_regional_instruction_use_count(instruction, value) != 0)
             row[instruction] = 1;
@@ -11951,7 +12243,7 @@ void mir_regional_after_instruction(int instruction)
 }
 
 static int mir_physical_phi_liveness_needs_stable_recoloring(
-    const unsigned char *live_out)
+    const MirLiveWord *live_out)
 {
     int phi_instruction;
 
@@ -11962,7 +12254,7 @@ static int mir_physical_phi_liveness_needs_stable_recoloring(
         int instruction;
 
         if (phi->opcode != MIR_PHI || phi->dst < 0 ||
-            !live_out[(size_t)phi_instruction * mir.next_value + phi->dst])
+            !MIR_LIVE_TEST(live_out, phi_instruction, phi->dst))
             continue;
         for (instruction = mir_phi_physical_start(phi_instruction);
              instruction < phi_instruction;
@@ -11975,7 +12267,7 @@ static int mir_physical_phi_liveness_needs_stable_recoloring(
 }
 
 static void mir_extend_physical_phi_liveness(
-    unsigned char *live_in, unsigned char *live_out)
+    MirLiveWord *live_in, MirLiveWord *live_out)
 {
     int phi_instruction;
 
@@ -11987,20 +12279,20 @@ static void mir_extend_physical_phi_liveness(
         int physical_start;
 
         if (phi->opcode != MIR_PHI || phi->dst < 0 ||
-            !live_out[(size_t)phi_instruction * mir.next_value + phi->dst])
+            !MIR_LIVE_TEST(live_out, phi_instruction, phi->dst))
             continue;
         physical_start = mir_phi_physical_start(phi_instruction);
         for (instruction = physical_start;
              instruction < phi_instruction;
              ++instruction) {
-            live_in[(size_t)instruction * mir.next_value + phi->dst] = 1;
-            live_out[(size_t)instruction * mir.next_value + phi->dst] = 1;
+            MIR_LIVE_SET(live_in, instruction, phi->dst);
+            MIR_LIVE_SET(live_out, instruction, phi->dst);
         }
     }
 }
 
 static void mir_clear_physical_phi_liveness(
-    unsigned char *live_in, unsigned char *live_out)
+    MirLiveWord *live_in, MirLiveWord *live_out)
 {
     int phi_instruction;
 
@@ -12016,8 +12308,8 @@ static void mir_clear_physical_phi_liveness(
         for (instruction = mir_phi_physical_start(phi_instruction);
              instruction < phi_instruction;
              ++instruction) {
-            live_in[(size_t)instruction * mir.next_value + phi->dst] = 0;
-            live_out[(size_t)instruction * mir.next_value + phi->dst] = 0;
+            MIR_LIVE_CLEAR(live_in, instruction, phi->dst);
+            MIR_LIVE_CLEAR(live_out, instruction, phi->dst);
         }
     }
 }
@@ -12050,8 +12342,8 @@ int mir_probe_wide_colors_for_homed(
     int *saved_spills;
     int saved_spill_count;
     struct MirAllocationSummary summary;
-    unsigned char *textual_live_in = NULL;
-    unsigned char *textual_live_out = NULL;
+    MirLiveWord *textual_live_in = NULL;
+    MirLiveWord *textual_live_out = NULL;
     int *textual_colors = NULL;
     int narrow_spills = 0;
     int wide_spills = 0;
@@ -12075,10 +12367,11 @@ int mir_probe_wide_colors_for_homed(
 
     if (mir_physical_phi_liveness_needs_stable_recoloring(
             mir.live_out)) {
-        size_t bytes = (size_t)mir.count * value_count;
+        size_t bytes = MIR_LIVE_MATRIX_WORDS(mir.count, value_count) *
+                       sizeof(MirLiveWord);
 
-        textual_live_in = (unsigned char *)malloc(bytes);
-        textual_live_out = (unsigned char *)malloc(bytes);
+        textual_live_in = (MirLiveWord *)malloc(bytes);
+        textual_live_out = (MirLiveWord *)malloc(bytes);
         textual_colors =
             (int *)malloc((size_t)value_count * sizeof(*textual_colors));
         if (textual_live_in == NULL || textual_live_out == NULL ||
@@ -12496,116 +12789,17 @@ static int mir_verify_structure(void)
     return valid;
 }
 
-int mir_verify_and_dump(void)
+/* The original per-instruction, per-value liveness fixed point - kept as
+ * the reference implementation (DCC_MIR_LIVENESS_VERIFY) and as the path
+ * for MIR with an out-of-range successor, whose per-value diagnostics and
+ * error count it reports. Returns that error count. */
+static int mir_compute_liveness_bytes(unsigned char *live_in,
+                                      unsigned char *live_out)
 {
-    unsigned char *defined;
-    unsigned char *live_in;
-    unsigned char *live_out;
     int errors = 0;
-    int block_count = 0;
-    int max_live = 0;
-    int opaque_count = 0;
-    int opaque_kinds[AST_DIVMOD_CALL + 1];
-    int promoted_objects;
-    struct MirAllocationSummary allocation;
     int changed;
     int i;
 
-    if (!mir_verify_structure())
-        return 0;
-    defined = (unsigned char *)calloc((size_t)mir.next_value, 1);
-    live_in = (unsigned char *)calloc((size_t)mir.count * mir.next_value, 1);
-    live_out = (unsigned char *)calloc((size_t)mir.count * mir.next_value, 1);
-    if ((mir.next_value && defined == NULL) ||
-        (mir.count && mir.next_value && (live_in == NULL || live_out == NULL)))
-        fatal("out of memory verifying MIR");
-
-    for (i = 0; i < mir.count; ++i) {
-        struct MirInsn *insn = &mir.insns[i];
-        int target;
-
-        insn->successor_count = 0;
-        if (insn->opcode == MIR_JUMP || insn->opcode == MIR_BRANCH_FALSE) {
-            target = mir_find_label(insn->label);
-            if (target < 0)
-                ++errors;
-            else
-                insn->successors[insn->successor_count++] = target;
-        }
-        if (insn->opcode == MIR_BRANCH_FALSE && i + 1 < mir.count)
-            insn->successors[insn->successor_count++] = i + 1;
-        else if (insn->opcode != MIR_JUMP && insn->opcode != MIR_RETURN &&
-                 i + 1 < mir.count)
-            insn->successors[insn->successor_count++] = i + 1;
-        if (i == 0 || insn->opcode == MIR_LABEL)
-            ++block_count;
-    }
-
-    memset(opaque_kinds, 0, sizeof(opaque_kinds));
-    mir_report_pointer_parameter_eligibility();
-    mir_filter_pointer_parameter_objects();
-    mir_filter_address_taken_scalar_objects();
-    promoted_objects = 0;
-    for (;;) {
-        int promoted_pass = mir_promote_objects();
-        if (promoted_pass < 0) {
-            promoted_objects += -promoted_pass - 1;
-            continue;
-        }
-        promoted_objects += promoted_pass;
-        break;
-    }
-    /* mir_promote_objects clears insn->dst in place (see the big comment
-     * above mir_use_cache_def_index) - invalidate so mir_definition's
-     * always-on cache picks up the post-promotion definitions instead of
-     * whatever was cached (if anything) before this ran. */
-    mir_invalidate_use_cache();
-    /*
-     * Promotion exposes the declared types behind stale lowering-time
-     * conversions, so refresh div/mod signedness before selection/emission.
-     */
-    mir_repair_divmod_types();
-    mir_eliminate_dominated_indirect_loads();
-    mir_combine_little_endian_byte_loads();
-
-    if (!mir_verify_structure()) {
-        free(defined);
-        free(live_in);
-        free(live_out);
-        return 0;
-    }
-
-    memset(defined, 0, (size_t)mir.next_value);
-    for (i = 0; i < mir.count; ++i) {
-        struct MirInsn *insn = &mir.insns[i];
-        if (insn->dst >= 0) {
-            if (defined[insn->dst]) {
-                if (mir.report_mode)
-                    fprintf(stderr, "; MIR %s: instruction %d redefines v%d\n",
-                            mir.name, i, insn->dst);
-                ++errors;
-            }
-            defined[insn->dst] = 1;
-        }
-    }
-
-    if (errors != 0 || !mir_verify_dominance()) {
-        free(defined);
-        free(live_in);
-        free(live_out);
-        return 0;
-    }
-
-    /* This loop only reads mir.insns (opcodes, src1/src2, successors) - it
-     * never rewrites an instruction in place and never calls mir_emit or
-     * anything that does - so it's safe to enable the def-use cache's fast
-     * path for exactly its duration. See the mir_use_cache_scope_active
-     * comment above mir_first_phi_or_block_end_uncached's cache for why that
-     * safety property matters and why it must not be assumed to hold for
-     * any other caller of mir_call_uses_value/mir_value_use_count/
-     * mir_first_phi_or_block_end. */
-    mir_invalidate_use_cache();
-    mir_use_cache_scope_active = 1;
     do {
         changed = 0;
         for (i = mir.count - 1; i >= 0; --i) {
@@ -12698,6 +12892,328 @@ int mir_verify_and_dump(void)
             }
         }
     } while (changed);
+    return errors;
+}
+
+/* Runs mir_compute_liveness_bytes into scratch byte matrices and packs the
+ * result into the bitset matrices - the path for MIR the bitset version
+ * declines (an out-of-range successor). Returns its error count. */
+static int mir_compute_liveness_packed(MirLiveWord *live_in,
+                                       MirLiveWord *live_out)
+{
+    size_t size = (size_t)mir.count * mir.next_value;
+    unsigned char *bytes_in = (unsigned char *)calloc(size ? size : 1, 1);
+    unsigned char *bytes_out = (unsigned char *)calloc(size ? size : 1, 1);
+    int errors;
+    int value;
+    int i;
+
+    if (bytes_in == NULL || bytes_out == NULL)
+        fatal("out of memory verifying MIR");
+    errors = mir_compute_liveness_bytes(bytes_in, bytes_out);
+    for (i = 0; i < mir.count; ++i)
+        for (value = 0; value < mir.next_value; ++value) {
+            if (bytes_in[(size_t)i * mir.next_value + value])
+                MIR_LIVE_SET(live_in, i, value);
+            if (bytes_out[(size_t)i * mir.next_value + value])
+                MIR_LIVE_SET(live_out, i, value);
+        }
+    free(bytes_in);
+    free(bytes_out);
+    return errors;
+}
+
+static int mir_liveness_verify_enabled(void)
+{
+    static int flag = -1;
+    if (flag < 0)
+        flag = getenv("DCC_MIR_LIVENESS_VERIFY") != NULL;
+    return flag;
+}
+
+/* The same liveness fixed point as mir_compute_liveness_bytes, on 64-bit
+ * bitsets with each instruction's transfer function precomputed once:
+ *     out[i] = OR over successors s of (in[s] | phi inputs on edge i->s)
+ *     in[i]  = (out[i] - {dst}) | uses (src1/src2/call args; none for PHI)
+ * Both start empty and only grow, so iterating to a fixed point yields the
+ * same least solution the byte version computes - but at one word per 64
+ * values instead of re-deriving every (instruction, value) pair, including
+ * a scan of the successor's phis, on every iteration. That was the single
+ * largest self-time cost for a large function. live_in/live_out must be
+ * zeroed MIR_LIVE_MATRIX_WORDS(mir.count, mir.next_value) matrices.
+ *
+ * Returns 0, leaving the matrices untouched, if any successor is out of
+ * range - the byte version reports those per value. Requires the def-use
+ * cache scope to be active (mir_next_use). DCC_MIR_LIVENESS_VERIFY=1 also
+ * runs the byte version and fatals if the matrices differ. */
+static int mir_compute_liveness_bitsets(MirLiveWord *live_in,
+                                        MirLiveWord *live_out)
+{
+    int count = mir.count;
+    int values = mir.next_value;
+    size_t words = ((size_t)values + 63) / 64;
+    unsigned long long *in_bits;
+    unsigned long long *out_bits;
+    unsigned long long *gen_bits;
+    unsigned long long *phi_bits;
+    unsigned long long *next_out;
+    int changed;
+    int value;
+    int i;
+
+    if (count == 0 || values == 0)
+        return 1;
+    for (i = 0; i < count; ++i) {
+        int successor;
+        for (successor = 0; successor < mir.insns[i].successor_count;
+             ++successor)
+            if (mir.insns[i].successors[successor] < 0 ||
+                mir.insns[i].successors[successor] >= count)
+                return 0;
+    }
+    in_bits = live_in;
+    out_bits = live_out;
+    gen_bits = (unsigned long long *)calloc((size_t)count * words,
+                                            sizeof(*gen_bits));
+    phi_bits = (unsigned long long *)calloc((size_t)count * words,
+                                            sizeof(*phi_bits));
+    next_out = (unsigned long long *)malloc(words * sizeof(*next_out));
+    if (in_bits == NULL || out_bits == NULL || gen_bits == NULL ||
+        phi_bits == NULL || next_out == NULL)
+        fatal("out of memory computing MIR liveness");
+
+    /* gen: every non-PHI instruction using the value - mir_next_use's use
+     * test is exactly the byte version's src1/src2/mir_call_uses_value. */
+    for (value = 0; value < values; ++value) {
+        int use;
+        for (use = mir_next_use(value, -1); use >= 0;
+             use = mir_next_use(value, use))
+            if (mir.insns[use].opcode != MIR_PHI)
+                gen_bits[(size_t)use * words + (size_t)value / 64] |=
+                    1ULL << (value % 64);
+    }
+    /* Phi inputs flowing along each edge out of instruction i. */
+    for (i = 0; i < count; ++i) {
+        const struct MirInsn *insn = &mir.insns[i];
+        unsigned long long *phi_row = &phi_bits[(size_t)i * words];
+        int predecessor_label = -1;
+        int predecessor_label_known = 0;
+        int successor;
+
+        for (successor = 0; successor < insn->successor_count; ++successor) {
+            int first = mir_first_phi_or_block_end(insn->successors[successor]);
+
+            if (first < 0 || first >= count ||
+                mir.insns[first].opcode != MIR_PHI)
+                continue;
+            if (!predecessor_label_known) {
+                predecessor_label = mir_block_label_before(i);
+                predecessor_label_known = 1;
+            }
+            for (; first < count; ++first) {
+                const struct MirInsn *phi = &mir.insns[first];
+
+                if (phi->opcode == MIR_NOP)
+                    continue;
+                if (phi->opcode != MIR_PHI)
+                    break;
+                if (predecessor_label == phi->phi_pred1 &&
+                    phi->src1 >= 0 && phi->src1 < values)
+                    phi_row[phi->src1 / 64] |= 1ULL << (phi->src1 % 64);
+                if (predecessor_label == phi->phi_pred2 &&
+                    phi->src2 >= 0 && phi->src2 < values)
+                    phi_row[phi->src2 / 64] |= 1ULL << (phi->src2 % 64);
+            }
+        }
+    }
+
+    do {
+        changed = 0;
+        for (i = count - 1; i >= 0; --i) {
+            const struct MirInsn *insn = &mir.insns[i];
+            unsigned long long *in_row = &in_bits[(size_t)i * words];
+            unsigned long long *out_row = &out_bits[(size_t)i * words];
+            const unsigned long long *gen_row = &gen_bits[(size_t)i * words];
+            const unsigned long long *phi_row = &phi_bits[(size_t)i * words];
+            size_t kill_word = words;
+            unsigned long long kill_mask = 0;
+            size_t word;
+            int successor;
+
+            if (insn->dst >= 0 && insn->dst < values) {
+                kill_word = (size_t)insn->dst / 64;
+                kill_mask = 1ULL << (insn->dst % 64);
+            }
+            memcpy(next_out, phi_row, words * sizeof(*next_out));
+            for (successor = 0; successor < insn->successor_count;
+                 ++successor) {
+                const unsigned long long *successor_in =
+                    &in_bits[(size_t)insn->successors[successor] * words];
+                for (word = 0; word < words; ++word)
+                    next_out[word] |= successor_in[word];
+            }
+            for (word = 0; word < words; ++word) {
+                unsigned long long next_in = next_out[word];
+
+                if (word == kill_word)
+                    next_in &= ~kill_mask;
+                next_in |= gen_row[word];
+                if (out_row[word] != next_out[word] ||
+                    in_row[word] != next_in) {
+                    out_row[word] = next_out[word];
+                    in_row[word] = next_in;
+                    changed = 1;
+                }
+            }
+        }
+    } while (changed);
+
+    free(gen_bits);
+    free(phi_bits);
+    free(next_out);
+
+    if (mir_liveness_verify_enabled()) {
+        size_t size = MIR_LIVE_MATRIX_WORDS(count, values);
+        MirLiveWord *reference_in = (MirLiveWord *)calloc(size, sizeof(*reference_in));
+        MirLiveWord *reference_out = (MirLiveWord *)calloc(size, sizeof(*reference_out));
+        size_t cell;
+
+        if (reference_in == NULL || reference_out == NULL)
+            fatal("out of memory verifying MIR liveness");
+        if (mir_compute_liveness_packed(reference_in, reference_out) != 0)
+            fatal("MIR liveness reference rejected verified successors");
+        /* Compare complete words, including unused tail bits. The packed
+         * reference still computes the independent byte fixed point. */
+        for (cell = 0; cell < size; ++cell) {
+            if (live_in[cell] != reference_in[cell] ||
+                live_out[cell] != reference_out[cell]) {
+                fprintf(stderr,
+                        "; MIR LIVENESS MISMATCH function=%s "
+                        "instruction=%d word=%lu\n",
+                        mir.name, (int)(cell / words),
+                        (unsigned long)(cell % words));
+                fatal("MIR liveness mismatch");
+            }
+        }
+        free(reference_in);
+        free(reference_out);
+    }
+    return 1;
+}
+
+int mir_verify_and_dump(void)
+{
+    unsigned char *defined;
+    MirLiveWord *live_in;
+    MirLiveWord *live_out;
+    int errors = 0;
+    int block_count = 0;
+    int max_live = 0;
+    int opaque_count = 0;
+    int opaque_kinds[AST_DIVMOD_CALL + 1];
+    int promoted_objects;
+    struct MirAllocationSummary allocation;
+    int i;
+
+    if (!mir_verify_structure())
+        return 0;
+    defined = (unsigned char *)calloc((size_t)mir.next_value, 1);
+    live_in = (MirLiveWord *)calloc(
+        MIR_LIVE_MATRIX_WORDS(mir.count, mir.next_value), sizeof(*live_in));
+    live_out = (MirLiveWord *)calloc(
+        MIR_LIVE_MATRIX_WORDS(mir.count, mir.next_value), sizeof(*live_out));
+    if ((mir.next_value && defined == NULL) ||
+        (mir.count && mir.next_value && (live_in == NULL || live_out == NULL)))
+        fatal("out of memory verifying MIR");
+
+    for (i = 0; i < mir.count; ++i) {
+        struct MirInsn *insn = &mir.insns[i];
+        int target;
+
+        insn->successor_count = 0;
+        if (insn->opcode == MIR_JUMP || insn->opcode == MIR_BRANCH_FALSE) {
+            target = mir_find_label(insn->label);
+            if (target < 0)
+                ++errors;
+            else
+                insn->successors[insn->successor_count++] = target;
+        }
+        if (insn->opcode == MIR_BRANCH_FALSE && i + 1 < mir.count)
+            insn->successors[insn->successor_count++] = i + 1;
+        else if (insn->opcode != MIR_JUMP && insn->opcode != MIR_RETURN &&
+                 i + 1 < mir.count)
+            insn->successors[insn->successor_count++] = i + 1;
+        if (i == 0 || insn->opcode == MIR_LABEL)
+            ++block_count;
+    }
+
+    memset(opaque_kinds, 0, sizeof(opaque_kinds));
+    mir_report_pointer_parameter_eligibility();
+    mir_filter_pointer_parameter_objects();
+    mir_filter_address_taken_scalar_objects();
+    promoted_objects = 0;
+    for (;;) {
+        int promoted_pass = mir_promote_objects();
+        if (promoted_pass < 0) {
+            promoted_objects += -promoted_pass - 1;
+            continue;
+        }
+        promoted_objects += promoted_pass;
+        break;
+    }
+    /* mir_promote_objects clears insn->dst in place (see the big comment
+     * above mir_use_cache_def_index) - invalidate so mir_definition's
+     * always-on cache picks up the post-promotion definitions instead of
+     * whatever was cached (if anything) before this ran. */
+    mir_invalidate_use_cache();
+    /*
+     * Promotion exposes the declared types behind stale lowering-time
+     * conversions, so refresh div/mod signedness before selection/emission.
+     */
+    mir_repair_divmod_types();
+    mir_eliminate_dominated_indirect_loads();
+    mir_combine_little_endian_byte_loads();
+
+    if (!mir_verify_structure()) {
+        free(defined);
+        free(live_in);
+        free(live_out);
+        return 0;
+    }
+
+    memset(defined, 0, (size_t)mir.next_value);
+    for (i = 0; i < mir.count; ++i) {
+        struct MirInsn *insn = &mir.insns[i];
+        if (insn->dst >= 0) {
+            if (defined[insn->dst]) {
+                if (mir.report_mode)
+                    fprintf(stderr, "; MIR %s: instruction %d redefines v%d\n",
+                            mir.name, i, insn->dst);
+                ++errors;
+            }
+            defined[insn->dst] = 1;
+        }
+    }
+
+    if (errors != 0 || !mir_verify_dominance()) {
+        free(defined);
+        free(live_in);
+        free(live_out);
+        return 0;
+    }
+
+    /* This loop only reads mir.insns (opcodes, src1/src2, successors) - it
+     * never rewrites an instruction in place and never calls mir_emit or
+     * anything that does - so it's safe to enable the def-use cache's fast
+     * path for exactly its duration. See the mir_use_cache_scope_active
+     * comment above mir_first_phi_or_block_end_uncached's cache for why that
+     * safety property matters and why it must not be assumed to hold for
+     * any other caller of mir_call_uses_value/mir_value_use_count/
+     * mir_first_phi_or_block_end. */
+    mir_invalidate_use_cache();
+    mir_use_cache_scope_active = 1;
+    if (!mir_compute_liveness_bitsets(live_in, live_out))
+        errors += mir_compute_liveness_packed(live_in, live_out);
     if (mir_physical_phi_liveness_needs_stable_recoloring(live_out)) {
         int *stable_colors = (int *)malloc(
             (size_t)mir.next_value * sizeof(*stable_colors));
@@ -12718,30 +13234,12 @@ int mir_verify_and_dump(void)
         mir_allocate_registers(
             live_in, live_out, &allocation, 0, NULL, 0);
     }
-    /* Left active on purpose past this point, through register allocation,
-     * backend slot preparation, instruction selection, and emission - i.e.
-     * for the rest of this attempt. This was tried once already on the
-     * strength of a grep across every .c file in this directory showing no
-     * assignment to opcode/src1/src2/secondary_offset/dst outside dcc_mir.c;
-     * that grep was accurate but the conclusion was wrong, because it only
-     * ruled out OTHER files mutating instructions - it didn't rule out
-     * functions defined in dcc_mir.c itself (so invisible to a
-     * "which file" grep) being called from those other files during
-     * selection. Four passes had exactly that shape - defined early in
-     * dcc_mir.c looking like construction helpers, but actually invoked from
-     * dcc_mir_select.c mid-selection: mir_value_number_global_field_loads,
-     * mir_eliminate_common_block_expressions,
-     * mir_eliminate_common_region_expressions, and
-     * mir_simplify_boolean_phi_branches. Each also reads use/definition data
-     * for instructions it hasn't reached yet in the very same scan where it
-     * mutates earlier ones, so even invalidating at their return wouldn't
-     * have been enough - they now suspend mir_use_cache_scope_active for
-     * their own duration and invalidate on the way out (see each one's own
-     * comment). With those four isolated, mir.insns's opcode/src1/src2/
-     * secondary_offset/dst fields really are immutable from here to the end
-     * of mir_end_function, and this scope has a clean, full-suite-verified
-     * pass to show for it (0 failures, 0 codegen regressions) at each of
-     * the last two states: liveness-loop-only, and this wider one. */
+    /* Keep the cache active through allocation and candidate emission.
+     * The production Boolean PHI rewrite and host-only field-VN/common-
+     * expression/immediate-PHI passes suspend it during interleaved mutation
+     * and queries, then invalidate on return. Candidate rollback also
+     * invalidates before reverification. New graph mutators must preserve
+     * these contracts; absence of writes in emitter files is not enough. */
 
     if (getenv("DCC_MIR_ALLOCATION_REPORT") != NULL)
         fprintf(stderr,
@@ -12768,8 +13266,8 @@ int mir_verify_and_dump(void)
         int value;
 
         for (value = 0; value < mir.next_value; ++value) {
-            in_count += live_in[(size_t)i * mir.next_value + value] != 0;
-            out_count += live_out[(size_t)i * mir.next_value + value] != 0;
+            in_count += MIR_LIVE_TEST(live_in, i, value);
+            out_count += MIR_LIVE_TEST(live_out, i, value);
         }
         if (in_count > max_live)
             max_live = in_count;
